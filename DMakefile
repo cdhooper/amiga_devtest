@@ -1,0 +1,11 @@
+PROG=devtest
+
+RM=-delete force >NIL:
+CC=dcc
+CFLAGS=-O2 -ms -r -proto
+
+$(PROG): devtest.c
+	$(CC) $(CFLAGS) %(right) -o %(left)
+
+clean:
+	$(RM) $(PROG)
