@@ -34,11 +34,35 @@ struct ExecBase *SysBase;
 struct ExecBase *DOSBase;
 #endif
 
+#include <inttypes.h>
+/* ULONG has changed from NDK 3.9 to NDK 3.2.
+ * However, PRI*32 did not. What is the right way to implement this?
+ */
+#if INCLUDE_VERSION < 47
+#undef PRIu32
+#define PRIu32 "lu"
+#undef PRId32
+#define PRId32 "ld"
+#undef PRIx32
+#define PRIx32 "lx"
+#endif
+
 /* Trackdisk-64 enhanced commands */
+/* Check before defining. AmigaOS 3.2 NDK provides these in
+ * trackdisk.h
+ */
+#ifndef TD_READ64
 #define TD_READ64    24      // Read at 64-bit offset
+#endif
+#ifndef TD_WRITE64
 #define TD_WRITE64   25      // Write at 64-bit offset
+#endif
+#ifndef TD_SEEK64
 #define TD_SEEK64    26      // Seek to 64-bit offset
+#endif
+#ifndef TD_FORMAT64
 #define TD_FORMAT64  27      // Format (write) at 64-bit offset
+#endif
 
 /* NSD commands */
 #define NSCMD_DEVICEQUERY   0x4000
@@ -581,7 +605,7 @@ drive_geometry(const char *devname, uint lun)
         printf("%7c %12c %5c %5c %5c  %4c  -    Fail %d\n",
                '-', '-', '-', '-', '-', '-', rc);
     } else {
-        printf("%7lu %12lu %5lu %5lu %5lu  0x%02x  %s\n",
+        printf("%7"PRIu32" %12"PRIu32" %5"PRIu32" %5"PRIu32" %5"PRIu32"  0x%02x  %s\n",
                dg.dg_SectorSize, dg.dg_TotalSectors, dg.dg_Cylinders,
                dg.dg_Heads, dg.dg_TrackSectors,
                dg.dg_DeviceType,
@@ -1229,7 +1253,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
                 int failcode = WaitIO((struct IORequest *) tio[cur]);
                 if (failcode != 0) {
                     issued[cur] = 0;
-                    printf("  Error %d %sing at %lu\n",
+                    printf("  Error %d %sing at %"PRIu32"\n",
                            failcode, (iocmd == CMD_READ) ? "read" : "writ",
                            tio[cur]->iotd_Req.io_Offset);
                     rc++;
@@ -1264,7 +1288,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
             if (issued[cur]) {
                 int failcode = WaitIO((struct IORequest *) tio[cur]);
                 if (failcode != 0) {
-                    printf("  Error %d %sing at %lu\n",
+                    printf("  Error %d %sing at %"PRIu32"\n",
                            failcode, (iocmd == CMD_READ) ? "read" : "writ",
                            tio[cur]->iotd_Req.io_Offset);
                     rc++;
@@ -1694,7 +1718,7 @@ test_packets(uint lun, int do_destructive)
     printf("TD_GETGEOMTRY\t   ");
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        printf("Success %lu x %lu  C=%lu H=%lu S=%lu Type=%u%s",
+        printf("Success %"PRIu32" x %"PRIu32"  C=%"PRIu32" H=%"PRIu32" S=%"PRIu32" Type=%u%s",
                dg.dg_TotalSectors, dg.dg_SectorSize, dg.dg_Cylinders,
                dg.dg_Heads, dg.dg_TrackSectors, dg.dg_DeviceType,
                (dg.dg_Flags & DGF_REMOVABLE) ? " Removable" : "");
@@ -1717,7 +1741,7 @@ test_packets(uint lun, int do_destructive)
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
         changenum = tio->iotd_Req.io_Actual;
-        printf("Success Count=%lu", tio->iotd_Req.io_Actual);
+        printf("Success Count=%"PRIu32, tio->iotd_Req.io_Actual);
     } else {
         print_fail(rc);
     }
@@ -1785,7 +1809,7 @@ test_packets(uint lun, int do_destructive)
                 printf("3.5\" 150RPM");
                 break;
             default:
-                printf("Type=%lu ", tio->iotd_Req.io_Actual);
+                printf("Type=%"PRIu32" ", tio->iotd_Req.io_Actual);
         }
     } else {
         print_fail(rc);
@@ -1802,7 +1826,7 @@ test_packets(uint lun, int do_destructive)
     printf("TD_GETNUMTRACKS\t   ");
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        printf("Success Tracks=%lu", tio->iotd_Req.io_Actual);
+        printf("Success Tracks=%"PRIu32, tio->iotd_Req.io_Actual);
     } else {
         print_fail(rc);
     }
@@ -1920,7 +1944,7 @@ test_packets(uint lun, int do_destructive)
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
         if (nsd_r->DevQueryFormat != 0) {
-            printf("Unexpected DevQueryFormat %lx", nsd_r->DevQueryFormat);
+            printf("Unexpected DevQueryFormat %"PRIx32, nsd_r->DevQueryFormat);
         } else if (nsd_r->DeviceType != NSDEVTYPE_TRACKDISK) {
             printf("Unexpected DeviceType %x", nsd_r->DeviceType);
         } else {
