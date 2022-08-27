@@ -3,7 +3,7 @@
  *
  * Utility to test AmigaOS block devices (trackdisk.device, scsi.device, etc).
  */
-const char *version = "\0$VER: devtest 1.1 ("__DATE__") © Chris Hooper";
+const char *version = "\0$VER: devtest 1.2 ("__DATE__") © Chris Hooper";
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -480,16 +480,65 @@ devtype_str(uint dtype)
 }
 
 static int
+scsi_probe_unit(const char *devname, uint unit, struct IOExtTD *tio)
+{
+    int rc;
+    int erc;
+    scsi_inquiry_data_t *inq_res;
+
+    rc = OpenDevice(devname, unit, (struct IORequest *) tio, 0);
+    if (rc == 0) {
+        printf("%3d", unit);
+        erc = do_scsi_inquiry(tio, unit, &inq_res);
+        if (erc == 0) {
+            printf(" %-*.*s %-*.*s %-*.*s %-7s",
+               sizeof (inq_res->vendor),
+               sizeof (inq_res->vendor),
+               trim_spaces(inq_res->vendor, sizeof (inq_res->vendor)),
+               sizeof (inq_res->product),
+               sizeof (inq_res->product),
+               trim_spaces(inq_res->product, sizeof (inq_res->product)),
+               sizeof (inq_res->revision),
+               sizeof (inq_res->revision),
+               trim_spaces(inq_res->revision, sizeof (inq_res->revision)),
+               devtype_str(inq_res->device & SID_TYPE));
+            FreeMem(inq_res, sizeof (*inq_res));
+        }
+        scsi_read_capacity_10_data_t *cap10;
+        cap10 = do_scsi_read_capacity_10(tio, unit);
+        if (cap10 != NULL) {
+            uint ssize = *(uint32_t *) &cap10->length;
+            uint cap   = (*(uint32_t *) &cap10->addr + 1) / 1000;
+            uint cap_c = 0;  // KMGTPEZY
+            if (cap > 100000) {
+                cap /= 1000;
+                cap_c++;
+            }
+            cap *= ssize;
+            while (cap > 9999) {
+                cap /= 1000;
+                cap_c++;
+            }
+            printf("%5u %5u %cB", ssize, cap, "KMGTPEZY"[cap_c]);
+            FreeMem(cap10, sizeof (*cap10));
+        }
+        printf("\n");
+        close_device(tio);
+    }
+    return (rc);
+}
+
+static int
 scsi_probe(const char *devname, char *unitstr)
 {
     int rc = 0;
-    int erc;
     int found = 0;
     int justunit = -1;
+    uint target;
+    uint lun;
     uint unit;
     struct IOExtTD *tio;
     struct MsgPort *mp;
-    scsi_inquiry_data_t *inq_res;
 
     if ((unitstr != NULL) &&
         (sscanf(unitstr, "%u", &unit) == 1)) {
@@ -507,50 +556,19 @@ scsi_probe(const char *devname, char *unitstr)
         rc = 1;
         goto extio_fail;
     }
-    for (unit = 0; unit < 8; unit++) {
-        if ((justunit != -1) && (unit != justunit))
-            continue;
-        rc = OpenDevice(devname, unit, (struct IORequest *) tio, 0);
-        if (rc == 0) {
-            found++;
-            printf("%2d", unit);
-            erc = do_scsi_inquiry(tio, unit, &inq_res);
-            if (erc == 0) {
-                printf(" %-*.*s %-*.*s %-*.*s %-7s",
-                   sizeof (inq_res->vendor),
-                   sizeof (inq_res->vendor),
-                   trim_spaces(inq_res->vendor, sizeof (inq_res->vendor)),
-                   sizeof (inq_res->product),
-                   sizeof (inq_res->product),
-                   trim_spaces(inq_res->product, sizeof (inq_res->product)),
-                   sizeof (inq_res->revision),
-                   sizeof (inq_res->revision),
-                   trim_spaces(inq_res->revision, sizeof (inq_res->revision)),
-                   devtype_str(inq_res->device & SID_TYPE));
-                FreeMem(inq_res, sizeof (*inq_res));
+    for (target = 0; target < 8; target++) {
+        for (lun = 0; lun < 8; lun++) {
+            unit = target + lun * 10;
+            if ((justunit != -1) && (unit != justunit))
+                continue;
+            rc = scsi_probe_unit(devname, unit, tio);
+            if (rc == 0) {
+                found++;
+            } else {
+                if (justunit != -1)
+                    printf("Open %s Unit %u fail: %d\n", devname, justunit, rc);
+                break;  // Stop probing at first failed lun of each target
             }
-            scsi_read_capacity_10_data_t *cap10;
-            cap10 = do_scsi_read_capacity_10(tio, unit);
-            if (cap10 != NULL) {
-                uint ssize = *(uint32_t *) &cap10->length;
-                uint cap   = (*(uint32_t *) &cap10->addr + 1) / 1000;
-                uint cap_c = 0;  // KMGTPEZY
-                if (cap > 100000) {
-                    cap /= 1000;
-                    cap_c++;
-                }
-                cap *= ssize;
-                while (cap > 9999) {
-                    cap /= 1000;
-                    cap_c++;
-                }
-                printf("%5u %5u %cB", ssize, cap, "KMGTPEZY"[cap_c]);
-                FreeMem(cap10, sizeof (*cap10));
-            }
-            printf("\n");
-            close_device(tio);
-        } else if (justunit != -1) {
-            printf("Open fail: %d\n", rc);
         }
     }
     DeleteExtIO((struct IORequest *) tio);
