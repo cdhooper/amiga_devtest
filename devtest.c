@@ -210,21 +210,52 @@ typedef struct scsi_rw_6 {
 
 UBYTE sense_data[255];
 
+static void
+setup_scsidirect_cmd(struct SCSICmd *scmd, scsi_generic_t *cmd, uint cmdlen,
+                     void *res, uint reslen)
+{
+    memset(scmd, 0, sizeof (*scmd));
+    scmd->scsi_Data = (UWORD *) res;
+    scmd->scsi_Length = reslen;
+    // scmd.scsi_Actual = 0;
+    scmd->scsi_Command = (UBYTE *) cmd;
+    scmd->scsi_CmdLength = cmdlen;  // sizeof (cmd);
+    // scmd.scsi_CmdActual = 0;
+    scmd->scsi_Flags = SCSIF_READ | SCSIF_AUTOSENSE;
+    // scmd.scsi_Status = 0;
+    scmd->scsi_SenseData = sense_data;
+    scmd->scsi_SenseLength = sizeof (sense_data);
+    // scmd.scsi_SenseActual = 0;
+}
+
+static void *
+do_scsidirect_cmd(struct IOExtTD *tio, scsi_generic_t *cmd, uint cmdlen,
+                  uint reslen, int *rc)
+{
+    void *res = AllocMem(reslen, MEMF_PUBLIC | MEMF_CLEAR);
+    if (res == NULL) {
+        printf("AllocMem 0x%x fail", reslen);
+        *rc = ENOMEM;
+    } else {
+        struct SCSICmd scmd;
+        setup_scsidirect_cmd(&scmd, cmd, cmdlen, res, reslen);
+        tio->iotd_Req.io_Command = HD_SCSICMD;
+        tio->iotd_Req.io_Length  = sizeof (scmd);
+        tio->iotd_Req.io_Data    = &scmd;
+
+        if ((*rc = DoIO((struct IORequest *) tio)) != 0) {
+            FreeMem(res, reslen);
+            res = NULL;
+        }
+    }
+    return (res);
+}
+
 static int
 do_scsi_inquiry(struct IOExtTD *tio, uint lun, scsi_inquiry_data_t **inq)
 {
-    int rc;
-    scsi_inquiry_data_t *res;
     scsi_generic_t cmd;
-    struct SCSICmd scmd;
-
-#define	SCSIPI_INQUIRY_LENGTH_SCSI2	36
-    res = (scsi_inquiry_data_t *) AllocMem(sizeof (*res), MEMF_PUBLIC);
-    if (res == NULL) {
-        printf("AllocMem ");
-        *inq = NULL;
-        return (1);
-    }
+    int rc;
 
     memset(&cmd, 0, sizeof (cmd));
     cmd.opcode = INQUIRY;
@@ -234,95 +265,29 @@ do_scsi_inquiry(struct IOExtTD *tio, uint lun, scsi_inquiry_data_t **inq)
     cmd.bytes[3] = sizeof (scsi_inquiry_data_t);
     cmd.bytes[4] = 0;  // Control
 
-    memset(&scmd, 0, sizeof (scmd));
-    scmd.scsi_Data = (UWORD *) res;
-    scmd.scsi_Length = sizeof (*res);
-    // scmd.scsi_Actual = 0;
-    scmd.scsi_Command = (UBYTE *) &cmd;
-    scmd.scsi_CmdLength = 6;
-    // scmd.scsi_CmdActual = 0;
-    scmd.scsi_Flags = SCSIF_READ | SCSIF_AUTOSENSE;
-    // scmd.scsi_Status = 0;
-    scmd.scsi_SenseData = sense_data;
-    scmd.scsi_SenseLength = sizeof (sense_data);
-    // scmd.scsi_SenseActual = 0;
-
-    tio->iotd_Req.io_Command = HD_SCSICMD;
-    tio->iotd_Req.io_Length  = sizeof (scmd);
-    tio->iotd_Req.io_Data    = &scmd;
-
-    if ((rc = DoIO((struct IORequest *) tio)) != 0) {
-        FreeMem(res, sizeof (*res));
-        res = NULL;
-    }
-    *inq = res;
+    *inq = do_scsidirect_cmd(tio, &cmd, 6, sizeof (**inq), &rc);
     return (rc);
-}
-
-static int
-do_scsidirect_cmd(struct IOExtTD *tio, scsi_generic_t *cmd, uint cmdlen,
-               void *res, uint reslen, uint immed)
-{
-    struct SCSICmd scmd;
-
-    memset(&scmd, 0, sizeof (scmd));
-    scmd.scsi_Data = (UWORD *) res;
-    scmd.scsi_Length = reslen;
-    // scmd.scsi_Actual = 0;
-    scmd.scsi_Command = (UBYTE *) cmd;
-    scmd.scsi_CmdLength = cmdlen;  // sizeof (cmd);
-    // scmd.scsi_CmdActual = 0;
-    scmd.scsi_Flags = SCSIF_READ | SCSIF_AUTOSENSE;
-    // scmd.scsi_Status = 0;
-    scmd.scsi_SenseData = sense_data;
-    scmd.scsi_SenseLength = sizeof (sense_data);
-    // scmd.scsi_SenseActual = 0;
-
-    tio->iotd_Req.io_Command = HD_SCSICMD;
-    tio->iotd_Req.io_Length  = sizeof (scmd);
-    tio->iotd_Req.io_Data    = &scmd;
-
-    if (immed) {
-        return (DoIO((struct IORequest *) tio));
-    } else {
-        SendIO((struct IORequest *) tio);
-        return (9);
-    }
-}
-
-static void *
-do_scsidirect_alloc(struct IOExtTD *tio, scsi_generic_t *cmd, uint cmdlen,
-                    uint reslen)
-{
-    void *res = AllocMem(reslen, MEMF_PUBLIC | MEMF_CLEAR);
-    if (res == NULL) {
-        printf("AllocMem ");
-    } else {
-        if (do_scsidirect_cmd(tio, cmd, cmdlen, res, reslen, 1)) {
-            FreeMem(res, reslen);
-            res = NULL;
-        }
-    }
-    return (res);
 }
 
 static scsi_read_capacity_10_data_t *
 do_scsi_read_capacity_10(struct IOExtTD *tio, uint lun)
 {
+    int rc;
     scsi_generic_t cmd;
+    uint len = sizeof (scsi_read_capacity_10_data_t);
 
     memset(&cmd, 0, sizeof (cmd));
     cmd.opcode = READ_CAPACITY_10;
     cmd.bytes[0] = lun << 5;
 
-    return (do_scsidirect_alloc(tio, &cmd, 10,
-                                sizeof (scsi_read_capacity_10_data_t)));
+    return (do_scsidirect_cmd(tio, &cmd, 10, len, &rc));
 }
 
 #define	SRC16_SERVICE_ACTION	0x10
 static scsi_read_capacity_16_data_t *
 do_scsi_read_capacity_16(struct IOExtTD *tio, uint lun)
 {
+    int rc;
     scsi_generic_t cmd;
     uint len = sizeof (scsi_read_capacity_16_data_t);
 
@@ -330,12 +295,13 @@ do_scsi_read_capacity_16(struct IOExtTD *tio, uint lun)
     cmd.opcode = READ_CAPACITY_16;
     cmd.bytes[0] = SRC16_SERVICE_ACTION;
     *(uint32_t *)&cmd.bytes[8] = len;
-// XXX: If I use [9] above instead of [8], the device will ignore the
-//      request and cause a phase error. The A4091 driver is not handling
-//      this correctly and never times out / fails the request from the
-//      devtest utility.
-
-    return (do_scsidirect_alloc(tio, &cmd, 16, len));
+    /*
+     * XXX: If I use [9] above instead of [8] with SCSI2SD, the device
+     *      will ignore the request and cause a phase error. The A4091
+     *      driver previously didn't handle this correctly and would
+     *      never time out / fail the request from the devtest utility.
+     */
+    return (do_scsidirect_cmd(tio, &cmd, 16, len, &rc));
 }
 
 #define	MODE_SENSE_6		0x1a
@@ -421,6 +387,7 @@ struct scsi_mode_sense_6 {
 static uint8_t *
 scsi_read_mode_pages(struct IOExtTD *tio, uint unit)
 {
+    int            rc;
     scsi_generic_t cmd;
 
 #define	SMS_PAGE_ALL_PAGES		0x3f
@@ -436,7 +403,7 @@ scsi_read_mode_pages(struct IOExtTD *tio, uint unit)
     cmd.bytes[3] = SCSI_MODE_PAGES_BUFSIZE; // length
     cmd.bytes[4] = 0; // control
 
-    return (do_scsidirect_alloc(tio, &cmd, 6, SCSI_MODE_PAGES_BUFSIZE));
+    return (do_scsidirect_cmd(tio, &cmd, 6, SCSI_MODE_PAGES_BUFSIZE, &rc));
 }
 
 static char *
@@ -964,7 +931,7 @@ latency_iocmd(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
         printf("CMD_READ parallel           ");
     else
         printf("CMD_WRITE parallel          ");
-    stime = read_system_ticks_wait();
+
     for (iter = 0; iter < num_iter; iter++) {
         tio[iter]->iotd_Req.io_Command = iocmd;
         tio[iter]->iotd_Req.io_Actual  = 0;
@@ -973,7 +940,10 @@ latency_iocmd(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
         tio[iter]->iotd_Req.io_Data    = buf;
         tio[iter]->iotd_Req.io_Flags   = 0;
         tio[iter]->iotd_Req.io_Error   = 0xa5;
+    }
 
+    stime = read_system_ticks_wait();
+    for (iter = 0; iter < num_iter; iter++) {
         SendIO((struct IORequest *) tio[iter]);
     }
     for (iter = 0; iter < num_iter; iter++) {
@@ -1002,6 +972,13 @@ latency_scsidirect_iocmd(UWORD iocmd, uint8_t *buf, int num_iter,
     unsigned int stime;
     unsigned int etime;
     scsi_rw_6_t cmd;
+    struct SCSICmd *scmd;
+
+    scmd = AllocMem(sizeof (*scmd) * num_iter, MEMF_PUBLIC);
+    if (scmd == NULL) {
+        printf("Allocmem failed\n");
+        return (1);
+    }
 
     if (iocmd == CMD_READ)
         printf("HD_SCSICMD read sequential  ");
@@ -1016,10 +993,17 @@ latency_scsidirect_iocmd(UWORD iocmd, uint8_t *buf, int num_iter,
     cmd.addr[0] = 0; // lun << 5;
     cmd.length = BUFSIZE / sector_size;
 
+    for (iter = 0; iter < num_iter; iter++) {
+        setup_scsidirect_cmd(scmd + iter, (scsi_generic_t *) &cmd, sizeof (cmd),
+                             buf, BUFSIZE);
+        tio[iter]->iotd_Req.io_Command = HD_SCSICMD;
+        tio[iter]->iotd_Req.io_Length  = sizeof (*scmd);
+        tio[iter]->iotd_Req.io_Data    = scmd + iter;
+    }
+
     stime = read_system_ticks_wait();
     for (iter = 0; iter < num_iter; iter++) {
-        failcode = do_scsidirect_cmd(tio[0], (scsi_generic_t *) &cmd,
-                                     sizeof (cmd), buf, BUFSIZE, 1);
+        failcode = DoIO((struct IORequest *) tio[iter]);
         if (failcode != 0) {
             rc += failcode;
             if (++rc < 10)
@@ -1032,16 +1016,22 @@ latency_scsidirect_iocmd(UWORD iocmd, uint8_t *buf, int num_iter,
         etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
     print_latency(etime - stime, iter, '\n');
 
-
     if (iocmd == CMD_READ)
         printf("HD_SCSICMD read parallel    ");
     else
         printf("HD_SCSICMD write parallel   ");
 
+    for (iter = 0; iter < num_iter; iter++) {
+        setup_scsidirect_cmd(scmd + iter, (scsi_generic_t *) &cmd, sizeof (cmd),
+                             buf, BUFSIZE);
+        tio[iter]->iotd_Req.io_Command = HD_SCSICMD;
+        tio[iter]->iotd_Req.io_Length  = sizeof (*scmd);
+        tio[iter]->iotd_Req.io_Data    = scmd + iter;
+    }
+
     stime = read_system_ticks_wait();
     for (iter = 0; iter < num_iter; iter++) {
-        (void) do_scsidirect_cmd(tio[iter], (scsi_generic_t *) &cmd,
-                                 sizeof (cmd), buf, BUFSIZE, 0);
+        SendIO((struct IORequest *) tio[iter]);
     }
     for (iter = 0; iter < num_iter; iter++) {
         int failcode = WaitIO((struct IORequest *) tio[iter]);
@@ -1056,6 +1046,8 @@ latency_scsidirect_iocmd(UWORD iocmd, uint8_t *buf, int num_iter,
         etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
     print_latency(etime - stime, iter, ' ');
     printf("(%u requests)\n", num_iter);
+
+    FreeMem(scmd, sizeof (*scmd) * num_iter);
 
     return (rc);
 }
@@ -1655,6 +1647,7 @@ err_to_str_t err_to_str[] = {
     { HFERR_SelTimeout, "HFERR_SelTimeout" },
     { HFERR_BadStatus, "HFERR_BadStatus" },
     { HFERR_NoBoard, "HFERR_NoBoard" },
+    { ENOMEM, "ENOMEM" },
 };
 
 static void
