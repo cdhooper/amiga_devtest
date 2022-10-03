@@ -3,7 +3,7 @@ OBJDIR  := objs
 SRCS    := devtest.c
 OBJS    := $(SRCS:%.c=$(OBJDIR)/%.o)
 CC      := m68k-amigaos-gcc
-CFLAGS  := -Wall -Wno-pointer-sign -fomit-frame-pointer
+CFLAGS  := -Wall -Wextra -Wno-pointer-sign -fomit-frame-pointer
 CFLAGS  += -Wno-strict-aliasing
 LDFLAGS = -Xlinker -Map=$(OBJDIR)/$@.map -Wa,-a > $(OBJDIR)/$@.lst -fomit-frame-pointer -mcrt=clib2 -lgcc -lc -lamiga
 
@@ -37,3 +37,7 @@ $(OBJDIR):
 
 clean:
 	rm -f $(OBJS) $(OBJDIR)/*.map $(OBJDIR)/*.lst
+
+FLINT_FILE=flexelint.lnt
+flint:
+	flexelint -v -w3 -I/opt/amiga/m68k-amigaos/ndk-include -I/opt/amiga/m68k-amigaos/sys-include -I/opt/amiga/m68k-amigaos/clib2/include flexelint.lnt $(SRCS)
