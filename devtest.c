@@ -75,6 +75,11 @@ struct ExecBase *DOSBase;
 #define TD_FORMAT64  27      // Format (write) at 64-bit offset
 #endif
 
+#define BIT(x) (1U << (x))
+
+/* Internal flag to indicate IOF_QUICK should be set for command */
+#define CMD_FLAG_NOT_QUICK BIT(14)
+
 /* NSD commands */
 #define NSCMD_DEVICEQUERY   0x4000
 #define NSCMD_TD_READ64     0xC000
@@ -358,17 +363,20 @@ floppy_type_string(uint dtype)
     return ("Unknown");
 }
 
-
 static void
 print_test_name(const char *name)
 {
     printf("%-19s", name);
+    fflush(stdout);
+    fflush(NULL);  // gcc bug? fflush(stdout) doesn't seem to work
 }
 
 static void
 print_ltest_name(const char *name)
 {
     printf("%-28s", name);
+    fflush(stdout);
+    fflush(NULL);  // gcc bug? fflush(stdout) doesn't seem to work
 }
 
 static void
@@ -376,9 +384,12 @@ print_fail(int rc)
 {
     size_t i;
     printf("Fail %d", rc);
-    for (i = 0; i < ARRAY_SIZE(err_to_str); i++)
-        if (err_to_str[i].errcode == rc)
+    for (i = 0; i < ARRAY_SIZE(err_to_str); i++) {
+        if (err_to_str[i].errcode == rc) {
             printf(" %s", err_to_str[i].errstr);
+            break;
+        }
+    }
 }
 
 static void
@@ -1119,8 +1130,18 @@ print_perf(unsigned int ttime, unsigned int xfer_kb, int is_write,
                tsec, trem * 100 / TICKS_PER_SECOND, xfer_size / 1024,
                xfer_kb, c2);
     } else {
-        printf("%s %3u KB xfers %13u %cB/sec\n",
-               is_write ? "write" : "read ", xfer_size / 1024, xfer_kb, c2);
+        printf("%13u %cB/sec\n", xfer_kb, c2);
+    }
+}
+
+static void
+print_perf_type(int is_write, uint xfer_size)
+{
+    if (g_verbose == 0) {
+        printf("%s %3u KB xfers ", is_write ? "write" : "read ",
+               xfer_size / 1024);
+        fflush(stdout);
+        fflush(NULL);  // gcc bug? fflush(stdout) doesn't seem to work
     }
 }
 
@@ -1164,7 +1185,6 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
 
     print_ltest_name("TD_GETGEOMETRY sequential");
 
-    stime = read_system_ticks_wait();
     for (iter = 0; iter < num_iter; iter++) {
         tio[iter]->iotd_Req.io_Command = TD_GETGEOMETRY;
         tio[iter]->iotd_Req.io_Actual  = 0xa5;
@@ -1173,6 +1193,10 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
         tio[iter]->iotd_Req.io_Data    = &dg;
         tio[iter]->iotd_Req.io_Flags   = 0;
         tio[iter]->iotd_Req.io_Error   = 0xa5;
+    }
+
+    stime = read_system_ticks_wait();
+    for (iter = 0; iter < num_iter; iter++) {
         failcode = DoIO((struct IORequest *) tio[iter]);
         if (failcode != 0) {
             if (++rc < 10) {
@@ -1180,6 +1204,9 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
                 print_fail(failcode);
             }
         }
+
+        if (iter & 0xf)
+            continue;
 
         etime = read_system_ticks();
         if (etime < stime)
@@ -1190,12 +1217,16 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
             break;
         }
     }
-    ttime = etime - stime;
+    if (iter >= num_iter) {
+        etime = read_system_ticks();
+        if (etime < stime)
+            etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
+        ttime = etime - stime;
+    }
     print_latency(ttime, iter, '\n');
 
     iters = iter;
     print_ltest_name("TD_GETGEOMETRY parallel");
-    stime = read_system_ticks_wait();
     for (iter = 0; iter < iters; iter++) {
         tio[iter]->iotd_Req.io_Command = TD_GETGEOMETRY;
         tio[iter]->iotd_Req.io_Actual  = 0xa5;
@@ -1204,14 +1235,21 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
         tio[iter]->iotd_Req.io_Data    = &dg;
         tio[iter]->iotd_Req.io_Flags   = 0;
         tio[iter]->iotd_Req.io_Error   = 0xa5;
+    }
+
+    stime = read_system_ticks_wait();
+    for (iter = 0; iter < iters; iter++) {
         SendIO((struct IORequest *) tio[iter]);
     }
     for (iter = 0; iter < iters; iter++) {
         failcode = WaitIO((struct IORequest *) tio[iter]);
         if (failcode != 0) {
-            if (++rc < 10) {
-                printf("  ");
+            if (++rc < 5) {
+                printf(" ");
                 print_fail(failcode);
+                printf(" ");
+            } else if (rc == 6) {
+                printf(" ... ");
             }
         }
     }
@@ -1219,61 +1257,193 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
     if (etime < stime)
         etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
     ttime = etime - stime;
-    print_latency(ttime, iter, ' ');
-    printf("(%u requests)\n", iters);
+    print_latency(ttime, iter, '\n');
 
     for (iter = 0; iter < num_iter; iter++)
         close_device(tio[iter]);
 
+    g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
     g_sector_size = dg.dg_SectorSize;
 
     return (0);
 }
 
+#define BUTTERFLY_MODE_AVG   0  // Average seek time across device
+#define BUTTERFLY_MODE_FAR   1  // Weight toward end of media
+#define BUTTERFLY_MODE_CONST 2  // Constant travel half of device
+
+/*
+ * Media read patterns
+ *
+ * |      AVG      |  |       FAR     |  |      CONST    |
+ *  *------------->    *------------->    *------->
+ *     <----------*     <------------*       <----*
+ *     *------->        *----------->        *------->
+ *        <----*         <----------*           <----*
+ *        *-->           *--------->            *------->
+ *          <*            <--------*               <----*
+ */
 static int
-latency_iocmd(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
+latency_butterfly(UWORD iocmd, uint8_t *buf, int num_iter,
+                  struct IOExtTD **tio, int mode)
 {
     int iter;
     int rc = 0;
-    int failcode;
+    int failcode = 0;
+    unsigned int step;
     unsigned int stime;
     unsigned int etime;
+    uint64_t pos = 0;
 
-    if (iocmd == CMD_READ)
-        print_ltest_name("CMD_READ sequential");
-    else
-        print_ltest_name("CMD_WRITE parallel");
+    if (g_sector_size == 0)
+        g_sector_size = 512;
 
-    stime = read_system_ticks_wait();
+    if (g_devsize == 0)
+        g_devsize = 720 << 10;  // At least 720K
+
+    if ((g_devsize >> 32) != 0) {
+        if (iocmd == CMD_READ) {
+            iocmd = g_has_nsd ? NSCMD_TD_READ64 : TD_READ64;
+        } else if (iocmd == CMD_WRITE) {
+            iocmd = g_has_nsd ? NSCMD_TD_WRITE64 : TD_WRITE64;
+        } else {
+            printf("Unknown iocmd %d\n", iocmd);
+            return (1);
+        }
+    }
+    step = g_devsize / num_iter;
+    if (mode == BUTTERFLY_MODE_FAR)
+        step /= 4;
+
+    if (step < g_sector_size) {
+        step = g_sector_size;
+        num_iter /= 4;
+    }
+
     for (iter = 0; iter < num_iter; iter++) {
         tio[0]->iotd_Req.io_Command = iocmd;
-        tio[0]->iotd_Req.io_Actual  = 0;
-        tio[0]->iotd_Req.io_Offset  = 0;
-        tio[0]->iotd_Req.io_Length  = BUFSIZE;
+        tio[0]->iotd_Req.io_Actual  = pos >> 32;
+        tio[0]->iotd_Req.io_Offset  = (uint32_t) pos;
+        tio[0]->iotd_Req.io_Length  = g_sector_size;
         tio[0]->iotd_Req.io_Data    = buf;
         tio[0]->iotd_Req.io_Flags   = 0;
         tio[0]->iotd_Req.io_Error   = 0xa5;
+        switch (mode) {
+            case BUTTERFLY_MODE_AVG:
+            case BUTTERFLY_MODE_FAR:
+                if ((iter & 1) == 0)
+                    pos = step * iter / 2;              // left --> right
+                else
+                    pos = g_devsize - step * iter / 2;  // left <-- right
+                break;
+            case BUTTERFLY_MODE_CONST:
+                if ((iter & 1) == 0)
+                    pos += g_devsize / 2;               // left --> right
+                else
+                    pos -= (g_devsize / 2 - step);      // left <-- right
+                break;
+        }
+    }
 
+    stime = read_system_ticks_wait();
+    /*
+     * DoIO always tries IOF_QUICK, but will always wait for the I/O
+     * to complete. This is regardless of whether the driver can do
+     * quick I/O or not.
+     */
+    for (iter = 0; iter < num_iter; iter++) {
         failcode = DoIO((struct IORequest *) tio[0]);
-        if (failcode != 0) {
-            rc += failcode;
-            if (++rc < 10) {
-                printf("  ");
-                print_fail(failcode);
-            }
+        if ((failcode != 0) && (iocmd != CMD_INVALID)) {
+            rc++;
             break;
         }
     }
     etime = read_system_ticks();
     if (etime < stime)
         etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    print_latency(etime - stime, iter, '\n');
+    print_latency(etime - stime, iter, ' ');
+    if (rc != 0)  {
+        printf(" ");
+        print_fail(failcode);
+    }
+    printf("\n");
+    return (rc);
+}
 
+static int
+latency_cmd_seq(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
+{
+    int iter;
+    int rc = 0;
+    int failcode = 0;
+    UBYTE flags = IOF_QUICK;
+    unsigned int stime;
+    unsigned int etime;
 
-    if (iocmd == CMD_READ)
-        print_ltest_name("CMD_READ parallel");
-    else
-        print_ltest_name("CMD_WRITE parallel");
+    if (iocmd & CMD_FLAG_NOT_QUICK) {
+        iocmd &= ~CMD_FLAG_NOT_QUICK;
+        flags = 0;
+    }
+
+    for (iter = 0; iter < num_iter; iter++) {
+        tio[0]->iotd_Req.io_Command = iocmd;
+        tio[0]->iotd_Req.io_Actual  = 0;
+        tio[0]->iotd_Req.io_Offset  = 0;
+        tio[0]->iotd_Req.io_Length  = BUFSIZE;
+        tio[0]->iotd_Req.io_Data    = buf;
+        tio[0]->iotd_Req.io_Flags   = flags;
+        tio[0]->iotd_Req.io_Error   = 0xa5;
+    }
+
+    stime = read_system_ticks_wait();
+    if (flags == 0) {
+        /*
+         * SendIO sets up asynch I/O, where the reply is always by message.
+         * The driver should not attempt quick I/O.
+         */
+        for (iter = 0; iter < num_iter; iter++) {
+            SendIO((struct IORequest *) tio[0]);
+            failcode = WaitIO((struct IORequest *) tio[0]);
+            if ((failcode != 0) && (iocmd != CMD_INVALID)) {
+                rc++;
+                break;
+            }
+        }
+    } else {
+        /*
+         * DoIO always tries IOF_QUICK, but will always wait for the I/O
+         * to complete. This is regardless of whether the driver can do
+         * quick I/O or not.
+         */
+        for (iter = 0; iter < num_iter; iter++) {
+            failcode = DoIO((struct IORequest *) tio[0]);
+            if ((failcode != 0) && (iocmd != CMD_INVALID)) {
+                rc++;
+                break;
+            }
+        }
+    }
+
+    etime = read_system_ticks();
+    if (etime < stime)
+        etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
+    print_latency(etime - stime, iter, ' ');
+    if (rc != 0)  {
+        printf(" ");
+        print_fail(failcode);
+    }
+    printf("\n");
+    return (rc);
+}
+
+static int
+latency_cmd_par(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
+{
+    int iter;
+    int rc = 0;
+    int failcode;
+    unsigned int stime;
+    unsigned int etime;
 
     for (iter = 0; iter < num_iter; iter++) {
         tio[iter]->iotd_Req.io_Command = iocmd;
@@ -1290,7 +1460,7 @@ latency_iocmd(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
         SendIO((struct IORequest *) tio[iter]);
     }
     for (iter = 0; iter < num_iter; iter++) {
-        int failcode = WaitIO((struct IORequest *) tio[iter]);
+        failcode = WaitIO((struct IORequest *) tio[iter]);
         if (failcode != 0) {
             if (++rc < 10) {
                 printf("  ");
@@ -1301,14 +1471,13 @@ latency_iocmd(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
     etime = read_system_ticks();
     if (etime < stime)
         etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    print_latency(etime - stime, iter, ' ');
-    printf("(%u requests)\n", num_iter);
+    print_latency(etime - stime, iter, '\n');
     return (rc);
 }
 
 static int
-latency_scsidirect_iocmd(UWORD iocmd, uint8_t *buf, int num_iter,
-                         struct IOExtTD **tio)
+latency_scsidirect_cmd_seq(uint8_t iocmd, uint8_t *buf, int num_iter,
+                           struct IOExtTD **tio)
 {
     int iter;
     int rc = 0;
@@ -1324,16 +1493,8 @@ latency_scsidirect_iocmd(UWORD iocmd, uint8_t *buf, int num_iter,
         return (1);
     }
 
-    if (iocmd == CMD_READ)
-        print_ltest_name("HD_SCSICMD read sequential");
-    else
-        print_ltest_name("HD_SCSICMD write sequential");
-
     memset(&cmd, 0, sizeof (cmd));
-    if (iocmd == CMD_READ)
-        cmd.opcode = SCSI_READ_6_COMMAND;
-    else
-        cmd.opcode = SCSI_WRITE_6_COMMAND;
+    cmd.opcode = iocmd;
     cmd.addr[0] = 0; // lun << 5;
     cmd.length = BUFSIZE / g_sector_size;
 
@@ -1362,10 +1523,32 @@ latency_scsidirect_iocmd(UWORD iocmd, uint8_t *buf, int num_iter,
         etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
     print_latency(etime - stime, iter, '\n');
 
-    if (iocmd == CMD_READ)
-        print_ltest_name("HD_SCSICMD read parallel");
-    else
-        print_ltest_name("HD_SCSICMD write parallel");
+    FreeMem(scmd, sizeof (*scmd) * num_iter);
+
+    return (rc);
+}
+
+static int
+latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
+                           struct IOExtTD **tio)
+{
+    int iter;
+    int rc = 0;
+    unsigned int stime;
+    unsigned int etime;
+    scsi_rw_6_t cmd;
+    struct SCSICmd *scmd;
+
+    scmd = AllocMem(sizeof (*scmd) * num_iter, MEMF_PUBLIC);
+    if (scmd == NULL) {
+        printf("Allocmem failed\n");
+        return (1);
+    }
+
+    memset(&cmd, 0, sizeof (cmd));
+    cmd.opcode = iocmd;
+    cmd.addr[0] = 0; // lun << 5;
+    cmd.length = BUFSIZE / g_sector_size;
 
     for (iter = 0; iter < num_iter; iter++) {
         setup_scsidirect_cmd(scmd + iter, (scsi_generic_t *) &cmd, sizeof (cmd),
@@ -1391,8 +1574,7 @@ latency_scsidirect_iocmd(UWORD iocmd, uint8_t *buf, int num_iter,
     etime = read_system_ticks();
     if (etime < stime)
         etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    print_latency(etime - stime, iter, ' ');
-    printf("(%u requests)\n", num_iter);
+    print_latency(etime - stime, iter, '\n');
 
     FreeMem(scmd, sizeof (*scmd) * num_iter);
 
@@ -1400,7 +1582,7 @@ latency_scsidirect_iocmd(UWORD iocmd, uint8_t *buf, int num_iter,
 }
 
 static int
-latency_read(struct IOExtTD **tio, int max_iter, int do_destructive)
+latency_read(struct IOExtTD **tio, int max_iter)
 {
     int rc = 0;
     int iter;
@@ -1426,18 +1608,94 @@ latency_read(struct IOExtTD **tio, int max_iter, int do_destructive)
     if (num_iter == 0)
         return (1);
 
-    if (latency_iocmd(CMD_READ, buf, num_iter, tio))
-        rc++;
+    print_ltest_name("TD_CHANGENUM");
+    rc += latency_cmd_seq(TD_CHANGENUM | CMD_FLAG_NOT_QUICK, buf,
+                          num_iter, tio);
 
-    if (latency_scsidirect_iocmd(CMD_READ, buf, num_iter, tio))
-        rc++;
+    print_ltest_name("TD_CHANGENUM quick");
+    rc += latency_cmd_seq(TD_CHANGENUM, buf, num_iter, tio);
 
-    if (do_destructive) {
-        if (latency_iocmd(CMD_WRITE, buf, num_iter, tio))
+    print_ltest_name("CMD_INVALID");
+    rc += latency_cmd_seq(CMD_INVALID, buf, num_iter, tio);
+
+    print_ltest_name("CMD_START");
+    rc += latency_cmd_seq(CMD_START, buf, num_iter, tio);
+
+    print_ltest_name("CMD_READ butterfly average");
+    rc += latency_butterfly(CMD_READ, buf, num_iter, tio, BUTTERFLY_MODE_AVG);
+
+    print_ltest_name("CMD_READ butterfly far");
+    rc += latency_butterfly(CMD_READ, buf, num_iter, tio, BUTTERFLY_MODE_FAR);
+
+    print_ltest_name("CMD_READ butterfly constant");
+    rc += latency_butterfly(CMD_READ, buf, num_iter, tio, BUTTERFLY_MODE_CONST);
+
+    print_ltest_name("CMD_READ sequential");
+    rc += latency_cmd_seq(CMD_READ, buf, num_iter, tio);
+
+    print_ltest_name("CMD_READ parallel");
+    rc += latency_cmd_par(CMD_READ, buf, num_iter, tio);
+
+    if (g_sector_size != 0) {
+        int rc2;
+        print_ltest_name("HD_SCSICMD read sequential");
+        rc2 = latency_scsidirect_cmd_seq(SCSI_READ_6_COMMAND, buf,
+                                         num_iter, tio);
+        if (rc2 != 0) {
             rc++;
-        if (latency_scsidirect_iocmd(CMD_WRITE, buf, num_iter, tio))
-            rc++;
+        } else {
+            print_ltest_name("HD_SCSICMD read parallel");
+            rc += latency_scsidirect_cmd_par(SCSI_READ_6_COMMAND, buf,
+                                             num_iter, tio);
+        }
     }
+
+    FreeMem(buf, BUFSIZE);
+
+    for (iter = 0; iter < num_iter; iter++)
+        close_device(tio[iter]);
+
+    return (rc);
+}
+
+static int
+latency_write(struct IOExtTD **tio, int max_iter)
+{
+    int rc = 0;
+    int iter;
+    int num_iter;
+    uint8_t *buf;
+
+    buf = AllocMem(BUFSIZE, MEMF_PUBLIC);
+    if (buf == NULL) {
+        printf("  AllocMem\n");
+        return (1);
+    }
+
+    if (max_iter > 100)
+        max_iter = 100;
+
+    for (num_iter = 0; num_iter < max_iter; num_iter++) {
+        if ((rc = open_device(tio[num_iter])) != 0) {
+            printf("Open %s Unit %u: ", g_devname, g_unitno);
+            print_fail_nl(rc);
+            break;
+        }
+    }
+    if (num_iter == 0)
+        return (1);
+
+    print_ltest_name("CMD_WRITE 8KB sequential");
+    rc += latency_cmd_seq(SCSI_WRITE_6_COMMAND, buf, num_iter, tio);
+
+    print_ltest_name("CMD_WRITE 8KB parallel");
+    rc += latency_cmd_par(CMD_WRITE, buf, num_iter, tio);
+
+    print_ltest_name("HD_SCSICMD write sequential");
+    rc += latency_scsidirect_cmd_seq(SCSI_WRITE_6_COMMAND, buf, num_iter, tio);
+
+    print_ltest_name("HD_SCSICMD write parallel");
+    rc += latency_scsidirect_cmd_par(SCSI_WRITE_6_COMMAND, buf, num_iter, tio);
 
     FreeMem(buf, BUFSIZE);
 
@@ -1566,7 +1824,8 @@ drive_latency(int do_destructive)
     print_latency(ttime, iters, '\n');
 
     if ((latency_getgeometry(mtio, NUM_MTIO / 4)) ||
-        (latency_read(mtio, NUM_MTIO, do_destructive))) {
+        (latency_read(mtio, NUM_MTIO)) ||
+        (do_destructive && latency_write(mtio, NUM_MTIO))) {
         rc = 1;
     }
 
@@ -1594,27 +1853,33 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
               uint32_t bufsize)
 {
     int xfer;
+    int xfer_good;
     int i;
     int rc = 0;
     uint8_t issued[NUM_TIO];
     int cur = 0;
-    uint32_t pos = 0;
+    uint32_t pos;
     unsigned int stime;
     unsigned int etime;
     int rep;
 
     for (rep = 0; rep < 10; rep++) {
+        pos = 0;
         memset(issued, 0, sizeof (issued));
 
         stime = read_system_ticks_wait();
 
+        print_perf_type((iocmd == CMD_READ) ? 0 : 1, bufsize);
+        xfer_good = 0;
         for (xfer = 0; xfer < 50; xfer++) {
             if (issued[cur]) {
                 int failcode = WaitIO((struct IORequest *) tio[cur]);
                 if (failcode == 0)
                     failcode = tio[cur]->iotd_Req.io_Error;
-                if (failcode != 0) {
-                    issued[cur] = 0;
+                issued[cur] = 0;
+                if (failcode == 0) {
+                    xfer_good++;
+                } else {
                     printf("  %s ", (iocmd == CMD_READ) ? "Read" : "Write");
                     print_fail(failcode);
                     printf(" at %"PRIu32"\n", tio[cur]->iotd_Req.io_Offset);
@@ -1649,7 +1914,10 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
                 int failcode = WaitIO((struct IORequest *) tio[cur]);
                 if (failcode == 0)
                     failcode = tio[cur]->iotd_Req.io_Error;
-                if (failcode != 0) {
+                issued[cur] = 0;
+                if (failcode == 0) {
+                    xfer_good++;
+                } else {
                     printf("  %s ", (iocmd == CMD_READ) ? "Read" : "Write");
                     print_fail(failcode);
                     printf(" at %"PRIu32"\n", tio[cur]->iotd_Req.io_Offset);
@@ -1664,7 +1932,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
         if (etime < stime)
             etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
 
-        print_perf(etime - stime, bufsize / 1000 * xfer,
+        print_perf(etime - stime, bufsize / 1000 * xfer_good,
                    (iocmd == CMD_READ) ? 0 : 1, bufsize);
         bufsize >>= 2;
         if (bufsize < 16384)
@@ -3617,6 +3885,12 @@ test_packets_ll(uint64_t test_mask, struct IOExtTD *tio)
         rc++;
     if ((test_mask & TEST_TD_GETNUMTRACKS) && test_td_getnumtracks(tio))
         rc++;
+    if ((test_mask & TEST_TD_RAWREAD) && test_td_rawread(tio)) {
+        test_mask &= ~TEST_TD_RAWWRITE;
+        rc++;
+    }
+    if (0 && (test_mask & TEST_TD_RAWWRITE) && test_td_rawwrite(tio))
+        rc++;
     if ((test_mask & TEST_HD_SCSICMD_INQ) && test_hd_scsicmd_inquiry(tio))
         rc++;
     if ((test_mask & TEST_HD_SCSICMD_TUR) && test_hd_scsicmd_tur(tio))
@@ -3633,13 +3907,6 @@ test_packets_ll(uint64_t test_mask, struct IOExtTD *tio)
         rc = -1;
         goto test_early_end;
     }
-
-    if ((test_mask & TEST_TD_RAWREAD) && test_td_rawread(tio)) {
-        test_mask &= ~TEST_TD_RAWWRITE;
-        rc++;
-    }
-    if (0 && (test_mask & TEST_TD_RAWWRITE) && test_td_rawwrite(tio))
-        rc++;
 
     if ((test_mask & TEST_CMD_READ) && test_cmd_read(tio)) {
         test_mask &= ~(TEST_ETD_READ | TEST_TD_READ64 |
