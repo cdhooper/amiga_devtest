@@ -1685,10 +1685,10 @@ latency_write(struct IOExtTD **tio, int max_iter)
     if (num_iter == 0)
         return (1);
 
-    print_ltest_name("CMD_WRITE 8KB sequential");
+    print_ltest_name("CMD_WRITE sequential");
     rc += latency_cmd_seq(SCSI_WRITE_6_COMMAND, buf, num_iter, tio);
 
-    print_ltest_name("CMD_WRITE 8KB parallel");
+    print_ltest_name("CMD_WRITE parallel");
     rc += latency_cmd_par(CMD_WRITE, buf, num_iter, tio);
 
     print_ltest_name("HD_SCSICMD write sequential");
