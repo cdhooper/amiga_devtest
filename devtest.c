@@ -856,11 +856,13 @@ extio_fail:
         if (justunit == -1) {
             printf("Open %s: ", g_devname);
             if (rc == HFERR_SelfUnit)
-                printf(" no device found\n");
+                printf("no device found\n");
             else
                 print_fail_nl(rc);
         }
         rc = 1;
+    } else {
+        rc = 0;
     }
     return (rc);
 }
@@ -1605,36 +1607,69 @@ latency_read(struct IOExtTD **tio, int max_iter)
             break;
         }
     }
-    if (num_iter == 0)
-        return (1);
+    if (num_iter == 0) {
+        rc = 1;
+        goto finish_fail;
+    }
 
     print_ltest_name("TD_CHANGENUM");
     rc += latency_cmd_seq(TD_CHANGENUM | CMD_FLAG_NOT_QUICK, buf,
                           num_iter, tio);
 
+    if (is_user_abort()) {
+user_abort:
+        printf("^C abort\n");
+        rc++;
+        goto finish_fail;
+    }
+
     print_ltest_name("TD_CHANGENUM quick");
     rc += latency_cmd_seq(TD_CHANGENUM, buf, num_iter, tio);
+
+    if (is_user_abort())
+        goto user_abort;
 
     print_ltest_name("CMD_INVALID");
     rc += latency_cmd_seq(CMD_INVALID, buf, num_iter, tio);
 
+    if (is_user_abort())
+        goto user_abort;
+
     print_ltest_name("CMD_START");
     rc += latency_cmd_seq(CMD_START, buf, num_iter, tio);
+
+    if (is_user_abort())
+        goto user_abort;
 
     print_ltest_name("CMD_READ butterfly average");
     rc += latency_butterfly(CMD_READ, buf, num_iter, tio, BUTTERFLY_MODE_AVG);
 
+    if (is_user_abort())
+        goto user_abort;
+
     print_ltest_name("CMD_READ butterfly far");
     rc += latency_butterfly(CMD_READ, buf, num_iter, tio, BUTTERFLY_MODE_FAR);
+
+    if (is_user_abort())
+        goto user_abort;
 
     print_ltest_name("CMD_READ butterfly constant");
     rc += latency_butterfly(CMD_READ, buf, num_iter, tio, BUTTERFLY_MODE_CONST);
 
+    if (is_user_abort())
+        goto user_abort;
+
     print_ltest_name("CMD_READ sequential");
     rc += latency_cmd_seq(CMD_READ, buf, num_iter, tio);
 
+    if (is_user_abort())
+        goto user_abort;
+
     print_ltest_name("CMD_READ parallel");
     rc += latency_cmd_par(CMD_READ, buf, num_iter, tio);
+
+    if (is_user_abort())
+        goto user_abort;
 
     if (g_sector_size != 0) {
         int rc2;
@@ -1644,12 +1679,16 @@ latency_read(struct IOExtTD **tio, int max_iter)
         if (rc2 != 0) {
             rc++;
         } else {
+            if (is_user_abort())
+                goto user_abort;
+
             print_ltest_name("HD_SCSICMD read parallel");
             rc += latency_scsidirect_cmd_par(SCSI_READ_6_COMMAND, buf,
                                              num_iter, tio);
         }
     }
 
+finish_fail:
     FreeMem(buf, BUFSIZE);
 
     for (iter = 0; iter < num_iter; iter++)
@@ -1686,7 +1725,7 @@ latency_write(struct IOExtTD **tio, int max_iter)
         return (1);
 
     print_ltest_name("CMD_WRITE sequential");
-    rc += latency_cmd_seq(SCSI_WRITE_6_COMMAND, buf, num_iter, tio);
+    rc += latency_cmd_seq(CMD_WRITE, buf, num_iter, tio);
 
     print_ltest_name("CMD_WRITE parallel");
     rc += latency_cmd_par(CMD_WRITE, buf, num_iter, tio);
@@ -1937,6 +1976,12 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
         bufsize >>= 2;
         if (bufsize < 16384)
             break;
+
+        if (is_user_abort()) {
+            printf("^C abort\n");
+            rc++;
+            break;
+        }
     }
 
     return (rc);
@@ -2162,7 +2207,7 @@ try_again:
 
     rc += run_bandwidth(CMD_READ, tio, buf, perf_buf_size);
 
-    if (do_destructive)
+    if (do_destructive && (rc == 0))
         rc += run_bandwidth(CMD_WRITE, tio, buf, perf_buf_size);
 
 allocmem_fail:
@@ -4331,10 +4376,9 @@ main(int argc, char *argv[])
                 printf("\n");
         }
         if (flag_benchmark &&
-            drive_benchmark(flag_destructive, memtype) &&
-            (loop != 0)) {
+            drive_benchmark(flag_destructive, memtype))
             break;
-        }
+
         if (flag_openclose) {
             if ((rc = open_device(&tio)) != 0) {
                 printf("Open %s unit %d: ", g_devname, g_unitno);

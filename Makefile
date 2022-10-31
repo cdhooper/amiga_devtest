@@ -35,6 +35,10 @@ $(PROG): $(OBJS)
 $(OBJDIR):
 	mkdir -p $@
 
+zip:
+	rm -f $(PROG).zip
+	zip $(PROG).zip $(PROG)
+
 clean:
 	rm -f $(OBJS) $(OBJDIR)/*.map $(OBJDIR)/*.lst
 
