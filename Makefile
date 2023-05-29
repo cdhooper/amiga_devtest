@@ -1,4 +1,8 @@
-PROG := devtest
+#
+# Makefile to build devtest for AmigaOS/68k using Bebbo's GCC cross-compiler.
+#
+
+PROG    := devtest
 OBJDIR  := objs
 SRCS    := devtest.c
 OBJS    := $(SRCS:%.c=$(OBJDIR)/%.o)
@@ -6,10 +10,12 @@ CC      := m68k-amigaos-gcc
 CFLAGS  := -Wall -Wextra -Wno-pointer-sign -fomit-frame-pointer
 CFLAGS  += -Wno-strict-aliasing
 LDFLAGS = -Xlinker -Map=$(OBJDIR)/$@.map -Wa,-a > $(OBJDIR)/$@.lst -fomit-frame-pointer -mcrt=clib2 -lgcc -lc -lamiga
+PROGVER := $(PROG)_$(shell awk '/char[[:space:]]*\*version =/{print $$7}' devtest.c)
 
 CFLAGS  += -Os
+#CFLAGS  += -g
 QUIET   := @
-QUIET   :=
+#QUIET   :=
 
 ifeq (, $(shell which $(CC) 2>/dev/null ))
 $(error "No $(CC) in PATH: maybe do PATH=$$PATH:/opt/amiga/bin")
@@ -36,8 +42,20 @@ $(OBJDIR):
 	mkdir -p $@
 
 zip:
-	rm -f $(PROG).zip
-	zip $(PROG).zip $(PROG)
+	@echo Building $(PROGVER).zip
+	$(QUIET)rm -rf $(PROG).zip $(PROGVER)
+	$(QUIET)mkdir $(PROGVER)
+	$(QUIET)cp -p $(PROG) $(PROGVER)/
+	$(QUIET)zip -rq $(PROGVER).zip $(PROGVER)
+	$(QUIET)rm -rf $(PROGVER)
+
+lha:
+	@echo Building $(PROGVER).lha
+	$(QUIET)rm -rf $(PROG).zip $(PROGVER)
+	$(QUIET)mkdir $(PROGVER)
+	$(QUIET)cp -p $(PROG) $(PROGVER)/
+	$(QUIET)lha -aq2 $(PROGVER).lha $(PROGVER)
+	$(QUIET)rm -rf $(PROGVER)
 
 clean:
 	rm -f $(OBJS) $(OBJDIR)/*.map $(OBJDIR)/*.lst

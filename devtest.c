@@ -3,7 +3,7 @@
  * -------
  * Utility to test AmigaOS block devices (trackdisk.device, scsi.device, etc).
  *
- * Copyright 2022 Chris Hooper. This program and source may be used
+ * Copyright 2023 Chris Hooper. This program and source may be used
  * and distributed freely, for any purpose which benefits the Amiga
  * community. Commercial use of the binary, source, or algorithms requires
  * prior written approval from Chris Hooper <amiga@cdh.eebugs.com>.
@@ -14,7 +14,7 @@
  * OR MISUSE OF THIS UTILITY OR INFORMATION REPORTED BY THIS UTILITY.
 
  */
-const char *version = "\0$VER: devtest 1.3 ("__DATE__") © Chris Hooper";
+const char *version = "\0$VER: devtest 1.4 ("__DATE__") © Chris Hooper";
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,18 +34,29 @@ const char *version = "\0$VER: devtest 1.3 ("__DATE__") © Chris Hooper";
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <exec/memory.h>
+#include <exec/execbase.h>
+#include <exec/memory.h>
+#include <libraries/configregs.h>
+
 #ifdef _DCC
 #define CDERR_BadDataType    36
 #define CDERR_InvalidState   37
+typedef unsigned char  uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned long  uint32_t;
+typedef struct { unsigned long hi; unsigned long lo;} uint64_t;
+#define __packed
 #else
 #include <devices/cd.h>
+#include <inline/timer.h>
 #include <inline/exec.h>
 #include <inline/dos.h>
+#include <inttypes.h>
 struct ExecBase *SysBase;
 struct ExecBase *DOSBase;
+struct Device   *TimerBase;
 #endif
 
-#include <inttypes.h>
 /* ULONG has changed from NDK 3.9 to NDK 3.2.
  * However, PRI*32 did not. What is the right way to implement this?
  */
@@ -97,6 +108,17 @@ struct ExecBase *DOSBase;
 
 #define BUFSIZE    8192
 #define RAWBUFSIZE 16384
+
+#define MEMTYPE_ANY    0
+#define MEMTYPE_CHIP   1
+#define MEMTYPE_FAST   2
+#define MEMTYPE_24BIT  3
+#define MEMTYPE_ZORRO  4
+#define MEMTYPE_ACCEL  5
+#define MEMTYPE_COPROC 6
+#define MEMTYPE_MB     7
+#define MEMTYPE_MAX    7
+
 
 #define	SSD_SENSE_KEY(x)        ((x[2]) & 0x0f)
 #define SSD_SENSE_ASC(x)        (x[12])
@@ -246,8 +268,11 @@ static uint      g_has_nsd = 0;       // Device driver supports NSD
 static uint8_t **g_buf;               // Saved data buffers for certain tests
 static char     *g_devname = NULL;    // Device name
 static uint      g_unitno;            // Device unit and LUN
+static uint      g_e_freq;            // Frequency of eclock (715909 tps)
 static UWORD     g_sense_length;      // Length of returned sense data (if any)
 static UBYTE     g_sense_data[255];   // Sense data buffer
+static UBYTE     mem_skip_alloc = 0;  // Skip memory allocate
+static uint32_t  memtype = MEMTYPE_ANY; // Memory type
 
 
 static BOOL
@@ -284,7 +309,8 @@ usage(void)
            "   -g           test drive geometry\n"
            "   -h           display help\n"
            "   -l <loops>   run multiple times\n"
-           "   -m <addr>    use specific memory (<addr> Chip Fast 24Bit Zorro -=list)\n"
+           "   -m <addr>    use specific memory (Chip Fast 24Bit Zorro MB Accel -=list)\n"
+           "   -mm <addr>   use specific address without allocation by OS\n"
            "   -o           test open/close\n"
            "   -p           probe SCSI bus for devices\n"
            "   -t           test all packet types (basic, TD64, NSD) "
@@ -417,6 +443,113 @@ llu_to_str(uint64_t value)
     return (buf);
 }
 
+APTR
+AllocMemType(ULONG byteSize, uint32_t memtype)
+{
+    /* Don't bother with memory allocate */
+    if (mem_skip_alloc)
+        return ((APTR) memtype);
+
+    switch (memtype) {
+        case 0:
+            /* Highest priority (usually fast) memory */
+            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_ANY));
+        case MEMTYPE_CHIP:
+            /* Chip memory */
+            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_CHIP));
+        case MEMTYPE_FAST:
+            /* Fast memory */
+            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_FAST));
+        case MEMTYPE_24BIT:
+            /* 24-bit memory */
+            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_24BITDMA));
+        case MEMTYPE_ZORRO:
+        case MEMTYPE_COPROC:
+        case MEMTYPE_MB:
+        case MEMTYPE_ACCEL: {
+            /*
+             * Zorro or accelerator memory -- walk memory list and find
+             * chunk in that memory space
+             */
+            struct ExecBase  *eb = SysBase;
+            struct MemHeader *mem;
+            struct MemChunk  *chunk;
+            uint32_t          chunksize = 0;
+            APTR              chunkaddr = NULL;
+            APTR              addr      = NULL;
+
+            Forbid();
+            for (mem = (struct MemHeader *)eb->MemList.lh_Head;
+                 mem->mh_Node.ln_Succ != NULL;
+                 mem = (struct MemHeader *)mem->mh_Node.ln_Succ) {
+                uint32_t size = (void *) mem->mh_Upper - (void *) mem;
+
+                if ((memtype == MEMTYPE_MB) &&
+                     (((uint32_t) mem < 0x04000000) ||
+                      ((uint32_t) mem >= 0x08000000))) {
+                    /* Not in Motherboard address range (A3000/A4000 fastmem) */
+                    continue;
+                }
+                if ((memtype == MEMTYPE_COPROC) &&
+                     (((uint32_t) mem < 0x08000000) ||
+                      ((uint32_t) mem >= 0x10000000))) {
+                    /* Not in Coprocessor address range */
+                    continue;
+                }
+                if ((memtype == MEMTYPE_ZORRO) &&
+                    ((((uint32_t) mem < E_MEMORYBASE) ||
+                      ((uint32_t) mem > E_MEMORYBASE + E_MEMORYSIZE)) &&
+                     (((uint32_t) mem < 0x10000000) ||    // EZ3_CONFIGAREA
+                      ((uint32_t) mem >= 0x80000000)))) { // EZ3_CONFIGAREAEND
+                    /* Not in Zorro II or Zorro III address range */
+                    continue;
+                }
+                if ((memtype == MEMTYPE_ACCEL) &&
+                     (((uint32_t) mem < 0x80000000) ||
+                      ((uint32_t) mem >= 0xe0000000))) {
+                    /* Not in Accelerator address range */
+                    continue;
+                }
+
+                /* Find the smallest chunk where this allocation will fit */
+                for (chunk = mem->mh_First; chunk != NULL;
+                     chunk = chunk->mc_Next) {
+                    uint32_t cursize = chunk->mc_Bytes;
+                    if (((uint32_t) chunk < (uint32_t) mem) ||
+                        ((uint32_t) chunk > (uint32_t) mem + size) ||
+                        ((uint32_t) chunk + cursize > (uint32_t) mem + size)) {
+                        break;  // Memory list corrupt - quit now!
+                    }
+
+                    if (cursize >= byteSize) {
+                        if ((chunkaddr != NULL) && (chunksize <= cursize))
+                            continue;
+                        chunkaddr = chunk;
+                        chunksize = cursize;
+                    }
+                }
+            }
+            if (chunkaddr != NULL)
+                addr = AllocAbs(byteSize, chunkaddr);
+            Permit();
+            return (addr);
+        }
+        default:
+            /* Allocate user-specified address */
+            if (memtype > MEMTYPE_MAX)
+                return (AllocAbs(byteSize, (APTR) memtype));
+            return (NULL);
+    }
+}
+
+void
+FreeMemType(APTR addr, ULONG byteSize)
+{
+    if (mem_skip_alloc)
+        return;  /* Memory was not allocated through the OS */
+    FreeMem(addr, byteSize);
+}
+
 static void
 setup_scsidirect_cmd(struct SCSICmd *scmd, scsi_generic_t *cmd, uint cmdlen,
                      void *res, uint reslen)
@@ -487,12 +620,13 @@ do_scsidirect_cmd(struct IOExtTD *tio, scsi_generic_t *cmd, uint cmdlen,
     struct SCSICmd scmd;
 
     if (reslen > 0) {
-        res = AllocMem(reslen, MEMF_PUBLIC | MEMF_CLEAR);
+        res = AllocMemType(reslen, memtype);
         if (res == NULL) {
-            printf("AllocMem 0x%x fail", reslen);
+            printf("AllocMem fail 0x%x\n", reslen);
             g_sense_length = 0;
             return (ENOMEM);
         }
+        memset(res, 0, reslen);
     } else {
         res = NULL;
     }
@@ -504,7 +638,7 @@ do_scsidirect_cmd(struct IOExtTD *tio, scsi_generic_t *cmd, uint cmdlen,
     rc = DoIO((struct IORequest *) tio);
     if (rc != 0) {
         if (reslen != 0) {
-            FreeMem(res, reslen);
+            FreeMemType(res, reslen);
             res = NULL;
         }
     }
@@ -569,6 +703,7 @@ do_scsi_read_capacity_16(struct IOExtTD *tio,
     cmd.opcode = SERVICE_ACTION_IN;
     cmd.bytes[0] = SRC16_SERVICE_ACTION;
     *(uint32_t *)&cmd.bytes[9] = len;
+
     return (do_scsidirect_cmd(tio, &cmd, 16, len, (void **) cap));
 }
 
@@ -589,7 +724,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
     if (incdec == 0)
         incdec = 1;
 
-    buf = (uint8_t *) AllocMem(g_sector_size, MEMF_PUBLIC);
+    buf = (uint8_t *) AllocMemType(g_sector_size, memtype);
     if (buf == NULL) {
         printf("Unable to allocate %d bytes\n", g_sector_size);
         return (1);
@@ -619,7 +754,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
     }
     offset &= ~(g_sector_size - 1);
 
-    FreeMem(buf, g_sector_size);
+    FreeMemType(buf, g_sector_size);
     *sectors = min_offset / g_sector_size;
     return (0);
 }
@@ -750,6 +885,8 @@ scsi_probe_unit(uint unit, struct IOExtTD *tio)
     if (rc == 0) {
         printf("%3d", unit);
         erc = do_scsi_inquiry(tio, unit, &inq_res);
+        if (erc == ENOMEM)
+            return (erc);
         if (erc == 0) {
             printf(" %-*.*s %-*.*s %-*.*s %-7s",
                sizeof (inq_res->vendor),
@@ -762,7 +899,7 @@ scsi_probe_unit(uint unit, struct IOExtTD *tio)
                sizeof (inq_res->revision),
                trim_spaces(inq_res->revision, sizeof (inq_res->revision)),
                devtype_str((inq_res->device) & SID_TYPE));
-            FreeMem(inq_res, sizeof (*inq_res));
+            FreeMemType(inq_res, sizeof (*inq_res));
         } else {
             uint floppytype;
             uint tracks;
@@ -791,7 +928,7 @@ scsi_probe_unit(uint unit, struct IOExtTD *tio)
                 cap_c++;
             }
             printf("%5u %5u %cB", ssize, cap, "KMGTPEZY"[cap_c]);
-            FreeMem(cap10, sizeof (*cap10));
+            FreeMemType(cap10, sizeof (*cap10));
         }
         printf("\n");
         close_device(tio);
@@ -943,7 +1080,7 @@ drive_geometry(void)
                 inq_res->device & SID_TYPE,
                 (inq_res->dev_qual2 & SID_REMOVABLE) ? "Removable" : "");
 #endif
-        FreeMem(inq_res, sizeof (*inq_res));
+        FreeMemType(inq_res, sizeof (*inq_res));
     }
 
     printf("READ_CAPACITY_10 ");
@@ -955,7 +1092,7 @@ drive_geometry(void)
     } else {
         uint last_sector = *(uint32_t *) &cap10->addr;
         printf("%5u %12u\n", *(uint32_t *) &cap10->length, last_sector + 1);
-        FreeMem(cap10, sizeof (*cap10));
+        FreeMemType(cap10, sizeof (*cap10));
         if (g_devsize == 0) {
             g_devsize = (uint64_t) (*(uint32_t *) cap10->length) *
                         (last_sector + 1);
@@ -971,7 +1108,7 @@ drive_geometry(void)
     } else {
         last_sector = *(uint64_t *) &cap16->addr;
         printf("%5c %12s\n", ' ', llu_to_str(last_sector + 1));
-        FreeMem(cap16, sizeof (*cap16));
+        FreeMemType(cap16, sizeof (*cap16));
     }
 
     printf("Read-to capacity ");
@@ -1047,7 +1184,7 @@ show_default:
                 printf("\n");
             }
         }
-        FreeMem(pages, SCSI_MODE_PAGES_BUFSIZE);
+        FreeMemType(pages, SCSI_MODE_PAGES_BUFSIZE);
     }
 
     close_device(tio);
@@ -1070,72 +1207,6 @@ print_time(void)
            tm->tm_hour, tm->tm_min, tm->tm_sec);
 }
 
-static unsigned int
-read_system_ticks(void)
-{
-    struct DateStamp ds;
-    DateStamp(&ds);  /* Measured latency is ~250us on A3000 A3640 */
-    return ((unsigned int) (ds.ds_Minute) * 60 * TICKS_PER_SECOND + ds.ds_Tick);
-}
-
-static unsigned int
-read_system_ticks_wait(void)
-{
-    unsigned int stick = read_system_ticks();
-    unsigned int tick;
-
-    do {
-        tick = read_system_ticks();
-    } while (tick == stick);
-
-    return (tick);
-}
-
-static void
-print_perf(unsigned int ttime, unsigned int xfer_kb, int is_write,
-           uint xfer_size)
-{
-    unsigned int tsec;
-    unsigned int trem;
-    uint rep = xfer_kb;
-    char c1 = 'K';
-    char c2 = 'K';
-
-    if (rep >= 10000) {
-        rep /= 1000;
-        c1 = 'M';
-    }
-    if (ttime == 0)
-        ttime = 1;
-    tsec = ttime / TICKS_PER_SECOND;
-    trem = ttime % TICKS_PER_SECOND;
-
-    if ((xfer_kb / ttime) >= (100000 / TICKS_PER_SECOND)) {
-        /* Transfer rate > 100 MB/sec */
-        xfer_kb /= 1000;
-        c2 = 'M';
-    }
-    if (xfer_kb < 10000000) {
-        /* Transfer < 10 MB (or 10 GB) */
-        xfer_kb = xfer_kb * TICKS_PER_SECOND / ttime;
-    } else {
-        /* Change math order to avoid 32-bit overflow */
-        ttime /= TICKS_PER_SECOND;
-        if (ttime == 0)
-            ttime = 1;
-        xfer_kb /= ttime;
-    }
-
-    if (g_verbose) {
-        printf("%4u %cB %s in %2u.%02u sec: %3u KB xfer: %3u %cB/sec\n",
-               rep, c1, is_write ? "write" : "read ",
-               tsec, trem * 100 / TICKS_PER_SECOND, xfer_size / 1024,
-               xfer_kb, c2);
-    } else {
-        printf("%13u %cB/sec\n", xfer_kb, c2);
-    }
-}
-
 static void
 print_perf_type(int is_write, uint xfer_size)
 {
@@ -1147,6 +1218,12 @@ print_perf_type(int is_write, uint xfer_size)
     }
 }
 
+static uint32_t
+diff_e_clock(struct EClockVal *ev1, struct EClockVal *ev2)
+{
+    return (*((uint64_t *) ev2) - *((uint64_t *) ev1));
+}
+
 static void
 print_latency(uint ttime, uint iters, char endch)
 {
@@ -1154,11 +1231,11 @@ print_latency(uint ttime, uint iters, char endch)
     uint tmsec;
     if (iters == 0)
         iters = 1;
-    tusec = ttime * (1000000 / TICKS_PER_SECOND) / iters;
+    tusec = (uint64_t) ttime * 1000000 / g_e_freq / iters;
     tmsec = tusec / 1000;
     tusec %= 1000;
 
-    printf("%u.%03u ms%c", tmsec, tusec / 10, endch);
+    printf("%u.%03u ms%c", tmsec, (tusec + 5) / 10, endch);
 }
 
 static int
@@ -1169,8 +1246,8 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
     int failcode;
     int iters;
     int num_iter = max_iter;
-    unsigned int stime;
-    unsigned int etime;
+    struct EClockVal stime;
+    struct EClockVal etime;
     unsigned int ttime;
     struct DriveGeometry dg;
 
@@ -1197,7 +1274,7 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
         tio[iter]->iotd_Req.io_Error   = 0xa5;
     }
 
-    stime = read_system_ticks_wait();
+    ReadEClock(&stime);
     for (iter = 0; iter < num_iter; iter++) {
         failcode = DoIO((struct IORequest *) tio[iter]);
         if (failcode != 0) {
@@ -1210,20 +1287,16 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
         if (iter & 0xf)
             continue;
 
-        etime = read_system_ticks();
-        if (etime < stime)
-            etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-        ttime = etime - stime;
-        if (ttime > TICKS_PER_SECOND * 2) {
+        ReadEClock(&etime);
+        ttime = diff_e_clock(&stime, &etime);
+        if (ttime > g_e_freq * 2) {
             iter++;
             break;
         }
     }
     if (iter >= num_iter) {
-        etime = read_system_ticks();
-        if (etime < stime)
-            etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-        ttime = etime - stime;
+        ReadEClock(&etime);
+        ttime = diff_e_clock(&stime, &etime);
     }
     print_latency(ttime, iter, '\n');
 
@@ -1239,7 +1312,7 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
         tio[iter]->iotd_Req.io_Error   = 0xa5;
     }
 
-    stime = read_system_ticks_wait();
+    ReadEClock(&stime);
     for (iter = 0; iter < iters; iter++) {
         SendIO((struct IORequest *) tio[iter]);
     }
@@ -1255,10 +1328,8 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
             }
         }
     }
-    etime = read_system_ticks();
-    if (etime < stime)
-        etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    ttime = etime - stime;
+    ReadEClock(&etime);
+    ttime = diff_e_clock(&stime, &etime);
     print_latency(ttime, iter, '\n');
 
     for (iter = 0; iter < num_iter; iter++)
@@ -1293,8 +1364,8 @@ latency_butterfly(UWORD iocmd, uint8_t *buf, int num_iter,
     int rc = 0;
     int failcode = 0;
     unsigned int step;
-    unsigned int stime;
-    unsigned int etime;
+    struct EClockVal stime;
+    struct EClockVal etime;
     uint64_t pos = 0;
 
     if (g_sector_size == 0)
@@ -1347,7 +1418,7 @@ latency_butterfly(UWORD iocmd, uint8_t *buf, int num_iter,
         }
     }
 
-    stime = read_system_ticks_wait();
+    ReadEClock(&stime);
     /*
      * DoIO always tries IOF_QUICK, but will always wait for the I/O
      * to complete. This is regardless of whether the driver can do
@@ -1360,10 +1431,8 @@ latency_butterfly(UWORD iocmd, uint8_t *buf, int num_iter,
             break;
         }
     }
-    etime = read_system_ticks();
-    if (etime < stime)
-        etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    print_latency(etime - stime, iter, ' ');
+    ReadEClock(&etime);
+    print_latency(diff_e_clock(&stime, &etime), iter, ' ');
     if (rc != 0)  {
         printf(" ");
         print_fail(failcode);
@@ -1379,8 +1448,8 @@ latency_cmd_seq(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
     int rc = 0;
     int failcode = 0;
     UBYTE flags = IOF_QUICK;
-    unsigned int stime;
-    unsigned int etime;
+    struct EClockVal stime;
+    struct EClockVal etime;
 
     if (iocmd & CMD_FLAG_NOT_QUICK) {
         iocmd &= ~CMD_FLAG_NOT_QUICK;
@@ -1397,7 +1466,7 @@ latency_cmd_seq(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
         tio[0]->iotd_Req.io_Error   = 0xa5;
     }
 
-    stime = read_system_ticks_wait();
+    ReadEClock(&stime);
     if (flags == 0) {
         /*
          * SendIO sets up asynch I/O, where the reply is always by message.
@@ -1426,10 +1495,8 @@ latency_cmd_seq(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
         }
     }
 
-    etime = read_system_ticks();
-    if (etime < stime)
-        etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    print_latency(etime - stime, iter, ' ');
+    ReadEClock(&etime);
+    print_latency(diff_e_clock(&stime, &etime), iter, ' ');
     if (rc != 0)  {
         printf(" ");
         print_fail(failcode);
@@ -1444,8 +1511,8 @@ latency_cmd_par(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
     int iter;
     int rc = 0;
     int failcode;
-    unsigned int stime;
-    unsigned int etime;
+    struct EClockVal stime;
+    struct EClockVal etime;
 
     for (iter = 0; iter < num_iter; iter++) {
         tio[iter]->iotd_Req.io_Command = iocmd;
@@ -1457,7 +1524,7 @@ latency_cmd_par(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
         tio[iter]->iotd_Req.io_Error   = 0xa5;
     }
 
-    stime = read_system_ticks_wait();
+    ReadEClock(&stime);
     for (iter = 0; iter < num_iter; iter++) {
         SendIO((struct IORequest *) tio[iter]);
     }
@@ -1470,10 +1537,8 @@ latency_cmd_par(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
             }
         }
     }
-    etime = read_system_ticks();
-    if (etime < stime)
-        etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    print_latency(etime - stime, iter, '\n');
+    ReadEClock(&etime);
+    print_latency(diff_e_clock(&stime, &etime), iter, '\n');
     return (rc);
 }
 
@@ -1484,12 +1549,12 @@ latency_scsidirect_cmd_seq(uint8_t iocmd, uint8_t *buf, int num_iter,
     int iter;
     int rc = 0;
     int failcode;
-    unsigned int stime;
-    unsigned int etime;
     scsi_rw_6_t cmd;
     struct SCSICmd *scmd;
+    struct EClockVal stime;
+    struct EClockVal etime;
 
-    scmd = AllocMem(sizeof (*scmd) * num_iter, MEMF_PUBLIC);
+    scmd = AllocMemType(sizeof (*scmd) * num_iter, memtype);
     if (scmd == NULL) {
         printf("Allocmem failed\n");
         return (1);
@@ -1508,7 +1573,7 @@ latency_scsidirect_cmd_seq(uint8_t iocmd, uint8_t *buf, int num_iter,
         tio[iter]->iotd_Req.io_Data    = scmd + iter;
     }
 
-    stime = read_system_ticks_wait();
+    ReadEClock(&stime);
     for (iter = 0; iter < num_iter; iter++) {
         failcode = DoIO((struct IORequest *) tio[iter]);
         if (failcode != 0) {
@@ -1520,12 +1585,10 @@ latency_scsidirect_cmd_seq(uint8_t iocmd, uint8_t *buf, int num_iter,
             break;
         }
     }
-    etime = read_system_ticks();
-    if (etime < stime)
-        etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    print_latency(etime - stime, iter, '\n');
+    ReadEClock(&etime);
+    print_latency(diff_e_clock(&stime, &etime), iter, '\n');
 
-    FreeMem(scmd, sizeof (*scmd) * num_iter);
+    FreeMemType(scmd, sizeof (*scmd) * num_iter);
 
     return (rc);
 }
@@ -1536,12 +1599,12 @@ latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
 {
     int iter;
     int rc = 0;
-    unsigned int stime;
-    unsigned int etime;
+    struct EClockVal stime;
+    struct EClockVal etime;
     scsi_rw_6_t cmd;
     struct SCSICmd *scmd;
 
-    scmd = AllocMem(sizeof (*scmd) * num_iter, MEMF_PUBLIC);
+    scmd = AllocMemType(sizeof (*scmd) * num_iter, memtype);
     if (scmd == NULL) {
         printf("Allocmem failed\n");
         return (1);
@@ -1560,7 +1623,7 @@ latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
         tio[iter]->iotd_Req.io_Data    = scmd + iter;
     }
 
-    stime = read_system_ticks_wait();
+    ReadEClock(&stime);
     for (iter = 0; iter < num_iter; iter++) {
         SendIO((struct IORequest *) tio[iter]);
     }
@@ -1573,12 +1636,10 @@ latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
             }
         }
     }
-    etime = read_system_ticks();
-    if (etime < stime)
-        etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    print_latency(etime - stime, iter, '\n');
+    ReadEClock(&etime);
+    print_latency(diff_e_clock(&stime, &etime), iter, '\n');
 
-    FreeMem(scmd, sizeof (*scmd) * num_iter);
+    FreeMemType(scmd, sizeof (*scmd) * num_iter);
 
     return (rc);
 }
@@ -1591,7 +1652,7 @@ latency_read(struct IOExtTD **tio, int max_iter)
     int num_iter;
     uint8_t *buf;
 
-    buf = AllocMem(BUFSIZE, MEMF_PUBLIC);
+    buf = AllocMemType(BUFSIZE, memtype);
     if (buf == NULL) {
         printf("  AllocMem\n");
         return (1);
@@ -1689,7 +1750,7 @@ user_abort:
     }
 
 finish_fail:
-    FreeMem(buf, BUFSIZE);
+    FreeMemType(buf, BUFSIZE);
 
     for (iter = 0; iter < num_iter; iter++)
         close_device(tio[iter]);
@@ -1705,7 +1766,7 @@ latency_write(struct IOExtTD **tio, int max_iter)
     int num_iter;
     uint8_t *buf;
 
-    buf = AllocMem(BUFSIZE, MEMF_PUBLIC);
+    buf = AllocMemType(BUFSIZE, memtype);
     if (buf == NULL) {
         printf("  AllocMem\n");
         return (1);
@@ -1736,7 +1797,7 @@ latency_write(struct IOExtTD **tio, int max_iter)
     print_ltest_name("HD_SCSICMD write parallel");
     rc += latency_scsidirect_cmd_par(SCSI_WRITE_6_COMMAND, buf, num_iter, tio);
 
-    FreeMem(buf, BUFSIZE);
+    FreeMemType(buf, BUFSIZE);
 
     for (iter = 0; iter < num_iter; iter++)
         close_device(tio[iter]);
@@ -1753,8 +1814,8 @@ drive_latency(int do_destructive)
     struct MsgPort *mp;
     struct IOExtTD *tio;
     struct IOExtTD **mtio;
-    unsigned int stime;
-    unsigned int etime;
+    struct EClockVal stime;
+    struct EClockVal etime;
     unsigned int ttime;
 
     mp = CreatePort(0, 0);
@@ -1773,7 +1834,7 @@ drive_latency(int do_destructive)
     }
 
 #define OPENDEVICE_MAX 10000
-    stime = read_system_ticks_wait();
+    ReadEClock(&stime);
     for (iters = 0; iters < OPENDEVICE_MAX; iters++) {
         if ((rc = open_device(tio)) != 0) {
             printf("Open %s Unit %u: ", g_devname, g_unitno);
@@ -1782,10 +1843,8 @@ drive_latency(int do_destructive)
         }
         close_device(tio);
         if ((iters & 7) == 0) {
-            etime = read_system_ticks();
-            if (etime < stime)
-                etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-            ttime = etime - stime;
+            ReadEClock(&etime);
+            ttime = diff_e_clock(&stime, &etime);
             if (ttime > TICKS_PER_SECOND * 2) {
                 iters++;
                 break;
@@ -1793,22 +1852,21 @@ drive_latency(int do_destructive)
         }
     }
 
-    etime = read_system_ticks();
-    if (etime < stime)
-        etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    ttime = etime - stime;
+    ReadEClock(&etime);
+    ttime = diff_e_clock(&stime, &etime);
 
     print_latency(ttime, iters, '\n');
 
     print_ltest_name("OpenDevice multiple");
 
 #define NUM_MTIO 1000
-    mtio = AllocMem(sizeof (*mtio) * NUM_MTIO, MEMF_PUBLIC | MEMF_CLEAR);
+    mtio = AllocMemType(sizeof (*mtio) * NUM_MTIO, memtype);
     if (mtio == NULL) {
         printf("AllocMem\n");
         rc = 1;
         goto need_delete_tio;
     }
+    memset(mtio, 0, sizeof (*mtio));
 
     for (i = 0; i < NUM_MTIO; i++) {
         mtio[i] = (struct IOExtTD *) CreateExtIO(mp, sizeof (struct IOExtTD));
@@ -1827,7 +1885,7 @@ drive_latency(int do_destructive)
     }
     /* Note that tio is left open, so driver is maintaining state here... */
 
-    stime = read_system_ticks_wait();
+    ReadEClock(&stime);
     for (iters = 0; iters < NUM_MTIO; iters++) {
         if ((rc = open_device(mtio[iters])) != 0) {
             printf("Open %s Unit %u: ", g_devname, g_unitno);
@@ -1835,10 +1893,8 @@ drive_latency(int do_destructive)
             break;
         }
         if ((iters & 7) == 0) {
-            etime = read_system_ticks();
-            if (etime < stime)
-                etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-            ttime = etime - stime;
+            ReadEClock(&etime);
+            ttime = diff_e_clock(&stime, &etime);
             if ((ttime > TICKS_PER_SECOND * 2) ||
                 (iters > NUM_MTIO - 7)) {
                 iters++;
@@ -1846,20 +1902,16 @@ drive_latency(int do_destructive)
             }
         }
     }
-    etime = read_system_ticks();
-    if (etime < stime)
-        etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    ttime = etime - stime;
+    ReadEClock(&etime);
+    ttime = diff_e_clock(&stime, &etime);
     print_latency(ttime, iters, '\n');
 
     print_ltest_name("CloseDevice multiple");
-    stime = read_system_ticks_wait();
+    ReadEClock(&stime);
     for (i = 0; i < iters; i++)
         close_device(mtio[i]);
-    etime = read_system_ticks();
-    if (etime < stime)
-        etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
-    ttime = etime - stime;
+    ReadEClock(&etime);
+    ttime = diff_e_clock(&stime, &etime);
     print_latency(ttime, iters, '\n');
 
     if ((latency_getgeometry(mtio, NUM_MTIO / 4)) ||
@@ -1874,7 +1926,7 @@ need_delete_mtio:
     for (i = 0; i < NUM_MTIO; i++)
         if (mtio[i] != NULL)
             DeleteExtIO((struct IORequest *) mtio[i]);
-    FreeMem(mtio, sizeof (*mtio) * NUM_MTIO);
+    FreeMemType(mtio, sizeof (*mtio) * NUM_MTIO);
 
 need_delete_tio:
     DeleteExtIO((struct IORequest *) tio);
@@ -1885,8 +1937,43 @@ need_delete_port:
 }
 
 #define PERF_BUF_SIZE (512 << 10)
-
 #define NUM_TIO 4
+
+static void
+print_perf(uint ttime, uint freq, uint xfer_kb, int is_write, uint xfer_size)
+{
+    uint tsec;
+    uint trem;
+    uint rep = xfer_kb;
+    char c1 = 'K';
+    char c2 = 'K';
+
+    if (rep >= 10000) {
+        rep /= 1000;
+        c1 = 'M';
+    }
+    if (ttime == 0)
+        ttime = 1;
+    tsec = ttime / freq;
+    trem = ttime % freq;
+
+    if ((xfer_kb * (freq / 1000) / ttime) >= 100) {
+        /* Transfer rate > about 100 MB/sec */
+        xfer_kb /= 1000;
+        c2 = 'M';
+    }
+    xfer_kb = (uint64_t) xfer_kb * (uint64_t) freq / (uint64_t) ttime;
+
+    if (g_verbose) {
+        printf("%4u %cB %s in %2u.%02u sec: %3u KB xfer: %3u %cB/sec\n",
+               rep, c1, is_write ? "write" : "read ",
+               tsec, trem * 100 / freq, xfer_size / 1024,
+               xfer_kb, c2);
+    } else {
+        printf("%13u %cB/sec\n", xfer_kb, c2);
+    }
+}
+
 static int
 run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
               uint32_t bufsize)
@@ -1898,15 +1985,18 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
     uint8_t issued[NUM_TIO];
     int cur = 0;
     uint32_t pos;
-    unsigned int stime;
-    unsigned int etime;
+    struct EClockVal stime;
+    struct EClockVal etime;
+    uint32_t freq;
+    uint32_t diff_ticks;
+
     int rep;
 
     for (rep = 0; rep < 10; rep++) {
         pos = 0;
         memset(issued, 0, sizeof (issued));
 
-        stime = read_system_ticks_wait();
+        ReadEClock(&stime);
 
         print_perf_type((iocmd == CMD_READ) ? 0 : 1, bufsize);
         xfer_good = 0;
@@ -1926,13 +2016,10 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
                     break;
                 }
                 if ((xfer & 0x7) == 0) {
-                    /* Cut out early if device is slow */
-                    etime = read_system_ticks();
-                    if (etime - stime > TICKS_PER_SECOND) {
-                        if (etime < stime)
-                            etime += 24 * 60 * 60 * TICKS_PER_SECOND;
-                        if (etime - stime > TICKS_PER_SECOND)
-                            break;
+                    /* Cut out early if device is slow (> 1 second) */
+                    ReadEClock(&etime);
+                    if (diff_e_clock(&stime, &etime) > g_e_freq) {
+                        break;
                     }
                 }
             }
@@ -1967,11 +2054,10 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
                 cur = 0;
         }
 
-        etime = read_system_ticks();
-        if (etime < stime)
-            etime += 24 * 60 * 60 * TICKS_PER_SECOND;  /* Next day */
+        freq = ReadEClock(&etime);
+        diff_ticks = diff_e_clock(&stime, &etime);
 
-        print_perf(etime - stime, bufsize / 1000 * xfer_good,
+        print_perf(diff_ticks, freq, bufsize / 1000 * xfer_good,
                    (iocmd == CMD_READ) ? 0 : 1, bufsize);
         bufsize >>= 2;
         if (bufsize < 16384)
@@ -1987,18 +2073,6 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
     return (rc);
 }
 
-#include <exec/execbase.h>
-#include <exec/memory.h>
-#include <libraries/configregs.h>
-
-#define MEMTYPE_ANY   0
-#define MEMTYPE_CHIP  1
-#define MEMTYPE_FAST  2
-#define MEMTYPE_24BIT 3
-#define MEMTYPE_ZORRO 4
-#define MEMTYPE_ACCEL 5
-#define MEMTYPE_MAX   5
-
 static const char *
 memtype_str(uint32_t mem)
 {
@@ -2009,7 +2083,10 @@ memtype_str(uint32_t mem)
         type = "Slow";
     } else if (((mem >= 0x04000000) && (mem < 0x08000000)) ||
                (mem == MEMTYPE_FAST))  {
-        type = "Fast";
+        type = "MB";
+    } else if (((mem >= 0x08000000) && (mem < 0x10000000)) ||
+               (mem == MEMTYPE_COPROC))  {
+        type = "Coprocessor";
     } else if (mem == MEMTYPE_ZORRO) {
         type = "Zorro";
     } else if ((mem >= E_MEMORYBASE) && (mem < E_MEMORYBASE + E_MEMORYSIZE)) {
@@ -2043,91 +2120,11 @@ show_memlist(void)
 
         for (chunk = mem->mh_First; chunk != NULL;
              chunk = chunk->mc_Next) {
-            printf("  %p 0x%x\n", chunk, (uint) chunk->mc_Bytes);
+            if (g_verbose || (chunk->mc_Bytes >= 512))
+                printf("  %p 0x%x\n", chunk, (uint) chunk->mc_Bytes);
         }
     }
     Permit();
-}
-
-APTR
-AllocMemType(ULONG byteSize, uint32_t memtype)
-{
-    switch (memtype) {
-        case 0:
-            /* Highest priority (usually fast) memory */
-            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_ANY));
-        case MEMTYPE_CHIP:
-            /* Chip memory */
-            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_CHIP));
-        case MEMTYPE_FAST:
-            /* Fast memory */
-            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_FAST));
-        case MEMTYPE_24BIT:
-            /* 24-bit memory */
-            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_24BITDMA));
-        case MEMTYPE_ZORRO:
-        case MEMTYPE_ACCEL: {
-            /*
-             * Zorro or accelerator memory -- walk memory list and find
-             * chunk in that memory space
-             */
-            struct ExecBase  *eb = SysBase;
-            struct MemHeader *mem;
-            struct MemChunk  *chunk;
-            uint32_t          chunksize = 0;
-            APTR              chunkaddr = NULL;
-            APTR              addr      = NULL;
-
-            Forbid();
-            for (mem = (struct MemHeader *)eb->MemList.lh_Head;
-                 mem->mh_Node.ln_Succ != NULL;
-                 mem = (struct MemHeader *)mem->mh_Node.ln_Succ) {
-                uint32_t size = (void *) mem->mh_Upper - (void *) mem;
-
-                if ((memtype == MEMTYPE_ZORRO) &&
-                    ((((uint32_t) mem < E_MEMORYBASE) ||
-                      ((uint32_t) mem > E_MEMORYBASE + E_MEMORYSIZE)) &&
-                     (((uint32_t) mem < 0x10000000) ||    // EZ3_CONFIGAREA
-                      ((uint32_t) mem > 0x80000000)))) {  // EZ3_CONFIGAREAEND
-                    /* Not in Zorro II or Zorro III address range */
-                    continue;
-                }
-                if ((memtype == MEMTYPE_ACCEL) &&
-                     (((uint32_t) mem < 0x80000000) ||
-                      ((uint32_t) mem > 0xe0000000))) {
-                    /* Not in Accelerator address range */
-                    continue;
-                }
-
-                /* Find the smallest chunk where this allocation will fit */
-                for (chunk = mem->mh_First; chunk != NULL;
-                     chunk = chunk->mc_Next) {
-                    uint32_t cursize = chunk->mc_Bytes;
-                    if (((uint32_t) chunk < (uint32_t) mem) ||
-                        ((uint32_t) chunk > (uint32_t) mem + size) ||
-                        ((uint32_t) chunk + cursize > (uint32_t) mem + size)) {
-                        break;  // Memory list corrupt - quit now!
-                    }
-
-                    if (cursize >= byteSize) {
-                        if ((chunkaddr != NULL) && (chunksize <= cursize))
-                            continue;
-                        chunkaddr = chunk;
-                        chunksize = cursize;
-                    }
-                }
-            }
-            if (chunkaddr != NULL)
-                addr = AllocAbs(byteSize, chunkaddr);
-            Permit();
-            return (addr);
-        }
-        default:
-            /* Allocate user-specified address */
-            if (memtype > MEMTYPE_MAX)
-                return (AllocAbs(byteSize, (APTR) memtype));
-            return (NULL);
-    }
 }
 
 static int
@@ -2180,14 +2177,14 @@ try_again:
                 /* Restart loop, asking for a smaller buffer */
                 size_t j;
                 for (j = 0; j < i; j++) {
-                    FreeMem(buf[j], perf_buf_size);
+                    FreeMemType(buf[j], perf_buf_size);
                     buf[j] = NULL;
                 }
                 perf_buf_size /= 2;
                 goto try_again;
             }
             printf("Unable to allocate ");
-            if (memtype != 0)
+            if (memtype != MEMTYPE_ANY)
                 printf("%s ", memtype_str((uint32_t) memtype));
             printf("RAM");
             if (memtype > MEMTYPE_MAX)
@@ -2213,7 +2210,7 @@ try_again:
 allocmem_fail:
     for (i = 0; i < ARRAY_SIZE(buf); i++)
         if (buf[i] != NULL)
-            FreeMem(buf[i], perf_buf_size);
+            FreeMemType(buf[i], perf_buf_size);
 
 opendevice_fail:
     for (i = 0; i < ARRAY_SIZE(tio); i++)
@@ -2477,7 +2474,7 @@ test_hd_scsicmd_inquiry(struct IOExtTD *tio)
         if (inq_res->flags3 & SID_RelAdr)
             printf(" Rel");
         printf("\n");
-        FreeMem(inq_res, sizeof (*inq_res));
+        FreeMemType(inq_res, sizeof (*inq_res));
     } else {
         print_fail_nl(rc);
     }
@@ -3697,6 +3694,7 @@ test_td_rawread(struct IOExtTD *tio)
     int      rc;
     uint8_t *buf;
 
+    /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
     buf = (uint8_t *) AllocMem(RAWBUFSIZE, MEMF_PUBLIC | MEMF_CHIP);
     if (buf == NULL) {
         printf("Unable to allocate %d byte\n", RAWBUFSIZE);
@@ -3728,6 +3726,7 @@ test_td_rawread(struct IOExtTD *tio)
     }
 #endif
 
+    /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
     FreeMem(buf, RAWBUFSIZE);
     return (rc);
 }
@@ -3747,6 +3746,7 @@ test_td_rawwrite(struct IOExtTD *tio)
      */
     memset(buf, 0, sizeof (buf));
     for (i = 0; i < ARRAY_SIZE(buf); i++) {
+        /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
         buf[i] = (uint8_t *) AllocMem(RAWBUFSIZE, MEMF_PUBLIC);
         if (buf[i] == NULL) {
             printf("Unable to allocate %d bytes\n", RAWBUFSIZE);
@@ -3771,6 +3771,7 @@ test_td_rawwrite(struct IOExtTD *tio)
 
 buf_alloc_failed:
     for (i = 0; i < ARRAY_SIZE(buf); i++) {
+        /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
         FreeMem(buf[i], RAWBUFSIZE);
     }
     return (0);
@@ -4104,7 +4105,7 @@ test_packets(int do_destructive, int test_level,
 
     memset(buf, 0, sizeof (buf));
     for (i = 0; i < ARRAY_SIZE(buf); i++) {
-        buf[i] = (uint8_t *) AllocMem(BUFSIZE, MEMF_PUBLIC);
+        buf[i] = (uint8_t *) AllocMemType(BUFSIZE, memtype);
         if (buf[i] == NULL)
             goto allocmem_fail;
     }
@@ -4167,7 +4168,7 @@ test_packets(int do_destructive, int test_level,
 allocmem_fail:
     for (i = 0; i < ARRAY_SIZE(buf); i++)
         if (buf[i] != NULL)
-            FreeMem(buf[i], BUFSIZE);
+            FreeMemType(buf[i], BUFSIZE);
     if (tio != NULL)
         close_device(tio);
 opendev_fail:
@@ -4238,7 +4239,6 @@ main(int argc, char *argv[])
 #define MAX_CMD_MASKS 32
     uint     test_cmd_count = 0;
     uint64_t test_cmd_mask[32];
-    uint32_t memtype = MEMTYPE_ANY;
     struct IOExtTD tio;
     uint flag_benchmark = 0;
     uint flag_destructive = 0;
@@ -4248,11 +4248,14 @@ main(int argc, char *argv[])
     uint flag_testpackets = 0;
     uint did_open = 0;
     char *unit = NULL;
+    struct EClockVal dummy;
 
     memset(test_cmd_mask, 0, sizeof (test_cmd_mask));
 #ifndef _DCC
     SysBase = *(struct ExecBase **)4UL;
 #endif
+    TimerBase = (struct Device *) FindName(&SysBase->DeviceList, TIMERNAME);
+    g_e_freq = ReadEClock(&dummy);
 
     for (arg = 1; arg < argc; arg++) {
         char *ptr = argv[arg];
@@ -4292,7 +4295,13 @@ main(int argc, char *argv[])
                         }
                         break;
                     case 'm':
-                        if (++arg < argc) {
+                        if (memtype != MEMTYPE_ANY) {
+                            if (memtype <= MEMTYPE_MAX) {
+                                printf("Memory type already specified\n");
+                                exit(1);
+                            }
+                            mem_skip_alloc++;
+                        } else if (++arg < argc) {
                             if (strcmp(argv[arg], "-") == 0) {
                                 show_memlist();
                                 exit(0);
@@ -4304,9 +4313,14 @@ main(int argc, char *argv[])
                                 memtype = MEMTYPE_24BIT;
                             } else if (strcasecmp(argv[arg], "zorro") == 0) {
                                 memtype = MEMTYPE_ZORRO;
-                            } else if (strncasecmp(argv[arg],
-                                                   "accel", 5) == 0) {
+                            } else if (strncasecmp(argv[arg], "copr", 3) == 0) {
+                                memtype = MEMTYPE_COPROC;
+                            } else if (strncasecmp(argv[arg], "acce", 4) == 0) {
                                 memtype = MEMTYPE_ACCEL;
+                            } else if ((strncasecmp(argv[arg],
+                                                    "motherboard", 4) == 0) ||
+                                       (strcasecmp(argv[arg], "mb") == 0)) {
+                                memtype = MEMTYPE_MB;
                             } else if (sscanf(argv[arg], "%x", &memtype) != 1) {
                                 printf("invalid argument %s for %s\n",
                                        argv[arg], ptr);
@@ -4315,7 +4329,7 @@ main(int argc, char *argv[])
                         } else {
                             printf("%s requires an argument\n"
                                    "    One of: chip, fast, 24bit, zorro, "
-                                   "accel, or <addr>\n", ptr);
+                                   "accel, coproc, or <addr>\n", ptr);
                             exit(1);
                         }
                         break;
