@@ -14,7 +14,7 @@
  * OR MISUSE OF THIS UTILITY OR INFORMATION REPORTED BY THIS UTILITY.
 
  */
-const char *version = "\0$VER: devtest 1.4 ("__DATE__") © Chris Hooper";
+const char *version = "\0$VER: devtest 1.5 ("__DATE__") © Chris Hooper";
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1300,6 +1300,12 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
     }
     print_latency(ttime, iter, '\n');
 
+    if (is_user_abort()) {
+        printf("^C abort\n");
+        rc++;
+        goto finish_fail;
+    }
+
     iters = iter;
     print_ltest_name("TD_GETGEOMETRY parallel");
     for (iter = 0; iter < iters; iter++) {
@@ -1332,13 +1338,14 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
     ttime = diff_e_clock(&stime, &etime);
     print_latency(ttime, iter, '\n');
 
+finish_fail:
     for (iter = 0; iter < num_iter; iter++)
         close_device(tio[iter]);
 
     g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
     g_sector_size = dg.dg_SectorSize;
 
-    return (0);
+    return (rc);
 }
 
 #define BUTTERFLY_MODE_AVG   0  // Average seek time across device
