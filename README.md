@@ -1,23 +1,26 @@
-# amiga block device test utility
+# Amiga block device test utility (devtest)
 
 This utility interacts directly with an Amiga block device driver to
 test the driver and physical device. There are several different
 operation types that the utility can perform:
-    Device probe
-    Performance
-    Packet support
-    Geometry
-    Data integrity
+   * Device probe
+   * Performance
+   * Packet support
+   * Device Geometry
+   * Data integrity
 
-1. Device probe
+## 1. Device probe
     It can probe all targets and logical units of a device and report
     which targets are responding. Example:
+```
         9.OS322:> devtest -p scsi.device
           0 ZULUSCSI HARDDRIVE        1.1  Disk     512  2147 MB
           5 ZULUSCSI CDROM            1.1  CDROM   2048    77 MB
+```
 
     You can also probe a specific target id. If that target id is
     not present, devtest will exit with a non-zero code. Example:
+```
         9.OS322:> devtest -p scsi.device 0
           0 ZULUSCSI HARDDRIVE        1.1  Disk     512  2147 MB
         9.OS322:> echo $RC
@@ -26,10 +29,12 @@ operation types that the utility can perform:
         Open scsi.device Unit 1: Fail 32 TDERR_BadUnitNum
         9.OS322:> echo $RC
         1
+```
 
-2. Performance
+## 2. Performance
     You can measure device read and write performance in the system,
     using different Amiga memory types (default is fastmem). Examples:
+```
         9.OS322:> devtest a4091.device 1 -bd
         Test a4091.device 1 with Coprocessor RAM
         read  512 KB xfers          5992 KB/sec
@@ -38,8 +43,10 @@ operation types that the utility can perform:
         write 512 KB xfers          5821 KB/sec
         write 128 KB xfers          4887 KB/sec
         write  32 KB xfers          3913 KB/sec
+```
 
     Testing with Zorro memory
+```
         9.OS322:> devtest a4091.device 1 -bd -m zorro
         Test a4091.device 1 with Zorro III RAM
         read  512 KB xfers          7377 KB/sec
@@ -48,11 +55,14 @@ operation types that the utility can perform:
         write 512 KB xfers          7350 KB/sec
         write 128 KB xfers          5893 KB/sec
         write  32 KB xfers          4031 KB/sec
+```
 
-    Sometimes there is memory which is at a specific range of
-    addresses, and you want to use that memory. With the -m option,
-    you may discover free memory and specify the exact memory
-    address to use:
+    Sometimes there is type of memory which is at a specific range
+    of addresses, and you want to use an address in that range.
+    With the -m option, you may both discover free memory and specify
+    the exact address to use. Use the `-m -` argument to show memory
+    blocks in the free list.
+```
         9.OS322:> devtest -m -
         Coprocessor RAM at 0x8000000 size=0x8000000
           0x86b6220 0x400
@@ -72,14 +82,20 @@ operation types that the utility can perform:
           0x60000020 0xfffffe0
         Chip RAM at 0x004000 size=0x1fc000
           0x0202d8 0x1dfd28
+```
+    Use the -m <address> option to specify a particular block
+    of memory. Example:
+```
         9.OS322:> devtest a4091.device 1 -bd -m 0x60000020
+```
 
-3. Packet support
+## 3. Packet support
     Trackdisk-compatible drivers often don't support all request
     packet types that a filesystem may use. This is especially true
     if it's an older driver that can't handle the packet standards
     which support larger (4GB+) media. Devtest will test most known
     trackdisk commands and report whether they are supported. Example:
+```
         9.OS322:> devtest -t a4091.device 1 -d
         TD_GETGEOMETRY     Success  4194304 x 512  C=8192 H=32 S=16 Type=0
         TD_CHANGENUM       Success  Count=1
@@ -113,11 +129,45 @@ operation types that the utility can perform:
         NSCMD_ETD_FORMAT64 Success
         TD_MOTOR ON        Success
         TD_MOTOR OFF       Success
+```
+    Adding a second `-b` option will cause devtest to also measure
+    latency of a variety of packets. Example:
+```
+        9.OS322:> devtest -bbd a4091.device 1
+        Test a4091.device 1 with Coprocessor RAM
+        read  512 KB xfers          5995 KB/sec
+        read  128 KB xfers          5768 KB/sec
+        read   32 KB xfers          4906 KB/sec
+        write 512 KB xfers          5800 KB/sec
+        write 128 KB xfers          5027 KB/sec
+        write  32 KB xfers          4020 KB/sec
+        OpenDevice / CloseDevice    2.090 ms
+        OpenDevice multiple         0.003 ms
+        CloseDevice multiple        0.001 ms
+        TD_GETGEOMETRY sequential   2.021 ms
+        TD_GETGEOMETRY parallel     1.100 ms
+        TD_CHANGENUM                0.006 ms
+        TD_CHANGENUM quick          0.006 ms
+        CMD_INVALID                 0.006 ms
+        CMD_START                   1.001 ms
+        CMD_READ butterfly average  1.063 ms
+        CMD_READ butterfly far      1.057 ms
+        CMD_READ butterfly constant 1.058 ms
+        CMD_READ sequential         2.077 ms
+        CMD_READ parallel           2.059 ms
+        HD_SCSICMD read sequential  2.072 ms
+        HD_SCSICMD read parallel    2.058 ms
+        CMD_WRITE sequential        3.052 ms
+        CMD_WRITE parallel          3.034 ms
+        HD_SCSICMD write sequential 3.054 ms
+        HD_SCSICMD write parallel   3.036 ms
+```
 
-4. Geometry
+## 4. Device Geometry
     On the Amiga, there are multiple methods to acquire a drive's physical
     geometry, including direct SCSI commands. These methods are reported
     by devtest.
+```
         9.OS322:> devtest -g a4091.device 1
                          SSize TotalSectors   Cyl  Head  Sect  DType Removable
         TD_GETGEOMETRY     512      4194304  8192    32    16  0x00  No
@@ -127,6 +177,7 @@ operation types that the utility can perform:
         Read-to capacity   512      4194304
         Mode Page 0x03     512                             63
         Mode Page 0x04                        261   255
+```
 
     Not all drivers or devices support all commands or mode pages. A
     good example is SCSI READ_CAPACITY_16. This command is practically
@@ -134,17 +185,19 @@ operation types that the utility can perform:
     the SCSI specification in the early 2000's, so older drives will
     definitely not support it.
 
-5. Data integrity
+## 5. Data integrity
     The benchmark test is a good tool for verifying the Amiga's bus
     interface and timing are being met, but it does no actual data
     verification. The devtest utility can perform tests to verify that
     data can be reliably stored to and retrieved from the device media.
 
-    CAUTION: This test is destructive. Do not operate on a drive with
-             data you intend to keep.
+>   CAUTION: This test is destructive. Do not operate on a drive with
+>            data you intend to keep.
 
     Example:
+```
         9.OS322:> devtest a4091.device 1 -i 1024 -d
+```
 
     The above command performs a single 1024 byte write to the device,
     and then reads that data back. It will report any miscompares, and
@@ -152,6 +205,7 @@ operation types that the utility can perform:
     of the device's storage. You can loop on this operation, in which
     case, all device data will be sequentially written and then read back.
     Example (test 64 MB of device storage in 64KB chunks):
+```
         9.OS322:> devtest a4091.device 1 -i 65536 -d -l 1024
         Pass 1  2024-07-07 00:32:46
         Pass 2  2024-07-07 00:32:46
@@ -161,6 +215,7 @@ operation types that the utility can perform:
         Pass 1023  2024-07-07 00:36:17
         Pass 1024  2024-07-07 00:36:17
         1024 passes completed successfully
+```
 
-    As one can calculate from the above, the data integrity test, at
-    about 300 KB/sec, is significantly slower than the performance test.
+    As can be calculated from the above (about 300 KB/sec), the data
+    integrity test is significantly slower than the performance test.
