@@ -3,7 +3,7 @@
  * -------
  * Utility to test AmigaOS block devices (trackdisk.device, scsi.device, etc).
  *
- * Copyright 2023 Chris Hooper. This program and source may be used
+ * Copyright 2024 Chris Hooper. This program and source may be used
  * and distributed freely, for any purpose which benefits the Amiga
  * community. Commercial use of the binary, source, or algorithms requires
  * prior written approval from Chris Hooper <amiga@cdh.eebugs.com>.
@@ -12,9 +12,8 @@
  * DISCLAIMER: THE SOFTWARE IS PROVIDED "AS-IS", WITHOUT ANY WARRANTY.
  * THE AUTHOR ASSUMES NO LIABILITY FOR ANY DAMAGE ARISING OUT OF THE USE
  * OR MISUSE OF THIS UTILITY OR INFORMATION REPORTED BY THIS UTILITY.
-
  */
-const char *version = "\0$VER: devtest 1.5 ("__DATE__") © Chris Hooper";
+const char *version = "\0$VER: devtest 1.5b ("__DATE__") © Chris Hooper";
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,7 +43,7 @@ const char *version = "\0$VER: devtest 1.5 ("__DATE__") © Chris Hooper";
 typedef unsigned char  uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned long  uint32_t;
-typedef struct { unsigned long hi; unsigned long lo;} uint64_t;
+typedef struct { unsigned long hi; unsigned long lo; } uint64_t;
 #define __packed
 #else
 #include <devices/cd.h>
@@ -57,7 +56,8 @@ struct ExecBase *DOSBase;
 struct Device   *TimerBase;
 #endif
 
-/* ULONG has changed from NDK 3.9 to NDK 3.2.
+/*
+ * ULONG has changed from NDK 3.9 to NDK 3.2.
  * However, PRI*32 did not. What is the right way to implement this?
  */
 #if INCLUDE_VERSION < 47
@@ -69,9 +69,10 @@ struct Device   *TimerBase;
 #define PRIx32 "lx"
 #endif
 
-/* Trackdisk-64 enhanced commands */
-/* Check before defining. AmigaOS 3.2 NDK provides these in
- * trackdisk.h
+/*
+ * Trackdisk-64 enhanced commands
+ *
+ * Check before defining. AmigaOS 3.2 NDK provides these in trackdisk.h
  */
 #ifndef TD_READ64
 #define TD_READ64    24      // Read at 64-bit offset
@@ -120,7 +121,7 @@ struct Device   *TimerBase;
 #define MEMTYPE_MAX    7
 
 
-#define	SSD_SENSE_KEY(x)        ((x[2]) & 0x0f)
+#define SSD_SENSE_KEY(x)        ((x[2]) & 0x0f)
 #define SSD_SENSE_ASC(x)        (x[12])
 #define SSD_SENSE_ASCQ(x)       (x[13])
 
@@ -200,7 +201,7 @@ typedef struct scsi_rw_6 {
     uint8_t control;
 } __packed scsi_rw_6_t;
 
-#define	MODE_SENSE_6		0x1a
+#define MODE_SENSE_6            0x1a
 #define SCSI_MODE_PAGES_BUFSIZE 255
 
 #define DISK_PGCODE 0x3F    /* only 6 bits valid */
@@ -229,14 +230,14 @@ struct scsi_mode_sense_6 {
 typedef struct NSDeviceQueryResult
 {
     /*
-    ** Standard information
-    */
+     * Standard information
+     */
     ULONG   DevQueryFormat;         /* this is type 0               */
     ULONG   SizeAvailable;          /* bytes available              */
 
     /*
-    ** Common information (READ ONLY!)
-    */
+     * Common information (READ ONLY!)
+     */
     UWORD   DeviceType;             /* what the device does         */
     UWORD   DeviceSubType;          /* depends on the main type     */
     UWORD   *SupportedCommands;     /* 0 terminated list of cmd's   */
@@ -252,10 +253,18 @@ typedef struct {
     uint64_t           mask;
     char               name[24];
     const char * const desc;
+    const char * const arg_help;
 } test_cmds_t;
+
+typedef struct {
+    uint8_t  arg_count;
+    uint32_t arg[4];
+} args_t;
 
 static int do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len,
                        void *buf, int nsd);
+
+#define TEST_MAX_CMDS 32
 
 BOOL __check_abort_enabled = 0;       // Disable gcc clib2 ^C break handling
 
@@ -271,9 +280,13 @@ static uint      g_unitno;            // Device unit and LUN
 static uint      g_e_freq;            // Frequency of eclock (715909 tps)
 static UWORD     g_sense_length;      // Length of returned sense data (if any)
 static UBYTE     g_sense_data[255];   // Sense data buffer
+static uint8_t  *g_ibuf[4];           // Integrity test buffers
 static UBYTE     mem_skip_alloc = 0;  // Skip memory allocate
 static uint32_t  memtype = MEMTYPE_ANY; // Memory type
-
+static uint64_t  test_cmd_mask[32];
+static args_t    test_cmd_args[TEST_MAX_CMDS];
+static args_t   *cur_test_args = NULL;
+static uint      flag_destructive = 0;
 
 static BOOL
 is_user_abort(void)
@@ -308,8 +321,11 @@ usage(void)
            "   -d           also do destructive operations (write)\n"
            "   -g           test drive geometry\n"
            "   -h           display help\n"
+           "   -i <tsize>   data integrity test (destructive) "
+                           "[-i=rand -ii=addr -iii=patt]\n"
            "   -l <loops>   run multiple times\n"
-           "   -m <addr>    use specific memory (Chip Fast 24Bit Zorro MB Accel -=list)\n"
+           "   -m <addr>    "
+                "use specific memory (Chip Fast 24Bit Zorro MB Accel -=list)\n"
            "   -mm <addr>   use specific address without allocation by OS\n"
            "   -o           test open/close\n"
            "   -p           probe SCSI bus for devices\n"
@@ -482,7 +498,7 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
             for (mem = (struct MemHeader *)eb->MemList.lh_Head;
                  mem->mh_Node.ln_Succ != NULL;
                  mem = (struct MemHeader *)mem->mh_Node.ln_Succ) {
-                uint32_t size = (void *) mem->mh_Upper - (void *) mem;
+                uint32_t size = (uint8_t *) mem->mh_Upper - (uint8_t *) mem;
 
                 if ((memtype == MEMTYPE_MB) &&
                      (((uint32_t) mem < 0x04000000) ||
@@ -622,7 +638,7 @@ do_scsidirect_cmd(struct IOExtTD *tio, scsi_generic_t *cmd, uint cmdlen,
     if (reslen > 0) {
         res = AllocMemType(reslen, memtype);
         if (res == NULL) {
-            printf("AllocMem fail 0x%x\n", reslen);
+            printf("  AllocMem %x (%x) fail\n", reslen, memtype);
             g_sense_length = 0;
             return (ENOMEM);
         }
@@ -691,7 +707,7 @@ do_scsi_read_capacity_10(struct IOExtTD *tio, uint lun,
     return (do_scsidirect_cmd(tio, &cmd, 10, len, (void **) cap));
 }
 
-#define	SRC16_SERVICE_ACTION	0x10  // SCSI_READ_CAPACITY_16
+#define SRC16_SERVICE_ACTION    0x10  // SCSI_READ_CAPACITY_16
 static int
 do_scsi_read_capacity_16(struct IOExtTD *tio,
                          scsi_read_capacity_16_data_t **cap)
@@ -726,7 +742,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
 
     buf = (uint8_t *) AllocMemType(g_sector_size, memtype);
     if (buf == NULL) {
-        printf("Unable to allocate %d bytes\n", g_sector_size);
+        printf("  AllocMem %x (%x) fail\n", g_sector_size, memtype);
         return (1);
     }
 
@@ -818,9 +834,9 @@ scsi_read_mode_pages(struct IOExtTD *tio, uint8_t **res)
     scsi_generic_t cmd;
     int len = SCSI_MODE_PAGES_BUFSIZE;
 
-#define	SMS_PAGE_ALL_PAGES		0x3f
-#define	SMS_PAGE_SUBPAGES		0x00
-#define	SMS_PAGE_NO_SUBPAGES            0xff
+#define SMS_PAGE_ALL_PAGES              0x3f
+#define SMS_PAGE_SUBPAGES               0x00
+#define SMS_PAGE_NO_SUBPAGES            0xff
 #define SMS_DBD                         0x08 /* disable block descriptors */
 
     memset(&cmd, 0, sizeof (cmd));
@@ -949,7 +965,7 @@ scsi_probe(char *unitstr)
     struct MsgPort *mp;
 
     if ((unitstr != NULL) &&
-        (sscanf(unitstr, "%d", &unit) == 1)) {
+        (sscanf(unitstr, "%i", (int *) &unit) == 1)) {
         justunit = unit;
     }
     mp = CreatePort(0, 0);
@@ -1563,7 +1579,7 @@ latency_scsidirect_cmd_seq(uint8_t iocmd, uint8_t *buf, int num_iter,
 
     scmd = AllocMemType(sizeof (*scmd) * num_iter, memtype);
     if (scmd == NULL) {
-        printf("Allocmem failed\n");
+        printf("  AllocMem %x (%x) fail\n", sizeof (*scmd) * num_iter, memtype);
         return (1);
     }
 
@@ -1613,7 +1629,7 @@ latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
 
     scmd = AllocMemType(sizeof (*scmd) * num_iter, memtype);
     if (scmd == NULL) {
-        printf("Allocmem failed\n");
+        printf("  AllocMem %x (%x) fail\n", sizeof (*scmd) * num_iter, memtype);
         return (1);
     }
 
@@ -1661,7 +1677,7 @@ latency_read(struct IOExtTD **tio, int max_iter)
 
     buf = AllocMemType(BUFSIZE, memtype);
     if (buf == NULL) {
-        printf("  AllocMem\n");
+        printf("  AllocMem %x (%x) fail\n", BUFSIZE, memtype);
         return (1);
     }
 
@@ -1775,7 +1791,7 @@ latency_write(struct IOExtTD **tio, int max_iter)
 
     buf = AllocMemType(BUFSIZE, memtype);
     if (buf == NULL) {
-        printf("  AllocMem\n");
+        printf("  AllocMem %x (%x) fail\n", BUFSIZE, memtype);
         return (1);
     }
 
@@ -1869,7 +1885,7 @@ drive_latency(int do_destructive)
 #define NUM_MTIO 1000
     mtio = AllocMemType(sizeof (*mtio) * NUM_MTIO, memtype);
     if (mtio == NULL) {
-        printf("AllocMem\n");
+        printf("  AllocMem %x (%x) fail\n", sizeof (*mtio) * NUM_MTIO, memtype);
         rc = 1;
         goto need_delete_tio;
     }
@@ -2120,15 +2136,24 @@ show_memlist(void)
     for (mem = (struct MemHeader *)eb->MemList.lh_Head;
          mem->mh_Node.ln_Succ != NULL;
          mem = (struct MemHeader *)mem->mh_Node.ln_Succ) {
-        uint32_t    size = (void *) mem->mh_Upper - (void *) mem;
+        uint32_t    size = (uint8_t *) mem->mh_Upper - (uint8_t *) mem;
+        uint32_t    upper = (uintptr_t) mem->mh_Upper;
         const char *type = memtype_str((uint32_t) mem);
 
-        printf("%s RAM at %p size=0x%x\n", type, mem, size);
+        printf("%s RAM at %p size=0x%x\n", type, (void *) mem, size);
 
         for (chunk = mem->mh_First; chunk != NULL;
              chunk = chunk->mc_Next) {
-            if (g_verbose || (chunk->mc_Bytes >= 512))
-                printf("  %p 0x%x\n", chunk, (uint) chunk->mc_Bytes);
+            uint bytes = chunk->mc_Bytes;
+            if (g_verbose || (chunk->mc_Bytes >= 512)) {
+                printf("  %p 0x%x", (void *) chunk, bytes);
+                if ((uintptr_t) chunk + bytes > upper)
+                    printf(" ** CORRUPT: 0x%x is maximum size",
+                           upper - (uintptr_t) chunk);
+                printf("\n");
+            }
+            if ((uintptr_t) chunk + bytes >= upper)
+                break;  // Corrupt memory list?
         }
     }
     Permit();
@@ -2543,12 +2568,12 @@ get_changenum(struct IOExtTD *tio)
 
 static int
 test_etd_command(struct IOExtTD *tio, UWORD cmd, const char *cmd_name,
-                 uint len, void *buf, uint io_actual)
+                 uint len, void *buf, uint io_actual, uint io_offset)
 {
     int rc;
 
     tio->iotd_Req.io_Command = cmd;
-    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Offset  = io_offset;
     tio->iotd_Req.io_Actual  = io_actual;
     tio->iotd_Req.io_Length  = len;
     tio->iotd_Req.io_Data    = buf;
@@ -2588,23 +2613,83 @@ test_etd_command(struct IOExtTD *tio, UWORD cmd, const char *cmd_name,
     return (rc);
 }
 
+static void
+get_args_1(uint *arg1)
+{
+    if (cur_test_args == NULL)
+        return;
+
+    if (cur_test_args->arg_count > 0)
+        *arg1 = cur_test_args->arg[0];
+
+    if (cur_test_args->arg_count > 1) {
+        printf("Too many args for this command\n");
+        exit(1);
+    }
+}
+
+static void
+get_args_2(uint *arg1, uint *arg2)
+{
+    if (cur_test_args == NULL)
+        return;
+
+    if (cur_test_args->arg_count > 0)
+        *arg1 = cur_test_args->arg[0];
+
+    if (cur_test_args->arg_count > 1)
+        *arg2 = cur_test_args->arg[1];
+
+    if (cur_test_args->arg_count > 2) {
+        printf("Too many args for this command\n");
+        exit(1);
+    }
+}
+
+static void
+get_args_3(uint *arg1, uint *arg2, uint *arg3)
+{
+    if (cur_test_args == NULL)
+        return;
+
+    if (cur_test_args->arg_count > 0)
+        *arg1 = cur_test_args->arg[0];
+
+    if (cur_test_args->arg_count > 1)
+        *arg2 = cur_test_args->arg[1];
+
+    if (cur_test_args->arg_count > 2)
+        *arg3 = cur_test_args->arg[2];
+
+    if (cur_test_args->arg_count > 3) {
+        printf("Too many args for this command\n");
+        exit(1);
+    }
+}
+
 #define BUF_COUNT 6
 static int
 test_cmd_read(struct IOExtTD *tio)
 {
     int rc;
     uint8_t **buf = g_buf;
+    uint readoffset = 0;
+    uint bufsize = BUFSIZE;
+
+    get_args_2(&bufsize, &readoffset);
+    if (bufsize > BUFSIZE)
+        bufsize = BUFSIZE;
 
     /* Read */
-    memset(buf[0], 0x5a, BUFSIZE);
+    memset(buf[0], 0x5a, bufsize);
     print_test_name("CMD_READ");
-    rc = do_read_cmd(tio, 0, BUFSIZE, buf[0], 0);
+    rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
     if (rc == 0) {
         uint count;
-        for (count = 0; count < BUFSIZE; count++)
+        for (count = 0; count < bufsize; count++)
             if (buf[0][count] != 0x5a)
                 break;
-        if (count == BUFSIZE) {
+        if (count == bufsize) {
             printf("No data\n");
             return (1);
         } else {
@@ -2614,7 +2699,7 @@ test_cmd_read(struct IOExtTD *tio)
         print_fail_nl(rc);
         return (1);
     }
-    memcpy(buf[2], buf[0], BUFSIZE);  // Keep a copy
+    memcpy(buf[2], buf[0], bufsize);  // Keep a copy
 
     return (rc);
 }
@@ -2624,17 +2709,24 @@ test_etd_read(struct IOExtTD *tio)
 {
     int rc;
     uint8_t **buf = g_buf;
+    uint readoffset;
+    uint bufsize = BUFSIZE;
 
-    memset(buf[1], 0xa5, BUFSIZE);
-    rc = test_etd_command(tio, ETD_READ, "ETD_READ", BUFSIZE, buf[1], 0);
+    get_args_2(&bufsize, &readoffset);
+    if (bufsize > BUFSIZE)
+        bufsize = BUFSIZE;
+
+    memset(buf[1], 0xa5, bufsize);
+    rc = test_etd_command(tio, ETD_READ, "ETD_READ", bufsize, buf[1], 0,
+                          readoffset);
     if (rc == 0) {
-        rc = do_read_cmd(tio, 0, BUFSIZE, buf[0], 0);
+        rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
         if (rc != 0) {
             print_fail(rc);
             printf(" - read verify operation failed\n");
             return (1);
         }
-        if (memcmp(buf[0], buf[1], BUFSIZE) == 0) {
+        if (memcmp(buf[0], buf[1], bufsize) == 0) {
             printf("Success\n");
         } else {
             printf("Miscompare\n");
@@ -2649,25 +2741,32 @@ test_td_read64(struct IOExtTD *tio)
 {
     int rc;
     uint8_t **buf = g_buf;
+    uint bufsize = BUFSIZE;
+    uint readoffset = 0;
+    uint readoffsethi = 0;
 
-    memset(buf[1], 0xa5, BUFSIZE);
+    get_args_3(&bufsize, &readoffset, &readoffsethi);
+    if (bufsize > BUFSIZE)
+        bufsize = BUFSIZE;
+
+    memset(buf[1], 0xa5, bufsize);
     tio->iotd_Req.io_Command = TD_READ64;
-    tio->iotd_Req.io_Actual  = 0;  // High 64 bits
-    tio->iotd_Req.io_Offset  = 0;
-    tio->iotd_Req.io_Length  = BUFSIZE;
+    tio->iotd_Req.io_Actual  = readoffsethi;  // High 64 bits
+    tio->iotd_Req.io_Offset  = readoffset;
+    tio->iotd_Req.io_Length  = bufsize;
     tio->iotd_Req.io_Data    = buf[1];
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_READ64");
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        rc = do_read_cmd(tio, 0, BUFSIZE, buf[0], 0);
+        rc = do_read_cmd(tio, 0, bufsize, buf[0], 0);
         if (rc != 0) {
             print_fail(rc);
             printf(" - read verify operation failed\n");
             return (1);
         }
-        if (memcmp(buf[0], buf[1], BUFSIZE) == 0) {
+        if (memcmp(buf[0], buf[1], bufsize) == 0) {
             printf("Success\n");
         } else {
             printf("Miscompare\n");
@@ -2723,25 +2822,32 @@ test_nscmd_td_read64(struct IOExtTD *tio)
 {
     int rc;
     uint8_t **buf = g_buf;
+    uint bufsize = BUFSIZE;
+    uint readoffset = 0;
+    uint readoffsethi = 0;
 
-    memset(buf[1], 0xa5, BUFSIZE);
+    get_args_3(&bufsize, &readoffset, &readoffsethi);
+    if (bufsize > BUFSIZE)
+        bufsize = BUFSIZE;
+
+    memset(buf[1], 0xa5, bufsize);
     tio->iotd_Req.io_Command = NSCMD_TD_READ64;
-    tio->iotd_Req.io_Actual  = 0;  // High 64 bits
-    tio->iotd_Req.io_Offset  = 0;
-    tio->iotd_Req.io_Length  = BUFSIZE;
+    tio->iotd_Req.io_Actual  = readoffsethi;  // High 64 bits
+    tio->iotd_Req.io_Offset  = readoffset;
+    tio->iotd_Req.io_Length  = bufsize;
     tio->iotd_Req.io_Data    = buf[1];
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("NSCMD_TD_READ64");
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        rc = do_read_cmd(tio, 0, BUFSIZE, buf[0], 0);
+        rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
         if (rc != 0) {
             print_fail(rc);
             printf(" - read verify operation failed\n");
             return (1);
         }
-        if (memcmp(buf[0], buf[1], BUFSIZE) == 0) {
+        if (memcmp(buf[0], buf[1], bufsize) == 0) {
             printf("Success\n");
         } else {
             printf("Miscompare\n");
@@ -2758,18 +2864,25 @@ test_nscmd_etd_read64(struct IOExtTD *tio)
 {
     int rc;
     uint8_t **buf = g_buf;
+    uint bufsize = BUFSIZE;
+    uint readoffset = 0;
+    uint readoffsethi = 0;
 
-    memset(buf[1], 0xa6, BUFSIZE);
+    get_args_3(&bufsize, &readoffset, &readoffsethi);
+    if (bufsize > BUFSIZE)
+        bufsize = BUFSIZE;
+
+    memset(buf[1], 0xa6, bufsize);
     rc = test_etd_command(tio, NSCMD_ETD_READ64, "NSCMD_ETD_READ64",
-                          BUFSIZE, buf[1], 0);
+                          bufsize, buf[1], readoffsethi, readoffset);
     if (rc == 0) {
-        rc = do_read_cmd(tio, 0, BUFSIZE, buf[0], 0);
+        rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
         if (rc != 0) {
             print_fail(rc);
             printf(" - read verify operation failed\n");
             return (1);
         }
-        if (memcmp(buf[0], buf[1], BUFSIZE) == 0) {
+        if (memcmp(buf[0], buf[1], bufsize) == 0) {
             printf("Success\n");
         } else {
             printf("Miscompare\n");
@@ -2783,10 +2896,13 @@ static int
 test_td_seek(struct IOExtTD *tio)
 {
     int rc;
+    uint seekoffset = 0;
+
+    get_args_1(&seekoffset);
 
     /* Seek */
     tio->iotd_Req.io_Command = TD_SEEK;
-    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Offset  = seekoffset;
     tio->iotd_Req.io_Length  = 0;
     tio->iotd_Req.io_Data    = NULL;
     tio->iotd_Req.io_Flags   = 0;
@@ -2800,7 +2916,7 @@ test_td_seek(struct IOExtTD *tio)
         uint8_t **buf = g_buf;
         memset(buf[1], 0xa5, BUFSIZE);
         tio->iotd_Req.io_Command = TD_SEEK;
-        tio->iotd_Req.io_Offset  = 0;
+        tio->iotd_Req.io_Offset  = seekoffset;
         tio->iotd_Req.io_Length  = BUFSIZE;
         tio->iotd_Req.io_Data    = buf[1];
         tio->iotd_Req.io_Flags   = 0;
@@ -2820,7 +2936,13 @@ test_td_seek(struct IOExtTD *tio)
 static int
 test_etd_seek(struct IOExtTD *tio)
 {
-    int rc = test_etd_command(tio, ETD_SEEK, "ETD_SEEK", BUFSIZE, g_buf[1], 0);
+    int rc;
+    uint seekoffset = 0;
+
+    get_args_1(&seekoffset);
+
+    rc = test_etd_command(tio, ETD_SEEK, "ETD_SEEK", BUFSIZE, g_buf[1],
+                          0, seekoffset);
     if (rc == 0)
         printf("Success\n");
     return (rc);
@@ -2830,9 +2952,14 @@ static int
 test_td_seek64(struct IOExtTD *tio)
 {
     int rc;
+    uint seekoffset = 0;
+    uint seekoffsethi = 0;
+
+    get_args_2(&seekoffset, &seekoffsethi);
+
     tio->iotd_Req.io_Command = TD_SEEK64;
-    tio->iotd_Req.io_Actual  = 0;  // High 64 bits
-    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Actual  = seekoffsethi;  // High 64 bits
+    tio->iotd_Req.io_Offset  = seekoffset;
     tio->iotd_Req.io_Length  = BUFSIZE;
     tio->iotd_Req.io_Data    = g_buf[1];
     tio->iotd_Req.io_Flags   = 0;
@@ -2848,9 +2975,14 @@ static int
 test_nscmd_td_seek64(struct IOExtTD *tio)
 {
     int rc;
+    uint seekoffset = 0;
+    uint seekoffsethi = 0;
+
+    get_args_2(&seekoffset, &seekoffsethi);
+
     tio->iotd_Req.io_Command = NSCMD_TD_SEEK64;
-    tio->iotd_Req.io_Actual  = 0;  // High 64 bits
-    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Actual  = seekoffsethi;  // High 64 bits
+    tio->iotd_Req.io_Offset  = seekoffset;
     tio->iotd_Req.io_Length  = BUFSIZE;
     tio->iotd_Req.io_Data    = g_buf[1];
     tio->iotd_Req.io_Flags   = 0;
@@ -2866,8 +2998,13 @@ static int
 test_nscmd_etd_seek64(struct IOExtTD *tio)
 {
     int rc;
+    uint seekoffset = 0;
+    uint seekoffsethi = 0;
+
+    get_args_2(&seekoffset, &seekoffsethi);
+
     rc = test_etd_command(tio, NSCMD_ETD_SEEK64, "NSCMD_ETD_SEEK64",
-                          BUFSIZE, g_buf[1], 0);
+                          BUFSIZE, g_buf[1], seekoffsethi, seekoffset);
     if (rc == 0)
         printf("Success\n");
     return (rc);
@@ -3319,6 +3456,9 @@ ar_extio_fail:
 static void
 save_overwritten_data(struct IOExtTD *tio, uint8_t **buf)
 {
+    if (flag_destructive > 1)  // Do not save or restore
+        return;
+
     /* Save data which might be overwritten into a RAM buffer */
     do_read_cmd(tio, 0, BUFSIZE, buf[2], 0);
     do_read_cmd(tio, BUFSIZE, BUFSIZE, buf[3], 0);
@@ -3335,6 +3475,9 @@ restore_overwritten_data(struct IOExtTD *tio, uint8_t **buf, int high)
 {
     int has_nsd = high & 2;
 
+    if (flag_destructive > 1)  // Do not save or restore
+        return;
+
     /* Restore overwritten data */
     do_write_cmd(tio, 0, BUFSIZE, buf[2], 0);
     do_write_cmd(tio, BUFSIZE, BUFSIZE, buf[3], 0);
@@ -3350,19 +3493,25 @@ test_cmd_write(struct IOExtTD *tio)
 {
     int rc;
     uint8_t **buf = g_buf;
+    uint writeoffset = 0;
+    uint bufsize = BUFSIZE;
 
-    memset(buf[0], 0xdb, BUFSIZE);
+    get_args_2(&bufsize, &writeoffset);
+    if (bufsize > BUFSIZE)
+        bufsize = BUFSIZE;
+
+    memset(buf[0], 0xdb, bufsize);
     tio->iotd_Req.io_Command = CMD_WRITE;
     tio->iotd_Req.io_Actual  = 0;  // Unused
-    tio->iotd_Req.io_Offset  = 0;
-    tio->iotd_Req.io_Length  = BUFSIZE;
+    tio->iotd_Req.io_Offset  = writeoffset;
+    tio->iotd_Req.io_Length  = bufsize;
     tio->iotd_Req.io_Data    = buf[0];
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("CMD_WRITE");
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0);
+        check_write(tio, buf[0], buf[1], bufsize, writeoffset, 0);
     } else {
         print_fail(rc);
     }
@@ -3377,11 +3526,18 @@ test_etd_write(struct IOExtTD *tio)
 {
     int rc;
     uint8_t **buf = g_buf;
+    uint writeoffset = 0;
+    uint bufsize = BUFSIZE;
 
-    memset(buf[0], 0xc9, BUFSIZE);
-    rc = test_etd_command(tio, ETD_WRITE, "ETD_WRITE", BUFSIZE, buf[0], 0);
+    get_args_2(&bufsize, &writeoffset);
+    if (bufsize > BUFSIZE)
+        bufsize = BUFSIZE;
+
+    memset(buf[0], 0xc9, bufsize);
+    rc = test_etd_command(tio, ETD_WRITE, "ETD_WRITE", bufsize, buf[0], 0,
+                          writeoffset);
     if (rc == 0) {
-        rc = check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0);
+        rc = check_write(tio, buf[0], buf[1], bufsize, writeoffset, 0);
         printf("\n");
     }
     restore_overwritten_data(tio, buf, 0);
@@ -3394,32 +3550,41 @@ test_td_write64(struct IOExtTD *tio)
 {
     int rc;
     uint8_t **buf = g_buf;
+    uint bufsize = BUFSIZE;
+    uint writeoffset = 0;
+    uint writeoffsethi = 0;
 
-    memset(buf[0], 0xd6, BUFSIZE);
+    get_args_3(&bufsize, &writeoffset, &writeoffsethi);
+    if (bufsize > BUFSIZE)
+        bufsize = BUFSIZE;
+
+    memset(buf[0], 0xd6, bufsize);
     tio->iotd_Req.io_Command = TD_WRITE64;
-    tio->iotd_Req.io_Actual  = 0;  // High 64 bits
-    tio->iotd_Req.io_Offset  = 0;
-    tio->iotd_Req.io_Length  = BUFSIZE;
+    tio->iotd_Req.io_Actual  = writeoffsethi;  // High 64 bits
+    tio->iotd_Req.io_Offset  = writeoffset;
+    tio->iotd_Req.io_Length  = bufsize;
     tio->iotd_Req.io_Data    = buf[0];
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_WRITE64");
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        if (check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0) == 0) {
-            if (g_devsize >= ((1ULL << 32) + BUFSIZE * 2)) {
+        uint64_t offset64 = ((uint64_t) writeoffsethi << 32) | writeoffset;
+        if (check_write(tio, buf[0], buf[1], bufsize, offset64, 0) == 0) {
+            if ((g_devsize >= ((1ULL << 32) + bufsize * 2)) &&
+                (offset64 == 0)) {
                 printf("  4GB:");
-                memset(buf[0], 0xd7, BUFSIZE);
+                memset(buf[0], 0xd7, bufsize);
                 tio->iotd_Req.io_Command = TD_WRITE64;
                 tio->iotd_Req.io_Actual  = 1;  // High 64 bits
                 tio->iotd_Req.io_Offset  = 0;
-                tio->iotd_Req.io_Length  = BUFSIZE;
+                tio->iotd_Req.io_Length  = bufsize;
                 tio->iotd_Req.io_Data    = buf[0];
                 tio->iotd_Req.io_Flags   = 0;
                 tio->iotd_Req.io_Error   = 0xa5;
                 rc = DoIO((struct IORequest *) tio);
                 if (rc == 0) {
-                    check_write(tio, buf[0], buf[1], BUFSIZE, 1ULL << 32, 0);
+                    check_write(tio, buf[0], buf[1], bufsize, 1ULL << 32, 0);
                 } else {
                     print_fail(rc);
                 }
@@ -3439,33 +3604,42 @@ test_nscmd_td_write64(struct IOExtTD *tio)
 {
     int rc;
     uint8_t **buf = g_buf;
+    uint bufsize = BUFSIZE;
+    uint writeoffset = 0;
+    uint writeoffsethi = 0;
 
-    memset(buf[0], 0xe5, BUFSIZE);
+    get_args_3(&bufsize, &writeoffset, &writeoffsethi);
+    if (bufsize > BUFSIZE)
+        bufsize = BUFSIZE;
+
+    memset(buf[0], 0xe5, bufsize);
     tio->iotd_Req.io_Command = NSCMD_TD_WRITE64;
-    tio->iotd_Req.io_Actual  = 0;  // High 64 bits
-    tio->iotd_Req.io_Offset  = 0;
-    tio->iotd_Req.io_Length  = BUFSIZE;
+    tio->iotd_Req.io_Actual  = writeoffsethi;  // High 64 bits
+    tio->iotd_Req.io_Offset  = writeoffset;
+    tio->iotd_Req.io_Length  = bufsize;
     tio->iotd_Req.io_Data    = buf[0];
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("NSCMD_TD_WRITE64");
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        if (check_write(tio, buf[0], buf[1], BUFSIZE, 0, 1) == 0) {
-            if (g_devsize >= ((1ULL << 32) + BUFSIZE * 2)) {
+        uint64_t offset64 = ((uint64_t) writeoffsethi << 32) | writeoffset;
+        if (check_write(tio, buf[0], buf[1], bufsize, offset64, 1) == 0) {
+            if ((g_devsize >= ((1ULL << 32) + bufsize * 2)) &&
+                (offset64 == 0)) {
                 /* Device is large enough to test 4GB boundary */
                 printf("  4GB:");
-                memset(buf[0], 0xe6, BUFSIZE);
+                memset(buf[0], 0xe6, bufsize);
                 tio->iotd_Req.io_Command = NSCMD_TD_WRITE64;
                 tio->iotd_Req.io_Actual  = 1;  // High 64 bits
                 tio->iotd_Req.io_Offset  = 0;
-                tio->iotd_Req.io_Length  = BUFSIZE;
+                tio->iotd_Req.io_Length  = bufsize;
                 tio->iotd_Req.io_Data    = buf[0];
                 tio->iotd_Req.io_Flags   = 0;
                 tio->iotd_Req.io_Error   = 0xa5;
                 rc = DoIO((struct IORequest *) tio);
                 if (rc == 0) {
-                    check_write(tio, buf[0], buf[1], BUFSIZE, 1ULL << 32, 1);
+                    check_write(tio, buf[0], buf[1], bufsize, 1ULL << 32, 1);
                 } else {
                     print_fail(rc);
                 }
@@ -3488,7 +3662,7 @@ test_nscmd_etd_write64(struct IOExtTD *tio)
 
     memset(buf[0], 0xe5, BUFSIZE);
     rc = test_etd_command(tio, NSCMD_ETD_WRITE64, "NSCMD_ETD_WRITE64",
-                          BUFSIZE, buf[0], 0);
+                          BUFSIZE, buf[0], 0, 0);
     if (rc == 0) {
         if ((rc = check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0)) == 0) {
             if (g_devsize >= ((1ULL << 32) + BUFSIZE * 2)) {
@@ -3496,7 +3670,7 @@ test_nscmd_etd_write64(struct IOExtTD *tio)
                 printf("  4GB:");
                 memset(buf[0], 0xe6, BUFSIZE);
                 rc = test_etd_command(tio, NSCMD_ETD_WRITE64,
-                                      NULL, BUFSIZE, buf[0], 1);
+                                      NULL, BUFSIZE, buf[0], 1, 0);
                 if (rc == 0) {
                     rc = check_write(tio, buf[0], buf[1], BUFSIZE,
                                      1ULL << 32, 1);
@@ -3549,7 +3723,7 @@ test_etd_format(struct IOExtTD *tio)
     uint8_t **buf = g_buf;
 
     memset(buf[0], 0xca, BUFSIZE);
-    rc = test_etd_command(tio, ETD_FORMAT, "ETD_FORMAT", BUFSIZE, buf[0], 0);
+    rc = test_etd_command(tio, ETD_FORMAT, "ETD_FORMAT", BUFSIZE, buf[0], 0, 0);
     if (rc == 0) {
         check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0);
         printf("\n");
@@ -3596,7 +3770,7 @@ test_td_format64(struct IOExtTD *tio)
                     print_fail(rc);
                 }
 
-                /* Restore overwritten data above 4GB boundary*/
+                /* Restore overwritten data above 4GB boundary */
                 do_write_cmd(tio, 1ULL << 32, BUFSIZE, buf[4], 1);
                 do_write_cmd(tio, (1ULL << 32) + BUFSIZE, BUFSIZE, buf[5], 1);
             }
@@ -3647,7 +3821,7 @@ test_nscmd_td_format64(struct IOExtTD *tio)
                     print_fail(rc);
                 }
 
-                /* Restore overwritten data above 4GB boundary*/
+                /* Restore overwritten data above 4GB boundary */
                 do_write_cmd(tio, 1ULL << 32, BUFSIZE, buf[4], 1);
                 do_write_cmd(tio, (1ULL << 32) + BUFSIZE, BUFSIZE, buf[5], 1);
             }
@@ -3669,7 +3843,7 @@ test_nscmd_etd_format64(struct IOExtTD *tio)
 
     memset(buf[0], 0xe5, BUFSIZE);
     rc = test_etd_command(tio, NSCMD_ETD_FORMAT64, "NSCMD_ETD_FORMAT64",
-                          BUFSIZE, buf[0], 0);
+                          BUFSIZE, buf[0], 0, 0);
     if (rc == 0) {
         if ((rc = check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0)) == 0) {
             if (g_devsize >= ((1ULL << 32) + BUFSIZE * 2)) {
@@ -3677,7 +3851,7 @@ test_nscmd_etd_format64(struct IOExtTD *tio)
                 printf("  4GB:");
                 memset(buf[0], 0xe6, BUFSIZE);
                 rc = test_etd_command(tio, NSCMD_ETD_FORMAT64,
-                                      NULL, BUFSIZE, buf[0], 1);
+                                      NULL, BUFSIZE, buf[0], 1, 0);
                 if (rc == 0) {
                     rc = check_write(tio, buf[0], buf[1], BUFSIZE,
                                      1ULL << 32, 1);
@@ -3829,90 +4003,130 @@ buf_alloc_failed:
 
 static const test_cmds_t test_cmds[] = {
     { "CHANGEINT",   2, TEST_ADDREMCHANGEINT,
-                        "TD_ADDREMCHANGEINT", "Test change interrupt" },
+                        "TD_ADDREMCHANGEINT", "Test change interrupt",
+                        NULL },
     { "CHANGENUM",   0, TEST_TD_CHANGENUM,
-                        "CMD_CHANGENUM", "Get media change count" },
+                        "CMD_CHANGENUM", "Get media change count",
+                        NULL },
     { "CHANGESTATE", 0, TEST_TD_CHANGESTATE,
-                        "CMD_CHANGESTATE", "Get media change state" },
+                        "CMD_CHANGESTATE", "Get media change state",
+                        NULL },
     { "DRIVETYPE",   0, TEST_TD_GETDRIVETYPE,
-                        "CMD_GETDRIVETYPE", "Get drive type" },
+                        "CMD_GETDRIVETYPE", "Get drive type",
+                        NULL },
     { "GEOMETRY",    0, TEST_CMD_GETGEOMETRY,
-                        "CMD_GETGEOMETRY", "Get device geometry" },
+                        "CMD_GETGEOMETRY", "Get device geometry",
+                        NULL },
     { "NSD",         0, TEST_NSD_DEVICEQUERY,
-                        "CMD_NSD_DEVICEQUERY", "Query for NSD" },
+                        "CMD_NSD_DEVICEQUERY", "Query for NSD",
+                        NULL },
     { "NUMTRACKS",   0, TEST_TD_GETNUMTRACKS,
-                        "TD_GETNUMTRACKS", "Get track count" },
+                        "TD_GETNUMTRACKS", "Get track count",
+                        NULL },
     { "INQUIRY",     0, TEST_HD_SCSICMD_INQ,
-                        "HD_SCSICMD_INQ", "SCSI Inquiry command" },
+                        "HD_SCSICMD_INQ", "SCSI Inquiry command",
+                        NULL },
     { "PROTSTATUS",  0, TEST_TD_PROTSTATUS,
-                        "CMD_PROTSTATUS", "Get protected state" },
+                        "CMD_PROTSTATUS", "Get protected state",
+                        NULL },
     { "TUR",         0, TEST_HD_SCSICMD_TUR,
-                        "HD_SCSICMD_TUR", "SCSI Test Unit Ready command" },
+                        "HD_SCSICMD_TUR", "SCSI Test Unit Ready command",
+                        NULL },
     { "RAWREAD",     0, TEST_TD_RAWREAD,
-                        "TD_RAWREAD", "Read raw track from (floppy) device" },
+                        "TD_RAWREAD", "Read raw track from (floppy) device",
+                        NULL },
 #if 0
     /* These are not implemented yet */
     { "RAWWRITE",    0, TEST_TD_RAWWRITE,
-                        "TD_RAWWRITE", "Write raw track to (floppy) device" },
+                        "TD_RAWWRITE", "Write raw track to (floppy) device",
+                        NULL },
     { "ERAWREAD",    0, TEST_ETD_RAWREAD,
                         "ETD_RAWREAD",
-                        "Extended read raw track from (floppy) device" },
+                        "Extended read raw track from (floppy) device",
+                        NULL },
     { "ERAWWRITE",   0, TEST_ETD_RAWWRITE,
                         "ETD_RAWWRITE",
-                        "Extended write raw track to (floppy) device" },
+                        "Extended write raw track to (floppy) device",
+                        NULL },
 #endif
     { "READ",        0, TEST_CMD_READ,
-                        "CMD_READ", "Read from device" },
+                        "CMD_READ", "Read from device",
+                        "size,offset" },
     { "EREAD",       0, TEST_ETD_READ,
-                        "ETD_READ", "Extended read from device" },
+                        "ETD_READ", "Extended read from device",
+                        "size,offset" },
     { "READ64",      0, TEST_TD_READ64,
-                        "TD_READ64", "TD64 read from device" },
+                        "TD_READ64", "TD64 read from device",
+                        "size,offset,offsethi" },
     { "NSDREAD",     0, TEST_NSCMD_TD_READ64,
-                        "NSCMD_TD_READ64", "NSD Read from device" },
+                        "NSCMD_TD_READ64", "NSD Read from device",
+                        "size,offset,offsethi" },
     { "NSDEREAD",    0, TEST_NSCMD_ETD_READ64,
-                        "NSCMD_ETD_READ64", "NSD extended read from device" },
+                        "NSCMD_ETD_READ64", "NSD extended read from device",
+                        "size,offset" },
     { "SEEK",        0, TEST_TD_SEEK,
-                        "TD_SEEK", "Seek to offset" },
+                        "TD_SEEK", "Seek to offset",
+                        "offset" },
     { "ESEEK",       0, TEST_ETD_SEEK,
-                        "ETD_SEEK", "Extended seek to offset" },
+                        "ETD_SEEK", "Extended seek to offset",
+                        "offset" },
     { "SEEK64",      0, TEST_TD_SEEK64,
-                        "TD_SEEK64", "TD64 seek to offset" },
+                        "TD_SEEK64", "TD64 seek to offset",
+                        "offset,offsethi" },
     { "NSDSEEK",     0, TEST_NSCMD_TD_SEEK64,
-                        "NSCMD_TD_SEEK64", "NSD seek to offset" },
+                        "NSCMD_TD_SEEK64", "NSD seek to offset",
+                        "offset,offsethi" },
     { "NSDESEEK",    0, TEST_NSCMD_ETD_SEEK64,
-                        "NSCMD_ETD_SEEK64", "NSD extended seek from device" },
+                        "NSCMD_ETD_SEEK64", "NSD extended seek from device",
+                        "offset,offsethi" },
     { "WRITE",       1, TEST_CMD_WRITE,
-                        "CMD_WRITE", "Write to device" },
+                        "CMD_WRITE", "Write to device",
+                        "size,offset" },
     { "EWRITE",      1, TEST_ETD_WRITE,
-                        "ETD_WRITE", "Extended write to device" },
+                        "ETD_WRITE", "Extended write to device",
+                        "size,offset" },
     { "WRITE64",     1, TEST_TD_WRITE64,
-                        "TD_WRITE64", "TD64 write to device" },
+                        "TD_WRITE64", "TD64 write to device",
+                        "size,offset,offsethi" },
     { "NSDWRITE",    1, TEST_NSCMD_TD_WRITE64,
-                        "NSCMD_TD_WRITE64", "NSD write to device" },
+                        "NSCMD_TD_WRITE64", "NSD write to device",
+                        "size,offset,offsethi" },
     { "NSDEWRITE",   0, TEST_NSCMD_ETD_WRITE64,
-                        "NSCMD_ETD_WRITE64", "NSD extended write to device" },
+                        "NSCMD_ETD_WRITE64", "NSD extended write to device",
+                        "size,offset,offsethi" },
     { "FORMAT",      1, TEST_TD_FORMAT,
-                        "TD_FORMAT", "Format device" },
+                        "TD_FORMAT", "Format device",
+                        NULL },
     { "EFORMAT",     1, TEST_ETD_FORMAT,
-                        "ETD_FORMAT", "Extended format device" },
+                        "ETD_FORMAT", "Extended format device",
+                        NULL },
     { "FORMAT64",    1, TEST_TD_FORMAT64,
-                        "TD_FORMAT64", "TD64 format device" },
+                        "TD_FORMAT64", "TD64 format device",
+                        NULL },
     { "NSDFORMAT",   1, TEST_NSCMD_TD_FORMAT64,
-                        "NSCMD_TD_FORMAT64", "NSD format device" },
+                        "NSCMD_TD_FORMAT64", "NSD format device",
+                        NULL },
     { "NSDEFORMAT",  0, TEST_NSCMD_ETD_FORMAT64,
-                        "NSCMD_ETD_FORMAT64", "NSD extended format to device" },
+                        "NSCMD_ETD_FORMAT64", "NSD extended format to device",
+                        NULL },
     { "MOTOROFF",    2, TEST_TD_MOTOR_OFF,
-                        "TD_MOTOR OFF", "Stop motor (spin down)" },
+                        "TD_MOTOR OFF", "Stop motor (spin down)",
+                        NULL },
     { "MOTORON",     2, TEST_TD_MOTOR_ON,
-                        "TD_MOTOR ON", "Start motor (spin up)" },
+                        "TD_MOTOR ON", "Start motor (spin up)",
+                        NULL },
     { "START",       2, TEST_CMD_START,
-                        "CMD_START", "Start device (spin up)" },
+                        "CMD_START", "Start device (spin up)",
+                        NULL },
     { "STOP",        2, TEST_CMD_STOP,
-                        "CMD_STOP", "Stop device (spin down)" },
+                        "CMD_STOP", "Stop device (spin down)",
+                        NULL },
     { "EJECT",       2, TEST_TD_EJECT,
-                        "TD_EJECT", "Eject device" },
+                        "TD_EJECT", "Eject device",
+                        NULL },
     { "LOAD",        2, TEST_TD_LOAD,
-                        "TD_LOAD", "Load device (insert media)" },
+                        "TD_LOAD", "Load device (insert media)",
+                        NULL },
 };
 
 static int
@@ -4113,8 +4327,10 @@ test_packets(int do_destructive, int test_level,
     memset(buf, 0, sizeof (buf));
     for (i = 0; i < ARRAY_SIZE(buf); i++) {
         buf[i] = (uint8_t *) AllocMemType(BUFSIZE, memtype);
-        if (buf[i] == NULL)
+        if (buf[i] == NULL) {
+            printf("  AllocMem %x (%x) fail\n", BUFSIZE, memtype);
             goto allocmem_fail;
+        }
     }
     g_lun = lun;
     g_buf = buf;
@@ -4122,7 +4338,7 @@ test_packets(int do_destructive, int test_level,
     if (test_count == 0) {
         /* Run all available tests */
         test_mask = 0xffffffffffffffff;
-
+        cur_test_args = NULL;
         if (test_level <= 1) {
             /* Only do extended commands if requested "-tt" */
             test_mask &= ~(TEST_CMD_START | TEST_CMD_STOP |
@@ -4144,6 +4360,7 @@ test_packets(int do_destructive, int test_level,
         /* Run specified tests */
         int rc2;
         for (cur = 0; cur < test_count; cur++) {
+            cur_test_args = &test_cmd_args[cur];
             if (test_masks[cur] &
                 (TEST_NSCMD_TD_READ64 | TEST_NSCMD_ETD_READ64 |
                  TEST_NSCMD_TD_SEEK64 | TEST_NSCMD_ETD_SEEK64 |
@@ -4186,6 +4403,178 @@ extio_fail:
     return (rc);
 }
 
+/*
+ * rand32
+ * ------
+ * Very simple pseudo-random number generator
+ */
+static uint32_t rand_seed = 0;
+static uint32_t
+rand32(void)
+{
+    rand_seed = (rand_seed * 25173) + 13849;
+    return (rand_seed);
+}
+
+/*
+ * srand32
+ * -------
+ * Very simple random number seed
+ */
+static void
+srand32(uint32_t seed)
+{
+    rand_seed = seed;
+}
+
+static void
+show_diffs(void *expected, void *data, uint len, const char *type)
+{
+    uint     pos;
+    uint     miscompares = 0;
+    uint8_t *eptr = (uint8_t *) expected;
+    uint8_t *dptr = (uint8_t *) data;
+    for (pos = 0; pos < len; pos++) {
+        if (*eptr != *dptr) {
+            if ((miscompares++ < 8) || g_verbose)
+                printf("  %04x: %02x != %s %02x [diff %02x]\n",
+                       pos, *dptr, type, *eptr, *dptr ^ *eptr);
+        }
+        dptr++;
+        eptr++;
+    }
+    if (miscompares >= 8)
+        printf("  %u miscompares\n", miscompares);
+}
+
+static const uint8_t chkpat[] = {
+    0xa5, 0x5a, 0xc3, 0x3c, 0x81, 0x00, 0xff
+};
+
+static int
+test_integrity(uint pattern, uint32_t memtype, uint bufsize)
+{
+    int       rc = 0;
+    uint      bnum;
+    uint      cur;
+    struct IOExtTD *tio;
+    struct MsgPort *mp;
+    static uint    pos = 0;
+    static uint8_t curbuf = 0;
+    static uint8_t chkcur = 0;
+
+    mp = CreatePort(0, 0);
+    if (mp == NULL) {
+        printf("Failed to create message port\n");
+        return (1);
+    }
+
+    tio = (struct IOExtTD *) CreateExtIO(mp, sizeof (struct IOExtTD));
+    if (tio == NULL) {
+        printf("Failed to create tio struct\n");
+        rc = 1;
+        goto extio_fail;
+    }
+    if ((rc = open_device(tio)) != 0) {
+        printf("Open %s Unit %u: ", g_devname, g_unitno);
+        print_fail_nl(rc);
+        rc = 1;
+        goto opendev_fail;
+    }
+
+    if (g_sector_size == 0)
+        g_sector_size = 512;
+
+    if (g_devsize == 0)
+        g_devsize = 720 << 10;  // At least 720K
+
+    for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++) {
+        if (g_ibuf[bnum] == NULL) {
+            g_ibuf[bnum] = AllocMemType(bufsize, memtype);
+            if (g_ibuf[bnum] == NULL) {
+                printf("  AllocMem %x (%x) fail\n", bufsize, memtype);
+                rc = ENOMEM;
+                goto integrity_fail;
+            }
+            if (bnum == 0) {
+                switch (pattern) {
+                    default: {
+                        uint32_t *ptr = (uint32_t *) g_ibuf[bnum];
+                        srand32(time(NULL));
+                        for (cur = 0; cur < bufsize / 4; cur++)
+                            ptr[cur] = rand32();
+                        break;
+                    }
+                    case 2:
+                        for (cur = 0; cur < bufsize; cur++)
+                            g_ibuf[bnum][cur] = (uint8_t) cur;
+                        break;
+                    case 3: {
+                        for (cur = 0; cur < bufsize; cur++) {
+                            if (chkcur >= ARRAY_SIZE(chkpat))
+                                chkcur = 0;
+                            g_ibuf[bnum][cur] = chkpat[chkcur++];
+                        }
+                        break;
+                    }
+                }
+            } else if (bnum == 1) {
+                for (cur = 0; cur < bufsize / 4; cur++)
+                    g_ibuf[bnum][cur] = ~g_ibuf[0][cur];
+            }
+        }
+    }
+
+    bnum = 0;
+    if (pos + bufsize > g_devsize)
+        pos = 0;
+
+    bnum ^= 1;
+    rc = do_write_cmd(tio, pos, bufsize, g_ibuf[curbuf], g_has_nsd);
+    if (rc != 0) {
+        printf("write failed at %u\n", pos);
+        goto integrity_fail;
+    }
+    rc = do_read_cmd(tio, pos, bufsize, g_ibuf[2], g_has_nsd);
+    if (rc != 0) {
+        printf("read failed at %u\n", pos);
+        goto integrity_fail;
+    }
+    if (memcmp(g_ibuf[curbuf], g_ibuf[2], bufsize) != 0) {
+        printf("Miscompare at %u\n", pos);
+        show_diffs(g_ibuf[curbuf], g_ibuf[2], bufsize, "expected");
+        rc = do_read_cmd(tio, pos, bufsize, g_ibuf[3], g_has_nsd);
+        if (rc != 0) {
+            printf("re-read failed at %u\n", pos);
+            goto integrity_fail;
+        }
+        if (memcmp(g_ibuf[curbuf], g_ibuf[3], bufsize) == 0) {
+            printf("Re-read of data matches what was written "
+                   "(read failure?)\n");
+        } else {
+            if (memcmp(g_ibuf[2], g_ibuf[3], bufsize) == 0) {
+                printf("Re-read of data matches what was read "
+                       "(write failure?)\n");
+            } else {
+                printf("Re-read of data differs (floating data?)\n");
+                show_diffs(g_ibuf[curbuf], g_ibuf[3], bufsize, "expected");
+            }
+        }
+        rc = 1;
+        goto integrity_fail;
+    }
+    pos += bufsize;
+
+integrity_fail:
+    close_device(tio);
+opendev_fail:
+    DeleteExtIO((struct IORequest *) tio);
+extio_fail:
+    DeletePort(mp);
+
+    return (rc);
+}
+
 static void
 show_cmds(void)
 {
@@ -4204,20 +4593,55 @@ usage_cmd(void)
     show_cmds();
 }
 
+static void
+show_arg_help(const char *str, uint cmd)
+{
+    const char *const arg_help = test_cmds[cmd].arg_help;
+    if (arg_help == NULL)
+        printf("No arguments for this command\n");
+    else
+        printf("%s(%s)\n", str, arg_help);
+}
 
 static uint64_t
-get_cmd(const char *str)
+get_cmd(const char *str, args_t *args)
 {
     size_t pos;
     uint   col;
     uint   cols = 6;
     uint   row;
     uint   rows;
+    char  *arg = strchr(str, '(');
+
+    args->arg_count = 0;
+    if (arg != NULL)
+        *(arg++) = '\0';
 
     for (pos = 0; pos < ARRAY_SIZE(test_cmds); pos++) {
         if ((strcasecmp(test_cmds[pos].alias, str) == 0) ||
-            (strcasecmp(test_cmds[pos].name, str) == 0))
+            (strcasecmp(test_cmds[pos].name, str) == 0)) {
+            if (arg != NULL) {
+                int count;
+                uint val;
+                while (sscanf(arg, "%i%n", (int *) &val, &count) == 1) {
+                    if (count != 0) {
+                        arg += count;
+                        if (*arg == ',')
+                            arg++;
+                    }
+                    if (args->arg_count == 4) {
+                        printf("Too many arguments to %s\n", str);
+                        exit(1);
+                    }
+                    args->arg[args->arg_count++] = val;
+                }
+                if (args->arg_count == 0) {
+                    show_arg_help(str, pos);
+                    exit(1);
+                }
+            }
             return (test_cmds[pos].mask);
+        }
     }
 
     printf("Invalid test command \"%s\"\n", str);
@@ -4241,19 +4665,20 @@ main(int argc, char *argv[])
 {
     int arg;
     int rc;
+    uint bnum;
     uint loop;
     uint loops = 1;
 #define MAX_CMD_MASKS 32
-    uint     test_cmd_count = 0;
-    uint64_t test_cmd_mask[32];
+    static uint test_cmd_count = 0;
     struct IOExtTD tio;
     uint flag_benchmark = 0;
-    uint flag_destructive = 0;
     uint flag_geometry = 0;
+    uint flag_integrity = 0;
     uint flag_openclose = 0;
     uint flag_probe = 0;
     uint flag_testpackets = 0;
     uint did_open = 0;
+    uint tsize = BUFSIZE;
     char *unit = NULL;
     struct EClockVal dummy;
 
@@ -4274,9 +4699,10 @@ main(int argc, char *argv[])
                         break;
                     case 'c':
                         if (++arg < argc) {
-                            test_cmd_mask[test_cmd_count++] |=
-                                get_cmd(argv[arg]);
-                            if (test_cmd_count >= ARRAY_SIZE(test_cmd_mask))
+                            test_cmd_mask[test_cmd_count] |=
+                                get_cmd(argv[arg],
+                                        &test_cmd_args[test_cmd_count]);
+                            if (++test_cmd_count >= ARRAY_SIZE(test_cmd_mask))
                                 test_cmd_count--;
                         } else {
                             usage_cmd();
@@ -4291,6 +4717,27 @@ main(int argc, char *argv[])
                         break;
                     case 'g':
                         flag_geometry++;
+                        break;
+                    case 'i':
+                        if (flag_integrity++ > 0)
+                            break;
+                        if (++arg < argc) {
+                            int pos = 0;
+                            if ((sscanf(argv[arg], "%i%n", (int *) &tsize,
+                                        &pos) != 1) ||
+                                (pos == 0) || (argv[arg][pos] != '\0')) {
+                                printf("Invalid transfer size %s\n", argv[arg]);
+                                exit(1);
+                            }
+                            if (tsize & 511) {
+                                printf("transfer size must be a multiple "
+                                       "of 512 bytes\n");
+                                exit(1);
+                            }
+                        } else {
+                            printf("%s requires an argument\n", ptr);
+                            exit(1);
+                        }
                         break;
                     case 'l':
                         /* Loop count */
@@ -4368,7 +4815,11 @@ main(int argc, char *argv[])
             exit(1);
         }
     }
-    if ((flag_benchmark || flag_geometry || flag_openclose ||
+    if (flag_integrity && !flag_destructive) {
+        printf("Integrity test requires -d (destructive) flag\n");
+        exit(1);
+    }
+    if ((flag_benchmark || flag_geometry || flag_integrity || flag_openclose ||
          flag_testpackets || flag_probe || test_cmd_mask[0]) == 0) {
         printf("You must specify an operation to perform\n");
         usage();
@@ -4376,7 +4827,8 @@ main(int argc, char *argv[])
     }
     if (unit == NULL) {
         if ((g_devname == NULL) || flag_benchmark || flag_geometry ||
-            flag_openclose || flag_testpackets || test_cmd_mask[0]) {
+            flag_integrity || flag_openclose || flag_testpackets ||
+            test_cmd_mask[0]) {
             printf("You must specify a device name and unit number to open\n");
             usage();
             exit(1);
@@ -4388,6 +4840,7 @@ main(int argc, char *argv[])
     }
 
     for (loop = 0; loop < loops; loop++) {
+        uint stop_on_error = (loop != 0) || (loops == 1);
         if (loops > 1) {
             printf("Pass %u  ", loop + 1);
             print_time();
@@ -4404,29 +4857,32 @@ main(int argc, char *argv[])
             if ((rc = open_device(&tio)) != 0) {
                 printf("Open %s unit %d: ", g_devname, g_unitno);
                 print_fail_nl(rc);
-                if (loop != 0)
+                if (stop_on_error)
                     break;
             } else {
                 did_open = 1;
             }
         }
-        if (flag_probe && scsi_probe(unit) && (loop != 0))
+        if (flag_probe && scsi_probe(unit) && stop_on_error)
             break;
-        if (flag_geometry && drive_geometry() && (loop != 0))
+        if (flag_geometry && drive_geometry() && stop_on_error)
+            break;
+        if (flag_integrity &&
+            test_integrity(flag_integrity, memtype, tsize))
             break;
         if (flag_testpackets &&
             test_packets(flag_destructive, flag_testpackets, 0, NULL) &&
-            (loop != 0)) {
+            stop_on_error) {
             break;
         }
         if ((test_cmd_count > 0) &&
             test_packets(0, 0, test_cmd_count, test_cmd_mask) &&
-            (loop != 0)) {
+            stop_on_error) {
             break;
         }
         if ((flag_benchmark > 1) &&
             drive_latency(flag_destructive) &&
-            (loop != 0)) {
+            stop_on_error) {
             break;
         }
         if (did_open) {
@@ -4438,6 +4894,19 @@ main(int argc, char *argv[])
     }
     if (did_open)
         close_device(&tio);
+
+    for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++)
+        if (g_ibuf[bnum] != NULL)
+            FreeMemType(g_ibuf[bnum], tsize);
+
+    if (loops > 1) {
+        if (loop < loops)
+            printf("Stopped at pass %u of %u\n", loop + 1, loops);
+        else
+            printf("%u passes completed successfully\n", loops);
+    }
+    if (loop < loops)
+        exit(1);
 
     exit(0);
 }

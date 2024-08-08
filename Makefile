@@ -9,6 +9,7 @@ OBJS    := $(SRCS:%.c=$(OBJDIR)/%.o)
 CC      := m68k-amigaos-gcc
 CFLAGS  := -Wall -Wextra -Wno-pointer-sign -fomit-frame-pointer
 CFLAGS  += -Wno-strict-aliasing
+CFLAGS  += -Wpedantic -Wno-overflow
 LDFLAGS = -Xlinker -Map=$(OBJDIR)/$@.map -Wa,-a > $(OBJDIR)/$@.lst -fomit-frame-pointer -mcrt=clib2 -lgcc -lc -lamiga
 PROGVER := $(PROG)_$(shell awk '/char[[:space:]]*\*version =/{print $$7}' devtest.c)
 
