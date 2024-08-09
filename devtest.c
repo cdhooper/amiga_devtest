@@ -4724,10 +4724,25 @@ main(int argc, char *argv[])
                         if (++arg < argc) {
                             int pos = 0;
                             if ((sscanf(argv[arg], "%i%n", (int *) &tsize,
-                                        &pos) != 1) ||
-                                (pos == 0) || (argv[arg][pos] != '\0')) {
+                                        &pos) != 1) || (pos == 0)) {
                                 printf("Invalid transfer size %s\n", argv[arg]);
                                 exit(1);
+                            }
+                            switch (argv[arg][pos]) {
+                                case '\0':
+                                    break;
+                                case 'k':
+                                case 'K':
+                                    tsize <<= 10;
+                                    break;
+                                case 'm':
+                                case 'M':
+                                    tsize <<= 20;
+                                    break;
+                                default:
+                                    printf("Invalid transfer size %s\n",
+                                           argv[arg]);
+                                    exit(1);
                             }
                             if (tsize & 511) {
                                 printf("transfer size must be a multiple "
