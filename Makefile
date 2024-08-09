@@ -46,7 +46,7 @@ zip:
 	@echo Building $(PROGVER).zip
 	$(QUIET)rm -rf $(PROG).zip $(PROGVER)
 	$(QUIET)mkdir $(PROGVER)
-	$(QUIET)cp -p $(PROG) $(PROGVER)/
+	$(QUIET)cp -p $(PROG) README.md $(PROGVER)/
 	$(QUIET)zip -rq $(PROGVER).zip $(PROGVER)
 	$(QUIET)rm -rf $(PROGVER)
 
@@ -54,7 +54,7 @@ lha:
 	@echo Building $(PROGVER).lha
 	$(QUIET)rm -rf $(PROG).zip $(PROGVER)
 	$(QUIET)mkdir $(PROGVER)
-	$(QUIET)cp -p $(PROG) $(PROGVER)/
+	$(QUIET)cp -p $(PROG) README.md $(PROGVER)/
 	$(QUIET)lha -aq2 $(PROGVER).lha $(PROGVER)
 	$(QUIET)rm -rf $(PROGVER)
 
