@@ -2,6 +2,8 @@
 # Makefile to build devtest for AmigaOS/68k using Bebbo's GCC cross-compiler.
 #
 
+VER     ?= 1.6c
+
 PROG    := devtest
 OBJDIR  := objs
 SRCS    := devtest.c
@@ -10,13 +12,30 @@ CC      := m68k-amigaos-gcc
 CFLAGS  := -Wall -Wextra -Wno-pointer-sign -fomit-frame-pointer
 CFLAGS  += -Wno-strict-aliasing
 CFLAGS  += -Wpedantic -Wno-overflow
-LDFLAGS = -Xlinker -Map=$(OBJDIR)/$@.map -Wa,-a > $(OBJDIR)/$@.lst -fomit-frame-pointer -mcrt=clib2 -lgcc -lc -lamiga
-PROGVER := $(PROG)_$(shell awk '/char[[:space:]]*\*version =/{print $$7}' devtest.c)
 
-CFLAGS  += -Os
+# clib2 crashes on exit under Kickstart 2.x
+LDFLAGS := -Xlinker -Map=$(OBJDIR)/$@.map -Wa,-a > $(OBJDIR)/$@.lst -fomit-frame-pointer -lgcc -lc -lamiga -mcrt=clib2
+
+# -noixemul generates significantly larger binaries, but KS 2.x is supported
+#LDFLAGS := -Xlinker -Map=$(OBJDIR)/$@.map -Wa,-a > $(OBJDIR)/$@.lst -fomit-frame-pointer -lgcc -lc -lamiga -noixemul
+
+#CFLAGS += -flto
+#LDFLAGS += -flto
+
+#VER := $(PROG)_$(shell awk '/char[[:space:]]*\*version =/{print $$7}' devtest.c)
+
+CFLAGS  += -Os -DVER=\"$(VER)\"
 #CFLAGS  += -g
+
+# If verbose is specified with no other targets, then build everything
+ifeq ($(MAKECMDGOALS),verbose)
+verbose: all
+endif
+ifeq (,$(filter verbose timed, $(MAKECMDGOALS)))
 QUIET   := @
-#QUIET   :=
+else
+QUIET   :=
+endif
 
 ifeq (, $(shell which $(CC) 2>/dev/null ))
 $(error "No $(CC) in PATH: maybe do PATH=$$PATH:/opt/amiga/bin")
@@ -43,20 +62,20 @@ $(OBJDIR):
 	mkdir -p $@
 
 zip:
-	@echo Building $(PROGVER).zip
-	$(QUIET)rm -rf $(PROG).zip $(PROGVER)
-	$(QUIET)mkdir $(PROGVER)
-	$(QUIET)cp -p $(PROG) README.md $(PROGVER)/
-	$(QUIET)zip -rq $(PROGVER).zip $(PROGVER)
-	$(QUIET)rm -rf $(PROGVER)
+	@echo Building $(VER).zip
+	$(QUIET)rm -rf $(PROG).zip $(VER)
+	$(QUIET)mkdir $(VER)
+	$(QUIET)cp -p $(PROG) README.md $(VER)/
+	$(QUIET)zip -rq $(VER).zip $(VER)
+	$(QUIET)rm -rf $(VER)
 
 lha:
-	@echo Building $(PROGVER).lha
-	$(QUIET)rm -rf $(PROG).zip $(PROGVER)
-	$(QUIET)mkdir $(PROGVER)
-	$(QUIET)cp -p $(PROG) README.md $(PROGVER)/
-	$(QUIET)lha -aq2 $(PROGVER).lha $(PROGVER)
-	$(QUIET)rm -rf $(PROGVER)
+	@echo Building $(VER).lha
+	$(QUIET)rm -rf $(PROG).zip $(VER)
+	$(QUIET)mkdir $(VER)
+	$(QUIET)cp -p $(PROG) README.md $(VER)/
+	$(QUIET)lha -aq2 $(VER).lha $(VER)
+	$(QUIET)rm -rf $(VER)
 
 clean:
 	rm -f $(OBJS) $(OBJDIR)/*.map $(OBJDIR)/*.lst

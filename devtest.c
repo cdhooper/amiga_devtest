@@ -13,7 +13,7 @@
  * THE AUTHOR ASSUMES NO LIABILITY FOR ANY DAMAGE ARISING OUT OF THE USE
  * OR MISUSE OF THIS UTILITY OR INFORMATION REPORTED BY THIS UTILITY.
  */
-const char *version = "\0$VER: devtest 1.6 ("__DATE__") © Chris Hooper";
+const char *version = "\0$VER: devtest " VER " ("__DATE__") © Chris Hooper";
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -281,6 +281,7 @@ static uint      g_e_freq;            // Frequency of eclock (715909 tps)
 static UWORD     g_sense_length;      // Length of returned sense data (if any)
 static UBYTE     g_sense_data[255];   // Sense data buffer
 static uint8_t  *g_ibuf[4];           // Integrity test buffers
+static uint8_t  *g_align[4];          // Integrity test buffers (aligned)
 static UBYTE     mem_skip_alloc = 0;  // Skip memory allocate
 static uint32_t  memtype = MEMTYPE_ANY; // Memory type
 static uint64_t  test_cmd_mask[32];
@@ -316,21 +317,23 @@ usage(void)
 {
     printf("%s\n\n"
            "usage: devtest <options> <x.device> <unit>\n"
-           "   -b           benchmark device performance [-bb tests latency]\n"
-           "   -c <cmd>     test a specific device driver request\n"
-           "   -d           also do destructive operations (write)\n"
-           "   -g           test drive geometry\n"
-           "   -h           display help\n"
-           "   -i <tsize>   data integrity test (destructive) "
-                           "[-i=rand -ii=addr -iii=patt]\n"
-           "   -l <loops>   run multiple times\n"
-           "   -m <addr>    "
-                "use specific memory (Chip Fast 24Bit Zorro MB Accel -=list)\n"
-           "   -mm <addr>   use specific address without allocation by OS\n"
-           "   -o           test open/close\n"
-           "   -p           probe SCSI bus for devices\n"
-           "   -t           test all packet types (basic, TD64, NSD) "
-                "[-tt = more]\n",
+           "   -b                    benchmark device performance "
+                    "[-bb tests latency]\n"
+           "   -c <cmd>              test a specific device driver request\n"
+           "   -d                    also do destructive operations (write)\n"
+           "   -g                    test drive geometry\n"
+           "   -h                    display help\n"
+           "   -i <tsize>[,<align>]  data integrity test (destructive) "
+                          "[-i=rand -ii=addr -iii=patt]\n"
+           "   -l <loops>            run multiple times\n"
+           "   -m <addr>             "
+                    "use specific memory (Chip Fast Zorro MB Accel -=list)\n"
+           "   -mm <addr>            "
+                    "use specific address without allocation by OS\n"
+           "   -o                    test open/close\n"
+           "   -p                    probe SCSI bus for devices\n"
+           "   -t                    test all packet types (basic, TD64, NSD) "
+                    "[-tt = more]\n",
            version + 7);
 }
 
@@ -462,6 +465,8 @@ llu_to_str(uint64_t value)
 APTR
 AllocMemType(ULONG byteSize, uint32_t memtype)
 {
+    APTR addr = NULL;
+
     /* Don't bother with memory allocate */
     if (mem_skip_alloc)
         return ((APTR) memtype);
@@ -469,16 +474,20 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
     switch (memtype) {
         case 0:
             /* Highest priority (usually fast) memory */
-            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_ANY));
+            addr = AllocMem(byteSize, MEMF_PUBLIC | MEMF_ANY);
+            break;
         case MEMTYPE_CHIP:
             /* Chip memory */
-            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_CHIP));
+            addr = AllocMem(byteSize, MEMF_PUBLIC | MEMF_CHIP);
+            break;
         case MEMTYPE_FAST:
             /* Fast memory */
-            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_FAST));
+            addr = AllocMem(byteSize, MEMF_PUBLIC | MEMF_FAST);
+            break;
         case MEMTYPE_24BIT:
             /* 24-bit memory */
-            return (AllocMem(byteSize, MEMF_PUBLIC | MEMF_24BITDMA));
+            addr = AllocMem(byteSize, MEMF_PUBLIC | MEMF_24BITDMA);
+            break;
         case MEMTYPE_ZORRO:
         case MEMTYPE_COPROC:
         case MEMTYPE_MB:
@@ -492,7 +501,6 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
             struct MemChunk  *chunk;
             uint32_t          chunksize = 0;
             APTR              chunkaddr = NULL;
-            APTR              addr      = NULL;
 
             Forbid();
             for (mem = (struct MemHeader *)eb->MemList.lh_Head;
@@ -548,14 +556,19 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
             if (chunkaddr != NULL)
                 addr = AllocAbs(byteSize, chunkaddr);
             Permit();
-            return (addr);
+            break;
         }
         default:
             /* Allocate user-specified address */
             if (memtype > MEMTYPE_MAX)
-                return (AllocAbs(byteSize, (APTR) memtype));
-            return (NULL);
+                addr = AllocAbs(byteSize, (APTR) memtype);
+            else
+                addr = NULL;
+            break;
     }
+    if (g_verbose)
+        printf("Alloc %p\n", addr);
+    return (addr);
 }
 
 void
@@ -1176,16 +1189,21 @@ drive_geometry(void)
                     printf("%8u %12s\n", ssize, llu_to_str(blks));
                     break;
                 }
+                /* The below pages are commonly seen, but not interesting */
                 case 0x00:  // Vendor-specific
                 case 0x01:  // Error recovery
                 case 0x02:  // Disconnect-Reconnect
+                case 0x07:  // Verify Error Recovery
                 case 0x08:  // Caching
-                case 0x0a:  // Control
+                case 0x0a:  // Control (TCQ, events, etc)
                 case 0x30:  // Apple-specific
                     if (g_verbose)
                         goto show_default;
                     break;
 show_default:
+                /* The below pages are not commonly seen */
+                case 0x0b:  // Medium Types Supported
+                case 0x0c:  // Notch and Partition (for variable blk devs)
                 default:
                     printf("Mode Page 0x%02x", page);
                     printf(" len=%u\n", pages[pos + 1]);
@@ -1209,6 +1227,31 @@ opendev_fail:
 extio_fail:
     DeletePort(mp);
     return (rc);
+}
+
+#define UNIX_TIME_OFFSET 252460800 // (1978 - 1970) * 365.25 * 24 * 60 * 60
+
+static time_t
+datestamp_to_time(struct DateStamp *ds)
+{
+    return (UNIX_TIME_OFFSET +
+            ds->ds_Days * (24 * 60* 60) +
+            ds->ds_Minute * 60 +
+            (ds->ds_Tick / TICKS_PER_SECOND));
+}
+
+__stdargs time_t
+time(time_t *t)
+{
+    struct DateStamp ds;
+    time_t timeval;
+
+    DateStamp(&ds);
+    timeval = datestamp_to_time(&ds);
+
+    if (t != NULL)
+        *t = timeval;
+    return (timeval);
 }
 
 static void
@@ -2034,7 +2077,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
                 } else {
                     printf("  %s ", (iocmd == CMD_READ) ? "Read" : "Write");
                     print_fail(failcode);
-                    printf(" at %"PRIu32"\n", tio[cur]->iotd_Req.io_Offset);
+                    printf(" at 0x%x\n", tio[cur]->iotd_Req.io_Offset);
                     rc++;
                     break;
                 }
@@ -2069,7 +2112,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
                 } else {
                     printf("  %s ", (iocmd == CMD_READ) ? "Read" : "Write");
                     print_fail(failcode);
-                    printf(" at %"PRIu32"\n", tio[cur]->iotd_Req.io_Offset);
+                    printf(" at 0x%x\n", tio[cur]->iotd_Req.io_Offset);
                     rc++;
                 }
             }
@@ -3928,7 +3971,7 @@ test_td_rawwrite(struct IOExtTD *tio)
     memset(buf, 0, sizeof (buf));
     for (i = 0; i < ARRAY_SIZE(buf); i++) {
         /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
-        buf[i] = (uint8_t *) AllocMem(RAWBUFSIZE, MEMF_PUBLIC);
+        buf[i] = (uint8_t *) AllocMem(RAWBUFSIZE, MEMF_PUBLIC | MEMF_CHIP);
         if (buf[i] == NULL) {
             printf("Unable to allocate %d bytes\n", RAWBUFSIZE);
             goto buf_alloc_failed;
@@ -4436,8 +4479,8 @@ show_diffs(void *expected, void *data, uint len, const char *type)
     uint8_t *dptr = (uint8_t *) data;
     for (pos = 0; pos < len; pos++) {
         if (*eptr != *dptr) {
-            if ((miscompares++ < 8) || g_verbose)
-                printf("  %04x: %02x != %s %02x [diff %02x]\n",
+            if ((miscompares++ < 9) || g_verbose)
+                printf("  %06x: %02x != %s %02x [diff %02x]\n",
                        pos, *dptr, type, *eptr, *dptr ^ *eptr);
         }
         dptr++;
@@ -4447,16 +4490,32 @@ show_diffs(void *expected, void *data, uint len, const char *type)
         printf("  %u miscompares\n", miscompares);
 }
 
+static uint
+memcmp_const(uint8_t *buf, uint bufsize, uint val)
+{
+    uint32_t *buf32 = (uint32_t *) buf;
+    val |= (val << 8);
+    val |= (val << 16);
+    bufsize /= 4;
+    while (bufsize-- > 0) {
+        if (*buf32 != val)
+            return (1);
+        buf32++;
+    }
+    return (0);
+}
+
 static const uint8_t chkpat[] = {
     0xa5, 0x5a, 0xc3, 0x3c, 0x81, 0x00, 0xff
 };
 
 static int
-test_integrity(uint pattern, uint32_t memtype, uint bufsize)
+test_integrity(uint pattern, uint32_t memtype, uint bufsize, uint align)
 {
     int       rc = 0;
     uint      bnum;
     uint      cur;
+    uint      memtypex = memtype;
     struct IOExtTD *tio;
     struct MsgPort *mp;
     static uint    pos = 0;
@@ -4490,16 +4549,37 @@ test_integrity(uint pattern, uint32_t memtype, uint bufsize)
 
     for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++) {
         if (g_ibuf[bnum] == NULL) {
-            g_ibuf[bnum] = AllocMemType(bufsize, memtype);
+            uint32_t base;
+            g_ibuf[bnum] = AllocMemType(bufsize + align, memtypex);
             if (g_ibuf[bnum] == NULL) {
-                printf("  AllocMem %x (%x) fail\n", bufsize, memtype);
+                printf("  AllocMem %x (%x) fail\n", bufsize + align, memtypex);
                 rc = ENOMEM;
                 goto integrity_fail;
             }
+            /*
+             * Create specific alignment
+             * If the address is already aligned at a higher order than
+             * the requested alignment, need to reduce the alignment.
+             * If the address is aligned at a lower order of alignment,
+             * then need to increase the alignment.
+             */
+            base = (uintptr_t) g_ibuf[bnum];
+            if (base & (align - 1)) {
+                /* Lower order of alignment; round up */
+                g_align[bnum] = (void *) ((base + align - 1) & ~(align - 1));
+            } else {
+                /* Lower order of alignment; force alignment */
+                g_align[bnum] = (void *) (base + align);
+            }
+            if (g_verbose)
+                printf("Align %p\n", g_align[bnum]);
+
+            if (memtypex > MEMTYPE_MAX)
+                memtypex += bufsize;
             if (bnum == 0) {
                 switch (pattern) {
                     default: {
-                        uint32_t *ptr = (uint32_t *) g_ibuf[bnum];
+                        uint32_t *ptr = (uint32_t *) g_align[bnum];
                         srand32(time(NULL));
                         for (cur = 0; cur < bufsize / 4; cur++)
                             ptr[cur] = rand32();
@@ -4507,63 +4587,79 @@ test_integrity(uint pattern, uint32_t memtype, uint bufsize)
                     }
                     case 2:
                         for (cur = 0; cur < bufsize; cur++)
-                            g_ibuf[bnum][cur] = (uint8_t) cur;
+                            g_align[bnum][cur] = (uint8_t) cur;
                         break;
                     case 3: {
                         for (cur = 0; cur < bufsize; cur++) {
                             if (chkcur >= ARRAY_SIZE(chkpat))
                                 chkcur = 0;
-                            g_ibuf[bnum][cur] = chkpat[chkcur++];
+                            g_align[bnum][cur] = chkpat[chkcur++];
                         }
                         break;
                     }
                 }
             } else if (bnum == 1) {
                 for (cur = 0; cur < bufsize / 4; cur++)
-                    g_ibuf[bnum][cur] = ~g_ibuf[0][cur];
+                    g_align[bnum][cur] = ~g_align[0][cur];
+            } else if (bnum == 2) {
+                /* Pattern the receive buffer */
+                memset(g_align[bnum], 0xa5, bufsize);
             }
         }
     }
 
-    bnum = 0;
     if (pos + bufsize > g_devsize)
         pos = 0;
 
-    bnum ^= 1;
-    rc = do_write_cmd(tio, pos, bufsize, g_ibuf[curbuf], g_has_nsd);
+    rc = do_write_cmd(tio, pos, bufsize, g_align[curbuf], g_has_nsd);
     if (rc != 0) {
-        printf("write failed at %u\n", pos);
+        printf("write failed at 0x%x\n", pos);
         goto integrity_fail;
     }
-    rc = do_read_cmd(tio, pos, bufsize, g_ibuf[2], g_has_nsd);
+    rc = do_read_cmd(tio, pos, bufsize, g_align[2], g_has_nsd);
     if (rc != 0) {
-        printf("read failed at %u\n", pos);
+        printf("read failed at 0x%x\n", pos);
         goto integrity_fail;
     }
-    if (memcmp(g_ibuf[curbuf], g_ibuf[2], bufsize) != 0) {
-        printf("Miscompare at %u\n", pos);
-        show_diffs(g_ibuf[curbuf], g_ibuf[2], bufsize, "expected");
-        rc = do_read_cmd(tio, pos, bufsize, g_ibuf[3], g_has_nsd);
+    if (memcmp(g_align[curbuf], g_align[2], bufsize) != 0) {
+        printf("Miscompare at 0x%x\n", pos);
+        if (memcmp_const(g_align[2], bufsize, 0xa5) == 0) {
+            printf("Read buffer was not updated\n");
+        } else {
+            show_diffs(g_align[curbuf], g_align[2], bufsize, "expected");
+        }
+
+        /* Pattern the second receive buffer */
+        memset(g_align[3], 0x5a, bufsize);
+
+        rc = do_read_cmd(tio, pos, bufsize, g_align[3], g_has_nsd);
         if (rc != 0) {
-            printf("re-read failed at %u\n", pos);
+            printf("Re-read failed at 0x%x\n", pos);
             goto integrity_fail;
         }
-        if (memcmp(g_ibuf[curbuf], g_ibuf[3], bufsize) == 0) {
+        if (memcmp(g_align[curbuf], g_align[3], bufsize) == 0) {
             printf("Re-read of data matches what was written "
                    "(read failure?)\n");
+        } else if (memcmp_const(g_align[3], bufsize, 0x5a) == 0) {
+            printf("Re-read buffer was not updated\n");
+        } else if (memcmp(g_align[2], g_align[3], bufsize) == 0) {
+            printf("Re-read of data matches what was read "
+                   "(write failure?)\n");
         } else {
-            if (memcmp(g_ibuf[2], g_ibuf[3], bufsize) == 0) {
-                printf("Re-read of data matches what was read "
-                       "(write failure?)\n");
-            } else {
-                printf("Re-read of data differs (floating data?)\n");
-                show_diffs(g_ibuf[curbuf], g_ibuf[3], bufsize, "expected");
-            }
+            printf("Re-read of data differs (floating data?)\n");
+            show_diffs(g_align[curbuf], g_align[3], bufsize, "expected");
+            show_diffs(g_align[2], g_align[3], bufsize, "first read");
+        }
+        CacheClearU();
+        if (memcmp(g_align[curbuf], g_align[2], bufsize) == 0) {
+            printf("Initial read data now matches what was written "
+                   "(CPU cache or memory failure?)\n");
         }
         rc = 1;
         goto integrity_fail;
     }
     pos += bufsize;
+    curbuf ^= 1;
 
 integrity_fail:
     close_device(tio);
@@ -4679,6 +4775,7 @@ main(int argc, char *argv[])
     uint flag_testpackets = 0;
     uint did_open = 0;
     uint tsize = BUFSIZE;
+    uint talign = 16;
     char *unit = NULL;
     struct EClockVal dummy;
 
@@ -4709,15 +4806,15 @@ main(int argc, char *argv[])
                             exit(1);
                         }
                         break;
-                    case 'h':
-                        usage();
-                        exit(0);
                     case 'd':
                         flag_destructive++;
                         break;
                     case 'g':
                         flag_geometry++;
                         break;
+                    case 'h':
+                        usage();
+                        exit(0);
                     case 'i':
                         if (flag_integrity++ > 0)
                             break;
@@ -4731,18 +4828,41 @@ main(int argc, char *argv[])
                             switch (argv[arg][pos]) {
                                 case '\0':
                                     break;
+                                case ',':
+                                    break;
                                 case 'k':
                                 case 'K':
                                     tsize <<= 10;
+                                    pos++;
+                                    if ((argv[arg][pos] == 'b') ||
+                                        (argv[arg][pos] == 'B'))
+                                        pos++;
                                     break;
                                 case 'm':
                                 case 'M':
                                     tsize <<= 20;
+                                    pos++;
+                                    if ((argv[arg][pos] == 'b') ||
+                                        (argv[arg][pos] == 'B'))
+                                        pos++;
                                     break;
                                 default:
                                     printf("Invalid transfer size %s\n",
                                            argv[arg]);
                                     exit(1);
+                            }
+                            if (argv[arg][pos] == ',') {
+                                char *str = argv[arg] + pos + 1;
+                                if ((sscanf(str, "%i%n", (int *) &talign,
+                                            &pos) != 1) || (pos == 0)) {
+                                    printf("Invalid alignment %s\n", str);
+                                    exit(1);
+                                }
+                                if (talign & (talign - 1)) {
+                                    printf("Invalid alignment %s; must be a "
+                                           "power of 2\n", str);
+                                    exit(1);
+                                }
                             }
                             if (tsize & 511) {
                                 printf("transfer size must be a multiple "
@@ -4774,13 +4894,14 @@ main(int argc, char *argv[])
                             if (strcmp(argv[arg], "-") == 0) {
                                 show_memlist();
                                 exit(0);
-                            } else if (strcasecmp(argv[arg], "chip") == 0) {
+                            } else if (strncasecmp(argv[arg], "chip", 4) == 0) {
                                 memtype = MEMTYPE_CHIP;
-                            } else if (strcasecmp(argv[arg], "fast") == 0) {
+                            } else if (strncasecmp(argv[arg], "fast", 4) == 0) {
                                 memtype = MEMTYPE_FAST;
                             } else if (strcasecmp(argv[arg], "24bit") == 0) {
                                 memtype = MEMTYPE_24BIT;
-                            } else if (strcasecmp(argv[arg], "zorro") == 0) {
+                            } else if (strncasecmp(argv[arg],
+                                                   "zorro", 5) == 0) {
                                 memtype = MEMTYPE_ZORRO;
                             } else if (strncasecmp(argv[arg], "copr", 3) == 0) {
                                 memtype = MEMTYPE_COPROC;
@@ -4883,7 +5004,7 @@ main(int argc, char *argv[])
         if (flag_geometry && drive_geometry() && stop_on_error)
             break;
         if (flag_integrity &&
-            test_integrity(flag_integrity, memtype, tsize))
+            test_integrity(flag_integrity, memtype, tsize, talign))
             break;
         if (flag_testpackets &&
             test_packets(flag_destructive, flag_testpackets, 0, NULL) &&
@@ -4912,7 +5033,7 @@ main(int argc, char *argv[])
 
     for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++)
         if (g_ibuf[bnum] != NULL)
-            FreeMemType(g_ibuf[bnum], tsize);
+            FreeMemType(g_ibuf[bnum], tsize + talign);
 
     if (loops > 1) {
         if (loop < loops)
