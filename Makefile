@@ -23,6 +23,7 @@ LDFLAGS := -Xlinker -Map=$(OBJDIR)/$@.map -Wa,-a > $(OBJDIR)/$@.lst -fomit-frame
 #LDFLAGS += -flto
 
 #VER := $(PROG)_$(shell awk '/char[[:space:]]*\*version =/{print $$7}' devtest.c)
+PROGVER := $(PROG)_$(VER)
 
 CFLAGS  += -Os -DVER=\"$(VER)\"
 #CFLAGS  += -g
@@ -62,20 +63,20 @@ $(OBJDIR):
 	mkdir -p $@
 
 zip:
-	@echo Building $(VER).zip
-	$(QUIET)rm -rf $(PROG).zip $(VER)
-	$(QUIET)mkdir $(VER)
-	$(QUIET)cp -p $(PROG) README.md $(VER)/
-	$(QUIET)zip -rq $(VER).zip $(VER)
-	$(QUIET)rm -rf $(VER)
+	@echo Building $(PROGVER).zip
+	$(QUIET)rm -rf $(PROG).zip $(PROGVER)
+	$(QUIET)mkdir $(PROGVER)
+	$(QUIET)cp -p $(PROG) README.md $(PROGVER)/
+	$(QUIET)zip -rq $(PROGVER).zip $(PROGVER)
+	$(QUIET)rm -rf $(PROGVER)
 
 lha:
-	@echo Building $(VER).lha
-	$(QUIET)rm -rf $(PROG).zip $(VER)
-	$(QUIET)mkdir $(VER)
-	$(QUIET)cp -p $(PROG) README.md $(VER)/
-	$(QUIET)lha -aq2 $(VER).lha $(VER)
-	$(QUIET)rm -rf $(VER)
+	@echo Building $(PROGVER).lha
+	$(QUIET)rm -rf $(PROG).zip $(PROGVER)
+	$(QUIET)mkdir $(PROGVER)
+	$(QUIET)cp -p $(PROG) README.md $(PROGVER)/
+	$(QUIET)lha -aq2 $(PROGVER).lha $(PROGVER)
+	$(QUIET)rm -rf $(PROGVER)
 
 clean:
 	rm -f $(OBJS) $(OBJDIR)/*.map $(OBJDIR)/*.lst
