@@ -280,8 +280,8 @@ static uint      g_unitno;            // Device unit and LUN
 static uint      g_e_freq;            // Frequency of eclock (715909 tps)
 static UWORD     g_sense_length;      // Length of returned sense data (if any)
 static UBYTE     g_sense_data[255];   // Sense data buffer
-static uint8_t  *g_ibuf[4];           // Integrity test buffers
-static uint8_t  *g_align[4];          // Integrity test buffers (aligned)
+static uint8_t  *g_ibuf[5];           // Integrity test buffers
+static uint8_t  *g_align[5];          // Integrity test buffers (aligned)
 static UBYTE     mem_skip_alloc = 0;  // Skip memory allocate
 static uint32_t  memtype = MEMTYPE_ANY; // Memory type
 static uint64_t  test_cmd_mask[32];
@@ -321,6 +321,7 @@ usage(void)
                     "[-bb tests latency]\n"
            "   -c <cmd>              test a specific device driver request\n"
            "   -d                    also do destructive operations (write)\n"
+// Undocumented: -dd skips save/restore of data with -i integrity test
            "   -g                    test drive geometry\n"
            "   -h                    display help\n"
            "   -i <tsize>[,<align>]  data integrity test (destructive) "
@@ -1262,7 +1263,7 @@ print_time(void)
     time(&timet);
     tm = localtime(&timet);
     printf("%04d-%02d-%02d %02d:%02d:%02d",
-           tm->tm_year + 1900, tm->tm_mon, tm->tm_mday,
+           tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
            tm->tm_hour, tm->tm_min, tm->tm_sec);
 }
 
@@ -4548,8 +4549,23 @@ test_integrity(uint pattern, uint32_t memtype, uint bufsize, uint align)
         g_devsize = 720 << 10;  // At least 720K
 
     for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++) {
+        /*
+         * g_ibuf is the collection of buffers for integrity testing.
+         *     g_ialign is located within the buffer g_ibuf
+         *
+         * g_align[0] is the data pattern to write
+         * g_align[1] is the alternatte (inverted) data pattern to write
+         * g_align[2] is read buffer; initially patterened with 0x5a, but
+         *               not re-patterned at every read
+         * g_align[3] is second read buffer (when miscompare happens
+         *               on the first read). Re-patterned with 0xa5 at
+         *               every re-read.
+         * g_ibuf[4] is the original data buffer, unless -dd specified
+         */
         if (g_ibuf[bnum] == NULL) {
             uint32_t base;
+            if ((bnum == 5) && (flag_destructive > 1))
+                continue;
             g_ibuf[bnum] = AllocMemType(bufsize + align, memtypex);
             if (g_ibuf[bnum] == NULL) {
                 printf("  AllocMem %x (%x) fail\n", bufsize + align, memtypex);
@@ -4607,9 +4623,11 @@ test_integrity(uint pattern, uint32_t memtype, uint bufsize, uint align)
             }
         }
     }
-
     if (pos + bufsize > g_devsize)
         pos = 0;
+
+    if (flag_destructive == 1)
+        rc = do_read_cmd(tio, pos, bufsize, g_buf[4], g_has_nsd);
 
     rc = do_write_cmd(tio, pos, bufsize, g_align[curbuf], g_has_nsd);
     if (rc != 0) {
@@ -4658,10 +4676,22 @@ test_integrity(uint pattern, uint32_t memtype, uint bufsize, uint align)
         rc = 1;
         goto integrity_fail;
     }
-    pos += bufsize;
-    curbuf ^= 1;
 
 integrity_fail:
+    if (flag_destructive == 1) {
+        int rc2 = do_write_cmd(tio, pos, bufsize, g_ibuf[4], g_has_nsd);
+        if (rc2 != 0) {
+            /* Bad day: you may have lost data */
+            printf("restore of original data failed at 0x%x\n", pos);
+            if (rc == 0)
+                rc = rc2;
+        }
+    }
+    if (rc == 0) {
+        pos += bufsize;
+        curbuf ^= 1;
+    }
+
     close_device(tio);
 opendev_fail:
     DeleteExtIO((struct IORequest *) tio);
