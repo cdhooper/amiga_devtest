@@ -2668,7 +2668,7 @@ get_args_1(uint *arg1)
 
     if (cur_test_args->arg_count > 1) {
         printf("Too many args for this command\n");
-        exit(1);
+        exit(RETURN_ERROR);
     }
 }
 
@@ -2686,7 +2686,7 @@ get_args_2(uint *arg1, uint *arg2)
 
     if (cur_test_args->arg_count > 2) {
         printf("Too many args for this command\n");
-        exit(1);
+        exit(RETURN_ERROR);
     }
 }
 
@@ -2707,7 +2707,7 @@ get_args_3(uint *arg1, uint *arg2, uint *arg3)
 
     if (cur_test_args->arg_count > 3) {
         printf("Too many args for this command\n");
-        exit(1);
+        exit(RETURN_ERROR);
     }
 }
 
@@ -4757,13 +4757,13 @@ get_cmd(const char *str, args_t *args)
                     }
                     if (args->arg_count == 4) {
                         printf("Too many arguments to %s\n", str);
-                        exit(1);
+                        exit(RETURN_ERROR);
                     }
                     args->arg[args->arg_count++] = val;
                 }
                 if (args->arg_count == 0) {
                     show_arg_help(str, pos);
-                    exit(1);
+                    exit(RETURN_ERROR);
                 }
             }
             return (test_cmds[pos].mask);
@@ -4783,7 +4783,7 @@ get_cmd(const char *str, args_t *args)
         }
         printf("\n");
     }
-    exit(1);
+    exit(RETURN_ERROR);
 }
 
 int
@@ -4833,7 +4833,7 @@ main(int argc, char *argv[])
                                 test_cmd_count--;
                         } else {
                             usage_cmd();
-                            exit(1);
+                            exit(RETURN_ERROR);
                         }
                         break;
                     case 'd':
@@ -4844,7 +4844,7 @@ main(int argc, char *argv[])
                         break;
                     case 'h':
                         usage();
-                        exit(0);
+                        exit(RETURN_OK);
                     case 'i':
                         if (flag_integrity++ > 0)
                             break;
@@ -4853,7 +4853,7 @@ main(int argc, char *argv[])
                             if ((sscanf(argv[arg], "%i%n", (int *) &tsize,
                                         &pos) != 1) || (pos == 0)) {
                                 printf("Invalid transfer size %s\n", argv[arg]);
-                                exit(1);
+                                exit(RETURN_ERROR);
                             }
                             switch (argv[arg][pos]) {
                                 case '\0':
@@ -4879,29 +4879,29 @@ main(int argc, char *argv[])
                                 default:
                                     printf("Invalid transfer size %s\n",
                                            argv[arg]);
-                                    exit(1);
+                                    exit(RETURN_ERROR);
                             }
                             if (argv[arg][pos] == ',') {
                                 char *str = argv[arg] + pos + 1;
                                 if ((sscanf(str, "%i%n", (int *) &talign,
                                             &pos) != 1) || (pos == 0)) {
                                     printf("Invalid alignment %s\n", str);
-                                    exit(1);
+                                    exit(RETURN_ERROR);
                                 }
                                 if (talign & (talign - 1)) {
                                     printf("Invalid alignment %s; must be a "
                                            "power of 2\n", str);
-                                    exit(1);
+                                    exit(RETURN_ERROR);
                                 }
                             }
                             if (tsize & 511) {
                                 printf("transfer size must be a multiple "
                                        "of 512 bytes\n");
-                                exit(1);
+                                exit(RETURN_ERROR);
                             }
                         } else {
                             printf("%s requires an argument\n", ptr);
-                            exit(1);
+                            exit(RETURN_ERROR);
                         }
                         break;
                     case 'l':
@@ -4910,20 +4910,20 @@ main(int argc, char *argv[])
                             loops = atoi(argv[arg]);
                         } else {
                             printf("%s requires an argument\n", ptr);
-                            exit(1);
+                            exit(RETURN_ERROR);
                         }
                         break;
                     case 'm':
                         if (memtype != MEMTYPE_ANY) {
                             if (memtype <= MEMTYPE_MAX) {
                                 printf("Memory type already specified\n");
-                                exit(1);
+                                exit(RETURN_ERROR);
                             }
                             mem_skip_alloc++;
                         } else if (++arg < argc) {
                             if (strcmp(argv[arg], "-") == 0) {
                                 show_memlist();
-                                exit(0);
+                                exit(RETURN_OK);
                             } else if (strncasecmp(argv[arg], "chip", 4) == 0) {
                                 memtype = MEMTYPE_CHIP;
                             } else if (strncasecmp(argv[arg], "fast", 4) == 0) {
@@ -4944,13 +4944,13 @@ main(int argc, char *argv[])
                             } else if (sscanf(argv[arg], "%x", &memtype) != 1) {
                                 printf("invalid argument %s for %s\n",
                                        argv[arg], ptr);
-                                exit(1);
+                                exit(RETURN_ERROR);
                             }
                         } else {
                             printf("%s requires an argument\n"
                                    "    One of: chip, fast, 24bit, zorro, "
                                    "accel, coproc, or <addr>\n", ptr);
-                            exit(1);
+                            exit(RETURN_ERROR);
                         }
                         break;
                     case 'o':
@@ -4968,7 +4968,7 @@ main(int argc, char *argv[])
                     default:
                         printf("Unknown argument %s\n", ptr);
                         usage();
-                        exit(1);
+                        exit(RETURN_ERROR);
                 }
             }
         } else if (g_devname == NULL) {
@@ -4978,18 +4978,18 @@ main(int argc, char *argv[])
         } else {
             printf("Error: unknown argument %s\n", ptr);
             usage();
-            exit(1);
+            exit(RETURN_ERROR);
         }
     }
     if (flag_integrity && !flag_destructive) {
         printf("Integrity test requires -d (destructive) flag\n");
-        exit(1);
+        exit(RETURN_ERROR);
     }
     if ((flag_benchmark || flag_geometry || flag_integrity || flag_openclose ||
          flag_testpackets || flag_probe || test_cmd_mask[0]) == 0) {
         printf("You must specify an operation to perform\n");
         usage();
-        exit(1);
+        exit(RETURN_ERROR);
     }
     if (unit == NULL) {
         if ((g_devname == NULL) || flag_benchmark || flag_geometry ||
@@ -4997,12 +4997,12 @@ main(int argc, char *argv[])
             test_cmd_mask[0]) {
             printf("You must specify a device name and unit number to open\n");
             usage();
-            exit(1);
+            exit(RETURN_ERROR);
         }
     } else if (sscanf(unit, "%u", &g_unitno) != 1) {
         printf("Invalid device unit \"%s\"\n", unit);
         usage();
-        exit(1);
+        exit(RETURN_ERROR);
     }
 
     for (loop = 0; loop < loops; loop++) {
@@ -5072,7 +5072,7 @@ main(int argc, char *argv[])
             printf("%u passes completed successfully\n", loops);
     }
     if (loop < loops)
-        exit(1);
+        exit(RETURN_ERROR);
 
-    exit(0);
+    exit(RETURN_OK);
 }
