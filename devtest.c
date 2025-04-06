@@ -13,7 +13,7 @@
  * THE AUTHOR ASSUMES NO LIABILITY FOR ANY DAMAGE ARISING OUT OF THE USE
  * OR MISUSE OF THIS UTILITY OR INFORMATION REPORTED BY THIS UTILITY.
  */
-const char *version = "\0$VER: devtest " VER " ("__DATE__") � Chris Hooper";
+const char *version = "\0$VER: devtest " VER " ("__DATE__") \xA9 Chris Hooper";
 
 #include <stdio.h>
 #include <stdlib.h>
