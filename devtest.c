@@ -13,7 +13,7 @@
  * THE AUTHOR ASSUMES NO LIABILITY FOR ANY DAMAGE ARISING OUT OF THE USE
  * OR MISUSE OF THIS UTILITY OR INFORMATION REPORTED BY THIS UTILITY.
  */
-const char *version = "\0$VER: devtest " VER " ("__DATE__") © Chris Hooper";
+const char *version = "\0$VER: devtest " VER " ("__DATE__") \xA9 Chris Hooper";
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,6 +119,20 @@ struct Device   *TimerBase;
 #define MEMTYPE_COPROC 6
 #define MEMTYPE_MB     7
 #define MEMTYPE_MAX    7
+
+// memory areas
+#define MEMTYPE_CHIP_START      0x00001000u  // chip memory start
+#define MEMTYPE_SIZE_SIZE       0x001FF000u  // max. ~2MB chip memory 
+#define MEMTYPE_SLOW_START      0x00c00000u  // slow expansion memory start
+#define MEMTYPE_SLOW_SIZE       0x00180000u  // max. 1.5MB slow expansion memory 
+#define MEMTYPE_ZORRO3_START    0x10000000u  // Zorro 3 start
+#define MEMTYPE_ZORRO3_SIZE     0x70000000u  // 1.5GB Zorro 3 space
+#define MEMTYPE_ACCEL_START     0x80000000u  // accelerator memory start
+#define MEMTYPE_ACCEL_SIZE      0x60000000u  // max. 1.5GB
+#define MEMTYPE_COPROC_START    0x08000000u  // coprocessor space start
+#define MEMTYPE_COPROC_SIZE     0x08000000u  // max. 128MB
+#define MEMTYPE_MB_START        0x01000000u  // 112MB RAM hack can start here
+#define MEMTYPE_MB_SIZE         0x07000000u  // max. 112MB
 
 
 #define SSD_SENSE_KEY(x)        ((x[2]) & 0x0f)
@@ -506,32 +520,32 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
             Forbid();
             for (mem = (struct MemHeader *)eb->MemList.lh_Head;
                  mem->mh_Node.ln_Succ != NULL;
-                 mem = (struct MemHeader *)mem->mh_Node.ln_Succ) {
+                 mem = (struct MemHeader *) mem->mh_Node.ln_Succ) {
                 uint32_t size = (uint8_t *) mem->mh_Upper - (uint8_t *) mem;
 
                 if ((memtype == MEMTYPE_MB) &&
-                     (((uint32_t) mem < 0x04000000) ||
-                      ((uint32_t) mem >= 0x08000000))) {
+                     (((uint32_t) mem < MEMTYPE_MB_START) ||
+                      ((uint32_t) mem >= MEMTYPE_MB_START + MEMTYPE_MB_SIZE))) {
                     /* Not in Motherboard address range (A3000/A4000 fastmem) */
                     continue;
                 }
                 if ((memtype == MEMTYPE_COPROC) &&
-                     (((uint32_t) mem < 0x08000000) ||
-                      ((uint32_t) mem >= 0x10000000))) {
+                     (((uint32_t) mem < MEMTYPE_COPROC_START) ||
+                      ((uint32_t) mem >= MEMTYPE_COPROC_START + MEMTYPE_COPROC_SIZE))) {
                     /* Not in Coprocessor address range */
                     continue;
                 }
                 if ((memtype == MEMTYPE_ZORRO) &&
                     ((((uint32_t) mem < E_MEMORYBASE) ||
-                      ((uint32_t) mem > E_MEMORYBASE + E_MEMORYSIZE)) &&
-                     (((uint32_t) mem < 0x10000000) ||    // EZ3_CONFIGAREA
-                      ((uint32_t) mem >= 0x80000000)))) { // EZ3_CONFIGAREAEND
+                      ((uint32_t) mem >= E_MEMORYBASE + E_MEMORYSIZE)) &&
+                     (((uint32_t) mem < MEMTYPE_ZORRO3_START) ||    // EZ3_CONFIGAREA
+                      ((uint32_t) mem >= MEMTYPE_ZORRO3_START + MEMTYPE_ZORRO3_SIZE)))) { // EZ3_CONFIGAREAEND
                     /* Not in Zorro II or Zorro III address range */
                     continue;
                 }
                 if ((memtype == MEMTYPE_ACCEL) &&
-                     (((uint32_t) mem < 0x80000000) ||
-                      ((uint32_t) mem >= 0xe0000000))) {
+                     (((uint32_t) mem < MEMTYPE_ACCEL_START) ||
+                      ((uint32_t) mem >= MEMTYPE_ACCEL_START + MEMTYPE_ACCEL_SIZE))) {
                     /* Not in Accelerator address range */
                     continue;
                 }
@@ -2144,23 +2158,23 @@ static const char *
 memtype_str(uint32_t mem)
 {
     const char *type;
-    if (((mem > 0x1000) && (mem < 0x00200000)) || (mem == MEMTYPE_CHIP)) {
+    if (((mem > MEMTYPE_CHIP_START) && (mem < MEMTYPE_CHIP_START + MEMTYPE_SIZE_SIZE)) || (mem == MEMTYPE_CHIP)) {
         type = "Chip";
-    } else if ((mem >= 0x00c00000) && (mem < 0x00d80000)) {
+    } else if ((mem >= MEMTYPE_SLOW_START) && (mem < MEMTYPE_SLOW_START + MEMTYPE_SLOW_SIZE)) {
         type = "Slow";
-    } else if (((mem >= 0x04000000) && (mem < 0x08000000)) ||
+    } else if (((mem >= MEMTYPE_MB_START) && (mem < MEMTYPE_MB_START + MEMTYPE_MB_SIZE)) ||
                (mem == MEMTYPE_FAST))  {
         type = "MB";
-    } else if (((mem >= 0x08000000) && (mem < 0x10000000)) ||
+    } else if (((mem >= MEMTYPE_COPROC_START) && (mem < MEMTYPE_COPROC_START + MEMTYPE_COPROC_SIZE)) ||
                (mem == MEMTYPE_COPROC))  {
         type = "Coprocessor";
     } else if (mem == MEMTYPE_ZORRO) {
         type = "Zorro";
     } else if ((mem >= E_MEMORYBASE) && (mem < E_MEMORYBASE + E_MEMORYSIZE)) {
         type = "Zorro II";
-    } else if ((mem >= 0x10000000) && (mem < 0x80000000)) {
+    } else if ((mem >= MEMTYPE_ZORRO3_START) && (mem < MEMTYPE_ZORRO3_START + MEMTYPE_ZORRO3_SIZE)) {
         type = "Zorro III";
-    } else if (((mem >= 0x80000000) && (mem < 0xe0000000)) ||
+    } else if (((mem >= MEMTYPE_ACCEL_START) && (mem < MEMTYPE_ACCEL_START + MEMTYPE_ACCEL_SIZE)) ||
                 (mem == MEMTYPE_ACCEL)) {
         type = "Accelerator";
     } else {
