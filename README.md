@@ -34,7 +34,9 @@ devtest will exit with a non-zero code. Example:
 
 ## 2. Performance
 You can measure device read and write performance in the system, using
-different Amiga memory types (default is fastmem). Examples:
+different Amiga memory types (default is fastmem).
+**WARNING: The -d option enables the write benchmark, which is destructive to any data on the drive!**
+Examples:
 ```
     9.OS322:> devtest a4091.device 1 -bd
     Test a4091.device 1 with Coprocessor RAM
@@ -58,7 +60,7 @@ Testing with Zorro memory
     write  32 KB xfers          4031 KB/sec
 ```
 
-Sometimes there is type of memory which is at a specific range
+Sometimes there is a type of memory which is at a specific range
 of addresses, and you want to use an address in that range.
 With the -m option, you may both discover free memory and specify
 the exact address to use. Use the `-m -` argument to show memory
@@ -96,7 +98,9 @@ Example:
     packet types that a filesystem may use. This is especially true
     if it's an older driver that can't handle the packet standards
     which support larger (4GB+) media. Devtest will test most known
-    trackdisk commands and report whether they are supported. Example:
+    trackdisk commands and report whether they are supported.
+**WARNING: The -d option enables the write benchmark, which is destructive to any data on the drive!**
+    Example:
 ```
     9.OS322:> devtest -t a4091.device 1 -d
     TD_GETGEOMETRY     Success  4194304 x 512  C=8192 H=32 S=16 Type=0

@@ -122,9 +122,9 @@ struct Device   *TimerBase;
 
 // memory areas
 #define MEMTYPE_CHIP_START      0x00001000u  // chip memory start
-#define MEMTYPE_SIZE_SIZE       0x001FF000u  // max. ~2MB chip memory 
+#define MEMTYPE_CHIP_SIZE       0x001FF000u  // max. ~2MB chip memory
 #define MEMTYPE_SLOW_START      0x00c00000u  // slow expansion memory start
-#define MEMTYPE_SLOW_SIZE       0x00180000u  // max. 1.5MB slow expansion memory 
+#define MEMTYPE_SLOW_SIZE       0x00180000u  // max. 1.5MB slow expansion memory
 #define MEMTYPE_ZORRO3_START    0x10000000u  // Zorro 3 start
 #define MEMTYPE_ZORRO3_SIZE     0x70000000u  // 1.5GB Zorro 3 space
 #define MEMTYPE_ACCEL_START     0x80000000u  // accelerator memory start
@@ -302,6 +302,7 @@ static uint64_t  test_cmd_mask[32];
 static args_t    test_cmd_args[TEST_MAX_CMDS];
 static args_t   *cur_test_args = NULL;
 static uint      flag_destructive = 0;
+static uint      force_yes = 0;
 
 static BOOL
 is_user_abort(void)
@@ -309,6 +310,38 @@ is_user_abort(void)
     if (SetSignal(0, 0) & SIGBREAKF_CTRL_C)
         return (1);
     return (0);
+}
+
+/*
+ * are_you_sure() prompts the user to confirm that an operation is intended.
+ *
+ * @param  [in]  None.
+ *
+ * @return       TRUE  - User has confirmed (Y).
+ * @return       FALSE - User has denied (N).
+ */
+int
+are_you_sure(const char *prompt)
+{
+    int ch;
+    if (force_yes) {
+        printf("%s: yes\n", prompt);
+        return (TRUE);
+    }
+ask_again:
+    printf("%s - are you sure? (y/n) ", prompt);
+    fflush(stdout);
+    while ((ch = getchar()) != EOF) {
+        if (is_user_abort())
+            return (FALSE);
+        if ((ch == 'y') || (ch == 'Y'))
+            return (TRUE);
+        if ((ch == 'n') || (ch == 'N'))
+            return (FALSE);
+        if (!isspace(ch))
+            goto ask_again;
+    }
+    return (FALSE);
 }
 
 static int
@@ -348,7 +381,8 @@ usage(void)
            "   -o                    test open/close\n"
            "   -p                    probe SCSI bus for devices\n"
            "   -t                    test all packet types (basic, TD64, NSD) "
-                    "[-tt = more]\n",
+                    "[-tt = more]\n"
+           "   -y                    answer all prompts with 'yes'\n",
            version + 7);
 }
 
@@ -470,7 +504,7 @@ llu_to_str(uint64_t value)
 
     if (high > 0) {
         sprintf(buf, "%u%09u",
-                high, (unsigned int) (value - high * 1000000));
+                high, (unsigned int) (value - high * 1000000000));
     } else {
         sprintf(buf, "%u", (unsigned int) value);
     }
@@ -2158,7 +2192,7 @@ static const char *
 memtype_str(uint32_t mem)
 {
     const char *type;
-    if (((mem > MEMTYPE_CHIP_START) && (mem < MEMTYPE_CHIP_START + MEMTYPE_SIZE_SIZE)) || (mem == MEMTYPE_CHIP)) {
+    if (((mem > MEMTYPE_CHIP_START) && (mem < MEMTYPE_CHIP_START + MEMTYPE_CHIP_SIZE)) || (mem == MEMTYPE_CHIP)) {
         type = "Chip";
     } else if ((mem >= MEMTYPE_SLOW_START) && (mem < MEMTYPE_SLOW_START + MEMTYPE_SLOW_SIZE)) {
         type = "Slow";
@@ -4979,6 +5013,9 @@ main(int argc, char *argv[])
                     case 'v':
                         g_verbose++;
                         break;
+                    case 'y':
+                        force_yes++;
+                        break;
                     default:
                         printf("Unknown argument %s\n", ptr);
                         usage();
@@ -4997,6 +5034,10 @@ main(int argc, char *argv[])
     }
     if (flag_integrity && !flag_destructive) {
         printf("Integrity test requires -d (destructive) flag\n");
+        exit(RETURN_ERROR);
+    }
+    if (flag_destructive && (force_yes == 0) &&
+        (are_you_sure("Destructive test") == FALSE)) {
         exit(RETURN_ERROR);
     }
     if ((flag_benchmark || flag_geometry || flag_integrity || flag_openclose ||
