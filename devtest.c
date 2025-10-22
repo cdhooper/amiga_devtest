@@ -362,6 +362,15 @@ close_device(struct IOExtTD *tio)
 static void
 usage(void)
 {
+    /*
+     * XXX implement:
+     * -k <test> for kind of integrity test to perform:
+     *     simple (default) is what is currently implemented
+     *     sweep - check all media of device with trailing half-rate
+     *             read (-dd required)
+     *     butterfly - pattern several writes, then check them
+     *     random - use prime-based random to check entire device
+     */
     printf("%s\n\n"
            "usage: devtest <options> <x.device> <unit>\n"
            "   -b                    benchmark device performance "
@@ -369,9 +378,9 @@ usage(void)
            "   -c <cmd>              test a specific device driver request\n"
            "   -d                    also do destructive operations (write)\n"
 // Undocumented: -dd skips save/restore of data with -i integrity test
-           "   -g                    test drive geometry\n"
+           "   -g                    report drive geometry\n"
            "   -h                    display help\n"
-           "   -i <tsize>[,<align>]  data integrity test (destructive) "
+           "   -i <tsize>[,<align>]  integrity test (destructive) "
                           "[-i=rand -ii=addr -iii=patt]\n"
            "   -l <loops>            run multiple times\n"
            "   -m <addr>             "
@@ -394,7 +403,7 @@ typedef struct {
 static const err_to_str_t err_to_str[] = {
     { IOERR_OPENFAIL,       "IOERR_OPENFAIL" },             // -1
     { IOERR_ABORTED,        "IOERR_ABORTED" },              // -2
-    { IOERR_NOCMD,          "IOERR_NOCMD (unsupported)" },  // -3
+    { IOERR_NOCMD,          "IOERR_NOCMD" },                // -3
     { IOERR_BADLENGTH,      "IOERR_BADLENGTH" },            // -4
     { IOERR_BADADDRESS,     "IOERR_BADADDRESS" },           // -5
     { IOERR_UNITBUSY,       "IOERR_UNITBUSY" },             // -6
@@ -812,11 +821,14 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
 
     while (incdec >= g_sector_size / 2) {
         rc = do_read_cmd(tio, offset, g_sector_size, buf, g_has_nsd);
+        if (g_verbose)
+            printf("Read %s = %d\n", llu_to_str(offset / g_sector_size), rc);
+
         if (rc == 0) {
             min_offset = offset;
             if (double_mode) {
+                incdec = offset;
                 offset *= 2;
-                incdec = offset / 2;
             } else {
                 if (offset + incdec >= max_offset)
                     incdec /= 2;
@@ -1090,6 +1102,7 @@ drive_geometry(void)
     struct DriveGeometry dg;
     struct MsgPort *mp;
     uint8_t *pages;
+    uint32_t sector_size;
     uint64_t last_sector;
 
     mp = CreatePort(0, 0);
@@ -1168,12 +1181,13 @@ drive_geometry(void)
         printf("%5c %12c %19s", '-', '-', "");
         print_fail_nl(rc);
     } else {
-        uint last_sector = *(uint32_t *) &cap10->addr;
-        printf("%5u %12u\n", *(uint32_t *) &cap10->length, last_sector + 1);
+        last_sector = *(uint32_t *) &cap10->addr;
+        sector_size = *(uint32_t *) &cap10->length;
         FreeMemType(cap10, sizeof (*cap10));
+        printf("%5u %12s\n", sector_size, llu_to_str(last_sector + 1));
         if (g_devsize == 0) {
-            g_devsize = (uint64_t) (*(uint32_t *) cap10->length) *
-                        (last_sector + 1);
+            g_devsize = (uint64_t) sector_size * (last_sector + 1);
+            g_sector_size = sector_size;
         }
     }
 
@@ -1185,8 +1199,11 @@ drive_geometry(void)
         print_fail_nl(rc);
     } else {
         last_sector = *(uint64_t *) &cap16->addr;
-        printf("%5c %12s\n", ' ', llu_to_str(last_sector + 1));
+        sector_size = *(uint32_t *) &cap16->length;
         FreeMemType(cap16, sizeof (*cap16));
+        printf("%5u %12s\n", sector_size, llu_to_str(last_sector + 1));
+        g_devsize = (uint64_t) sector_size * (last_sector + 1);
+        g_sector_size = sector_size;
     }
 
     printf("Read-to capacity ");
@@ -2439,6 +2456,7 @@ test_cmd_getgeometry(struct IOExtTD *tio)
                dg.dg_Heads, dg.dg_TrackSectors, dg.dg_DeviceType,
                (dg.dg_Flags & DGF_REMOVABLE) ? " Removable" : "");
         g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
+        g_sector_size = dg.dg_SectorSize;
     } else {
         print_fail_nl(rc);
     }
