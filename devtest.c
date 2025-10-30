@@ -107,6 +107,10 @@ struct Device   *TimerBase;
 
 #define ARRAY_SIZE(x) ((sizeof (x) / sizeof ((x)[0])))
 
+/* BCPL conversion functions */
+#define BTOC(x) ((x)<<2)
+#define CTOB(x) ((x)>>2)
+
 #define BUFSIZE    8192
 #define RAWBUFSIZE 16384
 
@@ -286,6 +290,8 @@ static int       g_verbose = 0;       // Verbose output
 static int       g_changenum = 0;     // Current device media change number
 static uint      g_sector_size = 512; // Updated when getting drive geometry
 static uint64_t  g_devsize = 0;       // Device total size in bytes
+static uint64_t  g_devstart = 0;      // Device start byte (for partitions)
+static uint64_t  g_devend = 0;        // Device end byte (for partitions)
 static uint      g_lun = 0;           // Target LUN to access
 static uint      g_has_nsd = 0;       // Device driver supports NSD
 static uint8_t **g_buf;               // Saved data buffers for certain tests
@@ -296,6 +302,7 @@ static UWORD     g_sense_length;      // Length of returned sense data (if any)
 static UBYTE     g_sense_data[255];   // Sense data buffer
 static uint8_t  *g_ibuf[5];           // Integrity test buffers
 static uint8_t  *g_align[5];          // Integrity test buffers (aligned)
+struct DosEnvec *g_envec;             // Filesystem environment vector
 static UBYTE     mem_skip_alloc = 0;  // Skip memory allocate
 static uint32_t  memtype = MEMTYPE_ANY; // Memory type
 static uint64_t  test_cmd_mask[32];
@@ -375,7 +382,7 @@ usage(void)
            "usage: devtest <options> <x.device> <unit>\n"
            "   -b                    benchmark device performance "
                     "[-bb tests latency]\n"
-           "   -c <cmd>              test a specific device driver request\n"
+           "   -c <cmd>[(arg,...)]   test a specific device driver request\n"
            "   -d                    also do destructive operations (write)\n"
 // Undocumented: -dd skips save/restore of data with -i integrity test
            "   -g                    report drive geometry\n"
@@ -1145,6 +1152,20 @@ drive_geometry(void)
     tio->iotd_Req.io_Error   = 0xa5;
     printf("                 SSize TotalSectors    Cyl Head  Sect DType "
            "Removable\n");
+    if (g_envec != NULL) {
+        uint cyls = g_envec->de_HighCyl + 1 - g_envec->de_LowCyl;
+        printf("Partition        %5u %12u %6u %4u %5u  %s %u\n",
+               g_sector_size, cyls * g_envec->de_Surfaces *
+               g_envec->de_BlocksPerTrack, cyls,
+               g_envec->de_Surfaces, g_envec->de_BlocksPerTrack,
+               g_devname, g_unitno);
+        printf("Partition-start  %5u %12u %6u\n",
+               g_sector_size, g_envec->de_LowCyl * g_envec->de_Surfaces *
+               g_envec->de_BlocksPerTrack, g_envec->de_LowCyl);
+        printf("Partition-end    %5u %12u %6u\n",
+               g_sector_size, (g_envec->de_HighCyl + 1) * g_envec->de_Surfaces *
+               g_envec->de_BlocksPerTrack, g_envec->de_HighCyl + 1);
+    }
     printf("TD_GETGEOMETRY ");
     if ((rc = DoIO((struct IORequest *) tio)) != 0) {
         printf("%7c %12c %5c %5c %5c  ",
@@ -1512,15 +1533,19 @@ latency_butterfly(UWORD iocmd, uint8_t *buf, int num_iter,
     unsigned int step;
     struct EClockVal stime;
     struct EClockVal etime;
-    uint64_t pos = 0;
+    uint64_t start = g_devstart;
+    uint64_t end   = g_devend;
+    uint64_t pos   = start;
+    if (end == 0)
+        end = g_devsize;
 
     if (g_sector_size == 0)
         g_sector_size = 512;
 
-    if (g_devsize == 0)
-        g_devsize = 720 << 10;  // At least 720K
+    if (end == 0)
+        end = 720 << 10;  // At least 720K
 
-    if ((g_devsize >> 32) != 0) {
+    if ((end >> 32) != 0) {
         if (iocmd == CMD_READ) {
             iocmd = g_has_nsd ? NSCMD_TD_READ64 : TD_READ64;
         } else if (iocmd == CMD_WRITE) {
@@ -1530,7 +1555,7 @@ latency_butterfly(UWORD iocmd, uint8_t *buf, int num_iter,
             return (1);
         }
     }
-    step = g_devsize / num_iter;
+    step = (end - start) / num_iter;
     if (mode == BUTTERFLY_MODE_FAR)
         step /= 4;
 
@@ -1551,15 +1576,15 @@ latency_butterfly(UWORD iocmd, uint8_t *buf, int num_iter,
             case BUTTERFLY_MODE_AVG:
             case BUTTERFLY_MODE_FAR:
                 if ((iter & 1) == 0)
-                    pos = step * iter / 2;              // left --> right
+                    pos = step * iter / 2;                  // left --> right
                 else
-                    pos = g_devsize - step * iter / 2;  // left <-- right
+                    pos = (end - start) - step * iter / 2;  // left <-- right
                 break;
             case BUTTERFLY_MODE_CONST:
                 if ((iter & 1) == 0)
-                    pos += g_devsize / 2;               // left --> right
+                    pos += (end - start) / 2;               // left --> right
                 else
-                    pos -= (g_devsize / 2 - step);      // left <-- right
+                    pos -= ((end - start) / 2 - step);      // left <-- right
                 break;
         }
     }
@@ -2385,6 +2410,7 @@ create_tio_fail:
 static int
 do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
 {
+    offset += g_devstart;
     tio->iotd_Req.io_Command = CMD_READ;
     tio->iotd_Req.io_Actual  = 0;
     tio->iotd_Req.io_Offset  = offset;
@@ -2392,6 +2418,9 @@ do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
     tio->iotd_Req.io_Data    = buf;
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
+
+    if ((g_devend != 0) && (offset + len >= g_devend))
+        return (1);
 
     if (((offset + len) >> 32) > 0) {
         /* Need TD64 or NSD */
@@ -2407,6 +2436,7 @@ do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
 static int
 do_write_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
 {
+    offset += g_devstart;
     tio->iotd_Req.io_Command = CMD_WRITE;
     tio->iotd_Req.io_Actual  = 0;
     tio->iotd_Req.io_Offset  = offset;
@@ -2414,6 +2444,9 @@ do_write_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
     tio->iotd_Req.io_Data    = buf;
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
+
+    if ((g_devend != 0) && (offset + len >= g_devend))
+        return (1);
 
     if (((offset + len) >> 32) > 0) {
         /* Need TD64 or NSD */
@@ -2696,6 +2729,7 @@ test_etd_command(struct IOExtTD *tio, UWORD cmd, const char *cmd_name,
 {
     int rc;
 
+    io_offset += g_devstart;
     tio->iotd_Req.io_Command = cmd;
     tio->iotd_Req.io_Offset  = io_offset;
     tio->iotd_Req.io_Actual  = io_actual;
@@ -2868,8 +2902,15 @@ test_td_read64(struct IOExtTD *tio)
     uint bufsize = BUFSIZE;
     uint readoffset = 0;
     uint readoffsethi = 0;
+    uint64_t io_offset;
 
     get_args_3(&bufsize, &readoffset, &readoffsethi);
+
+    io_offset = ((uint64_t) readoffsethi << 32) | readoffset;
+    io_offset += g_devstart;
+    readoffsethi = io_offset >> 32;
+    readoffset = (uint32_t) io_offset;
+
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
@@ -2884,7 +2925,7 @@ test_td_read64(struct IOExtTD *tio)
     print_test_name("TD_READ64");
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        rc = do_read_cmd(tio, 0, bufsize, buf[0], 0);
+        rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
         if (rc != 0) {
             print_fail(rc);
             printf(" - read verify operation failed\n");
@@ -2949,8 +2990,15 @@ test_nscmd_td_read64(struct IOExtTD *tio)
     uint bufsize = BUFSIZE;
     uint readoffset = 0;
     uint readoffsethi = 0;
+    uint64_t io_offset;
 
     get_args_3(&bufsize, &readoffset, &readoffsethi);
+
+    io_offset = ((uint64_t) readoffsethi << 32) | readoffset;
+    io_offset += g_devstart;
+    readoffsethi = io_offset >> 32;
+    readoffset = (uint32_t) io_offset;
+
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
@@ -2993,6 +3041,7 @@ test_nscmd_etd_read64(struct IOExtTD *tio)
     uint readoffsethi = 0;
 
     get_args_3(&bufsize, &readoffset, &readoffsethi);
+
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
@@ -3023,6 +3072,8 @@ test_td_seek(struct IOExtTD *tio)
     uint seekoffset = 0;
 
     get_args_1(&seekoffset);
+
+    seekoffset += g_devstart;
 
     /* Seek */
     tio->iotd_Req.io_Command = TD_SEEK;
@@ -3064,6 +3115,7 @@ test_etd_seek(struct IOExtTD *tio)
     uint seekoffset = 0;
 
     get_args_1(&seekoffset);
+    seekoffset += g_devstart;
 
     rc = test_etd_command(tio, ETD_SEEK, "ETD_SEEK", BUFSIZE, g_buf[1],
                           0, seekoffset);
@@ -3078,8 +3130,14 @@ test_td_seek64(struct IOExtTD *tio)
     int rc;
     uint seekoffset = 0;
     uint seekoffsethi = 0;
+    uint64_t io_offset;
 
     get_args_2(&seekoffset, &seekoffsethi);
+
+    io_offset = ((uint64_t) seekoffsethi << 32) | seekoffset;
+    io_offset += g_devstart;
+    seekoffsethi = io_offset >> 32;
+    seekoffset = (uint32_t) io_offset;
 
     tio->iotd_Req.io_Command = TD_SEEK64;
     tio->iotd_Req.io_Actual  = seekoffsethi;  // High 64 bits
@@ -3101,8 +3159,14 @@ test_nscmd_td_seek64(struct IOExtTD *tio)
     int rc;
     uint seekoffset = 0;
     uint seekoffsethi = 0;
+    uint64_t io_offset;
 
     get_args_2(&seekoffset, &seekoffsethi);
+
+    io_offset = ((uint64_t) seekoffsethi << 32) | seekoffset;
+    io_offset += g_devstart;
+    seekoffsethi = io_offset >> 32;
+    seekoffset = (uint32_t) io_offset;
 
     tio->iotd_Req.io_Command = NSCMD_TD_SEEK64;
     tio->iotd_Req.io_Actual  = seekoffsethi;  // High 64 bits
@@ -3624,6 +3688,8 @@ test_cmd_write(struct IOExtTD *tio)
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
+    writeoffset += g_devstart;
+
     memset(buf[0], 0xdb, bufsize);
     tio->iotd_Req.io_Command = CMD_WRITE;
     tio->iotd_Req.io_Actual  = 0;  // Unused
@@ -3682,6 +3748,8 @@ test_td_write64(struct IOExtTD *tio)
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
+    writeoffset += g_devstart;
+
     memset(buf[0], 0xd6, bufsize);
     tio->iotd_Req.io_Command = TD_WRITE64;
     tio->iotd_Req.io_Actual  = writeoffsethi;  // High 64 bits
@@ -3694,6 +3762,7 @@ test_td_write64(struct IOExtTD *tio)
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
         uint64_t offset64 = ((uint64_t) writeoffsethi << 32) | writeoffset;
+        offset64 += g_devstart;
         if (check_write(tio, buf[0], buf[1], bufsize, offset64, 0) == 0) {
             if ((g_devsize >= ((1ULL << 32) + bufsize * 2)) &&
                 (offset64 == 0)) {
@@ -3731,8 +3800,15 @@ test_nscmd_td_write64(struct IOExtTD *tio)
     uint bufsize = BUFSIZE;
     uint writeoffset = 0;
     uint writeoffsethi = 0;
+    uint64_t io_offset;
 
     get_args_3(&bufsize, &writeoffset, &writeoffsethi);
+
+    io_offset = ((uint64_t) writeoffsethi << 32) | writeoffset;
+    io_offset += g_devstart;
+    writeoffsethi = io_offset >> 32;
+    writeoffset = (uint32_t) io_offset;
+
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
@@ -4527,6 +4603,65 @@ extio_fail:
     return (rc);
 }
 
+static struct FileSysStartupMsg *
+find_startup(char *name)
+{
+    struct FileSysStartupMsg *startup;
+    struct DosLibrary        *DosBase;
+    struct RootNode          *rootnode;
+    struct DosInfo           *dosinfo;
+    struct DevInfo           *devinfo;
+    char                     *devname;
+    char                     *pos;
+    int                       found = 0;
+    int                       namelen = strlen(name);
+
+    if ((pos = strchr(name, ':')) != NULL)
+        *pos = '\0';
+
+    DosBase  = (struct DosLibrary *) OpenLibrary("dos.library", 0L);
+
+    rootnode = DosBase->dl_Root;
+    dosinfo  = (struct DosInfo *) BTOC(rootnode->rn_Info);
+    devinfo  = (struct DevInfo *) BTOC(dosinfo->di_DevInfo);
+
+    while (devinfo != NULL) {
+        devname = (char *) BTOC(devinfo->dvi_Name);
+        if (strncasecmp(devname + 1, name, namelen) == 0) {
+            found = 1;
+            break;
+        }
+        devinfo = (struct DevInfo *) BTOC(devinfo->dvi_Next);
+    }
+
+    if (found) {
+        startup = (struct FileSysStartupMsg *) BTOC(devinfo->dvi_Startup);
+        if (startup == NULL) {
+            /* Try searching for a volume which matches the task pointer */
+            APTR task = devinfo->dvi_Task;
+            devinfo  = (struct DevInfo *) BTOC(dosinfo->di_DevInfo);
+            while (devinfo != NULL) {
+                if ((devinfo->dvi_Task == task) &&
+                    (devinfo->dvi_Type == DLT_DEVICE))
+                    break;
+                devinfo = (struct DevInfo *) BTOC(devinfo->dvi_Next);
+            }
+            if (devinfo != NULL)
+                startup = (struct FileSysStartupMsg *)
+                    BTOC(devinfo->dvi_Startup);
+        }
+    } else {
+        startup = NULL;
+    }
+
+    CloseLibrary((struct Library *)DosBase);
+
+    if (pos != NULL)
+        *pos = ':';
+
+    return (startup);
+}
+
 /*
  * rand32
  * ------
@@ -5081,6 +5216,25 @@ main(int argc, char *argv[])
         usage();
         exit(RETURN_ERROR);
     }
+    if (strchr(g_devname, ':')) {
+        struct FileSysStartupMsg *startup = find_startup(g_devname);
+        if (startup == NULL) {
+            printf("Error opening %s\n", g_devname);
+            exit(RETURN_ERROR);
+        }
+        g_devname     = ((char *) BTOC(startup->fssm_Device)) + 1;
+        g_unitno      = startup->fssm_Unit;
+        g_envec       = (struct DosEnvec *) BTOC(startup->fssm_Environ);
+        if (g_envec != NULL) {
+            g_sector_size = g_envec->de_SizeBlock * 4;
+            g_devstart = g_envec->de_LowCyl * g_envec->de_Surfaces *
+                         g_envec->de_BlocksPerTrack * g_sector_size;
+            g_devend = (g_envec->de_HighCyl + 1) * g_envec->de_Surfaces *
+                       g_envec->de_BlocksPerTrack * g_sector_size;
+        }
+        printf("Device %s %u\n", g_devname, g_unitno);
+        goto got_unit;
+    }
     if (unit == NULL) {
         if ((g_devname == NULL) || flag_benchmark || flag_geometry ||
             flag_integrity || flag_openclose || flag_testpackets ||
@@ -5094,6 +5248,7 @@ main(int argc, char *argv[])
         usage();
         exit(RETURN_ERROR);
     }
+got_unit:
 
     for (loop = 0; loop < loops; loop++) {
         uint stop_on_error = (loop != 0) || (loops == 1);
