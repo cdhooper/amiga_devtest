@@ -837,6 +837,8 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
         } else {
             double_mode = 0;
             max_offset = offset;
+            if (incdec >= offset)
+                break;
             if (offset - incdec <= min_offset)
                 incdec /= 2;
             offset -= incdec;
@@ -1006,8 +1008,18 @@ scsi_probe_unit(uint unit, struct IOExtTD *tio)
         erc = do_scsi_read_capacity_10(tio, unit, &cap10);
         if ((erc == 0) && (cap10 != NULL)) {
             uint ssize = *(uint32_t *) &cap10->length;
-            uint cap   = (*(uint32_t *) &cap10->addr + 1) / 1000;
-            uint cap_c = 0;  // KMGTPEZY
+            uint64_t cap   = *(uint32_t *) &cap10->addr;
+            uint     cap_c = 0;  // KMGTPEZY
+            if (cap == 0xffffffff) {
+                /* Try to use READ_CAPACITY_16 */
+                scsi_read_capacity_16_data_t *cap16;
+                erc = do_scsi_read_capacity_16(tio, &cap16);
+                if ((erc == 0) && (cap16 != NULL)) {
+                    cap = *(uint64_t *) &cap16->addr;
+                    FreeMemType(cap16, sizeof (*cap16));
+                }
+            }
+            cap = (cap + 1) / 1000;
             if (cap > 100000) {
                 cap /= 1000;
                 cap_c++;
@@ -1017,7 +1029,7 @@ scsi_probe_unit(uint unit, struct IOExtTD *tio)
                 cap /= 1000;
                 cap_c++;
             }
-            printf("%5u %5u %cB", ssize, cap, "KMGTPEZY"[cap_c]);
+            printf("%5u %5u %cB", ssize, (uint)cap, "KMGTPEZY"[cap_c]);
             FreeMemType(cap10, sizeof (*cap10));
         }
         printf("\n");
@@ -1131,7 +1143,7 @@ drive_geometry(void)
     tio->iotd_Req.io_Data    = &dg;
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
-    printf("                 SSize TotalSectors   Cyl  Head  Sect  DType "
+    printf("                 SSize TotalSectors    Cyl Head  Sect DType "
            "Removable\n");
     printf("TD_GETGEOMETRY ");
     if ((rc = DoIO((struct IORequest *) tio)) != 0) {
@@ -1139,10 +1151,12 @@ drive_geometry(void)
                '-', '-', '-', '-', '-');
         print_fail_nl(rc);
     } else {
-        printf("%7"PRIu32" %12"PRIu32" %5"PRIu32" %5"PRIu32" "
-               "%5"PRIu32"  0x%02x  %s\n",
-               dg.dg_SectorSize, dg.dg_TotalSectors, dg.dg_Cylinders,
-               dg.dg_Heads, dg.dg_TrackSectors, dg.dg_DeviceType,
+        printf("%7"PRIu32" %12"PRIu32" %6"PRIu32" ",
+               dg.dg_SectorSize, dg.dg_TotalSectors, dg.dg_Cylinders);
+        printf("%*"PRIu32" ",
+               (dg.dg_Cylinders < 1000000) ? 4 : 3, dg.dg_Heads);
+        printf("%5"PRIu32"  0x%02x %s\n",
+               dg.dg_TrackSectors, dg.dg_DeviceType,
                (dg.dg_Flags & DGF_REMOVABLE) ? "Yes" : "No");
         g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
         g_sector_size = dg.dg_SectorSize;
@@ -1154,7 +1168,7 @@ drive_geometry(void)
     if (rc != 0) {
         printf("%51c  -    Fail\n", '-');
     } else {
-        printf("%46s 0x%02x  %s", "",
+        printf("%46s 0x%02x %s", "",
                inq_res->device & SID_TYPE,
                (inq_res->dev_qual2 & SID_REMOVABLE) ? "Yes" : "No");
         if (inq_res->dev_qual2 & SID_REMOVABLE) {
@@ -1236,7 +1250,7 @@ drive_geometry(void)
                     uint ncyl  = _3btol(&pages[pos + 2]);
                     uint nhead = pages[pos + 5];
                     printf("Mode Page 0x%02x", page);
-                    printf("%27u %5u\n", ncyl, nhead);
+                    printf("%28u %4u\n", ncyl, nhead);
                     break;
                 }
                 case 0x05: { // Flexible Geometry
@@ -1245,7 +1259,7 @@ drive_geometry(void)
                     uint ssize = *(uint16_t *)(&pages[pos + 6]);
                     uint ncyl  = *(uint16_t *)(&pages[pos + 8]);
                     printf("Mode Page 0x%02x", page);
-                    printf("%8u %18u %5u %5u\n", ssize, ncyl, nhead, nsec);
+                    printf("%8u %18u %6u %4u\n", ssize, ncyl, nhead, nsec);
                     break;
                 }
                 case 0x06: { // Reduced Block Commands Parameters
@@ -4967,6 +4981,8 @@ main(int argc, char *argv[])
                             }
                         } else {
                             printf("%s requires an argument\n", ptr);
+                            printf("    Transfer size: 512 1M 64k etc\n"
+                                   "    optional alignment: ,1 ,2 ,4 etc\n");
                             exit(RETURN_ERROR);
                         }
                         break;
@@ -4976,6 +4992,7 @@ main(int argc, char *argv[])
                             loops = atoi(argv[arg]);
                         } else {
                             printf("%s requires an argument\n", ptr);
+                            printf("    The number of loop iterations\n");
                             exit(RETURN_ERROR);
                         }
                         break;
@@ -5013,9 +5030,9 @@ main(int argc, char *argv[])
                                 exit(RETURN_ERROR);
                             }
                         } else {
-                            printf("%s requires an argument\n"
-                                   "    One of: chip, fast, 24bit, zorro, "
-                                   "accel, coproc, or <addr>\n", ptr);
+                            printf("%s requires an argument\n", ptr);
+                            printf("    One of: chip, fast, 24bit, zorro, "
+                                   "accel, coproc, or <addr>\n");
                             exit(RETURN_ERROR);
                         }
                         break;
