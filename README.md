@@ -196,8 +196,8 @@ and timing are being met, but it does no actual data verification. The
 devtest utility can perform tests to verify that data can be reliably stored
 to and retrieved from the device media.
 
-> CAUTION: This test is destructive. Do not operate on a drive with data
->          that you intend to keep.
+> CAUTION: This test is destructive when the -d flag is given. Do not
+           operate on a drive with data that you intend to keep.
 
 Example:
 ```
@@ -265,3 +265,24 @@ If -iii is specified, the written data will be one of 0xa5, 0x5a, 0xc3, 0x3c,
 0x81, 0x00, 0xff, in a rotating cycle. The fact that there are 7 values in
 the -iii mode is by design. The prime will cause different power-of-two
 addresses to experience different data patterns.
+
+The simple integrity test, as shown above, performs a sequential check of
+all media on the device. At each pass in destructive mode, it writes a chunk,
+reads back that chunk, and compares. In non-destructive mode, it reads a
+chunk, reads the same chunk again, and compares.
+
+The devtest utility offers another integrity test, butterfly. This test
+is specified with the -k option:
+```
+    -k butterfly
+```
+The butterfly integrity test alternates between low and high offsets on
+the device, each iteration the test moves the low and high closer to the
+middle of the device, until they cross over. At which point, the low and
+high swap places and then the test moves the low and high further from
+the middle of the device. In destructive mode, the test writes data to
+the low offset, and different data to the high offset. It then verifies
+the low and high data match what was written. In non-destructive mode,
+the test reads data at the low and high offset, then reads it a second
+time from the low and high offset. It then verifies the low and high
+data match what was previously read.

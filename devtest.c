@@ -269,9 +269,8 @@ typedef struct {
     char               alias[15];
     uint8_t            flags;
     uint64_t           mask;
-    char               name[24];
+    const char * const args;
     const char * const desc;
-    const char * const arg_help;
 } test_cmds_t;
 
 typedef struct {
@@ -283,6 +282,8 @@ static int do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len,
                        void *buf, int nsd);
 
 #define TEST_MAX_CMDS 32
+#define BUF_COUNT     6   // General test buffers
+#define IBUF_COUNT    6   // Integrity test buffers
 
 BOOL __check_abort_enabled = 0;       // Disable gcc clib2 ^C break handling
 
@@ -294,14 +295,14 @@ static uint64_t  g_devstart = 0;      // Device start byte (for partitions)
 static uint64_t  g_devend = 0;        // Device end byte (for partitions)
 static uint      g_lun = 0;           // Target LUN to access
 static uint      g_has_nsd = 0;       // Device driver supports NSD
-static uint8_t **g_buf;               // Saved data buffers for certain tests
 static char     *g_devname = NULL;    // Device name
 static uint      g_unitno;            // Device unit and LUN
 static uint      g_e_freq;            // Frequency of eclock (715909 tps)
 static UWORD     g_sense_length;      // Length of returned sense data (if any)
 static UBYTE     g_sense_data[255];   // Sense data buffer
-static uint8_t  *g_ibuf[5];           // Integrity test buffers
-static uint8_t  *g_align[5];          // Integrity test buffers (aligned)
+static uint8_t  *g_tbuf[BUF_COUNT];   // General test buffers for certain tests
+static uint8_t  *g_ibuf[IBUF_COUNT];  // Integrity test buffers
+static uint8_t  *g_align[IBUF_COUNT]; // Integrity test buffers (aligned)
 struct DosEnvec *g_envec;             // Filesystem environment vector
 static UBYTE     mem_skip_alloc = 0;  // Skip memory allocate
 static uint32_t  memtype = MEMTYPE_ANY; // Memory type
@@ -310,6 +311,7 @@ static args_t    test_cmd_args[TEST_MAX_CMDS];
 static args_t   *cur_test_args = NULL;
 static uint      flag_destructive = 0;
 static uint      force_yes = 0;
+static uint      checknum = 0;
 
 static BOOL
 is_user_abort(void)
@@ -373,8 +375,7 @@ usage(void)
      * XXX implement:
      * -k <test> for kind of integrity test to perform:
      *     simple (default) is what is currently implemented
-     *     sweep - check all media of device with trailing half-rate
-     *             read (-dd required)
+     *     sweep - check all media of device with trailing read (-dd required)
      *     butterfly - pattern several writes, then check them
      *     random - use prime-based random to check entire device
      */
@@ -387,8 +388,9 @@ usage(void)
 // Undocumented: -dd skips save/restore of data with -i integrity test
            "   -g                    report drive geometry\n"
            "   -h                    display help\n"
-           "   -i <tsize>[,<align>]  integrity test (destructive) "
-                          "[-i=rand -ii=addr -iii=patt]\n"
+           "   -i <tsize>[,<align>]  integrity test [-d=destructive]\n"
+           "                         [-i=random -ii=address -iii=pattern]\n"
+           "   -k <mode>             integrity test mode: simple or butterfly\n"
            "   -l <loops>            run multiple times\n"
            "   -m <addr>             "
                     "use specific memory (Chip Fast Zorro MB Accel -=list)\n"
@@ -527,6 +529,12 @@ llu_to_str(uint64_t value)
     return (buf);
 }
 
+static char *
+llu_sector_to_str(uint64_t value)
+{
+    return (llu_to_str(value / g_sector_size));
+}
+
 APTR
 AllocMemType(ULONG byteSize, uint32_t memtype)
 {
@@ -631,7 +639,7 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
                 addr = NULL;
             break;
     }
-    if (g_verbose)
+    if (g_verbose > 1)
         printf("Alloc %p\n", addr);
     return (addr);
 }
@@ -772,7 +780,7 @@ do_scsi_testunitready(struct IOExtTD *tio, uint lun)
 }
 
 static int
-do_scsi_read_capacity_10(struct IOExtTD *tio, uint lun,
+do_scsi_read_capacity_10(struct IOExtTD *tio,
                          scsi_read_capacity_10_data_t **cap)
 {
     scsi_generic_t cmd;
@@ -780,7 +788,7 @@ do_scsi_read_capacity_10(struct IOExtTD *tio, uint lun,
 
     memset(&cmd, 0, sizeof (cmd));
     cmd.opcode = READ_CAPACITY_10;
-    cmd.bytes[0] = lun << 5;
+    cmd.bytes[0] = g_unitno << 5;
 
     return (do_scsidirect_cmd(tio, &cmd, 10, len, (void **) cap));
 }
@@ -829,7 +837,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
     while (incdec >= g_sector_size / 2) {
         rc = do_read_cmd(tio, offset, g_sector_size, buf, g_has_nsd);
         if (g_verbose)
-            printf("Read %s = %d\n", llu_to_str(offset / g_sector_size), rc);
+            printf("Read %s = %d\n", llu_sector_to_str(offset), rc);
 
         if (rc == 0) {
             min_offset = offset;
@@ -856,6 +864,20 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
     FreeMemType(buf, g_sector_size);
     *sectors = min_offset / g_sector_size;
     return (0);
+}
+
+static int
+do_getgeometry(struct IOExtTD *tio, struct DriveGeometry *dg)
+{
+    /* Geometry */
+    tio->iotd_Req.io_Command = TD_GETGEOMETRY;
+    tio->iotd_Req.io_Actual  = 0xa5;
+    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Length  = sizeof (*dg);
+    tio->iotd_Req.io_Data    = dg;
+    tio->iotd_Req.io_Flags   = 0;
+    tio->iotd_Req.io_Error   = 0xa5;
+    return (DoIO((struct IORequest *) tio));
 }
 
 #if 0
@@ -974,6 +996,66 @@ devtype_str(uint dtype)
 }
 
 static int
+get_devsize(struct IOExtTD *tio)
+{
+    int rc;
+    uint64_t capacity = 0;
+    scsi_read_capacity_10_data_t *cap10;
+    rc = do_scsi_read_capacity_10(tio, &cap10);
+    if (rc != 0) {
+        /* Try TD_GETGEOMETRY */
+        struct DriveGeometry dg;
+        rc = do_getgeometry(tio, &dg);
+        if (rc == 0) {
+            g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
+            g_sector_size = dg.dg_SectorSize;
+        }
+        return (rc);
+    }
+    if (cap10 != NULL) {
+        uint ssize = *(uint32_t *) &cap10->length;
+        capacity   = *(uint32_t *) &cap10->addr;
+
+        FreeMemType(cap10, sizeof (*cap10));
+        if (capacity == 0xffffffff) {
+            /* Try to use READ_CAPACITY_16 */
+            scsi_read_capacity_16_data_t *cap16;
+            rc = do_scsi_read_capacity_16(tio, &cap16);
+            if ((rc == 0) && (cap16 != NULL)) {
+                capacity = *(uint64_t *) &cap16->addr;
+                FreeMemType(cap16, sizeof (*cap16));
+            }
+        }
+        if (capacity != 0)
+            capacity++;  // SCSI READ_CAPACITY_* reports last addressable sector
+        g_devsize = capacity * ssize;
+        g_sector_size = ssize;
+    }
+    if (capacity == 0)
+        return (1);
+    return (0);
+}
+
+static char *
+bytes_to_human_str(uint64_t bytes, uint blocksize)
+{
+    static char str[16];
+    uint     bytes_c = 0;  // KMGTPEZY
+    bytes /= 1000;
+    if (bytes > 100000) {
+        bytes /= 1000;
+        bytes_c++;
+    }
+    bytes *= blocksize;
+    while (bytes > 9999) {
+        bytes /= 1000;
+        bytes_c++;
+    }
+    sprintf(str, "%u %cB", (uint)bytes, "KMGTPEZY"[bytes_c]);
+    return (str);
+}
+
+static int
 scsi_probe_unit(uint unit, struct IOExtTD *tio)
 {
     int rc;
@@ -1012,11 +1094,10 @@ scsi_probe_unit(uint unit, struct IOExtTD *tio)
         }
 
         scsi_read_capacity_10_data_t *cap10;
-        erc = do_scsi_read_capacity_10(tio, unit, &cap10);
+        erc = do_scsi_read_capacity_10(tio, &cap10);
         if ((erc == 0) && (cap10 != NULL)) {
             uint ssize = *(uint32_t *) &cap10->length;
             uint64_t cap   = *(uint32_t *) &cap10->addr;
-            uint     cap_c = 0;  // KMGTPEZY
             if (cap == 0xffffffff) {
                 /* Try to use READ_CAPACITY_16 */
                 scsi_read_capacity_16_data_t *cap16;
@@ -1026,17 +1107,7 @@ scsi_probe_unit(uint unit, struct IOExtTD *tio)
                     FreeMemType(cap16, sizeof (*cap16));
                 }
             }
-            cap = (cap + 1) / 1000;
-            if (cap > 100000) {
-                cap /= 1000;
-                cap_c++;
-            }
-            cap *= ssize;
-            while (cap > 9999) {
-                cap /= 1000;
-                cap_c++;
-            }
-            printf("%5u %5u %cB", ssize, (uint)cap, "KMGTPEZY"[cap_c]);
+            printf("%5u %8s", ssize, bytes_to_human_str(cap + 1, ssize));
             FreeMemType(cap10, sizeof (*cap10));
         }
         printf("\n");
@@ -1154,17 +1225,21 @@ drive_geometry(void)
            "Removable\n");
     if (g_envec != NULL) {
         uint cyls = g_envec->de_HighCyl + 1 - g_envec->de_LowCyl;
-        printf("Partition        %5u %12u %6u %4u %5u  %s %u\n",
-               g_sector_size, cyls * g_envec->de_Surfaces *
-               g_envec->de_BlocksPerTrack, cyls,
+        uint64_t blocks;
+        blocks = (uint64_t) cyls * g_envec->de_Surfaces *
+                 g_envec->de_BlocksPerTrack;
+        printf("Partition        %5u %12s %6u %4u %5u  %s %u\n",
+               g_sector_size, llu_to_str(blocks), cyls,
                g_envec->de_Surfaces, g_envec->de_BlocksPerTrack,
                g_devname, g_unitno);
-        printf("Partition-start  %5u %12u %6u\n",
-               g_sector_size, g_envec->de_LowCyl * g_envec->de_Surfaces *
-               g_envec->de_BlocksPerTrack, g_envec->de_LowCyl);
-        printf("Partition-end    %5u %12u %6u\n",
-               g_sector_size, (g_envec->de_HighCyl + 1) * g_envec->de_Surfaces *
-               g_envec->de_BlocksPerTrack, g_envec->de_HighCyl + 1);
+        blocks = (uint64_t) g_envec->de_LowCyl *
+                 g_envec->de_Surfaces * g_envec->de_BlocksPerTrack;
+        printf("Partition-start  %5u %12s %6u\n",
+               g_sector_size, llu_to_str(blocks), g_envec->de_LowCyl);
+        blocks = (uint64_t) (g_envec->de_HighCyl + 1) *
+                 g_envec->de_Surfaces * g_envec->de_BlocksPerTrack;
+        printf("Partition-end    %5u %12s %6u\n",
+               g_sector_size, llu_to_str(blocks), g_envec->de_HighCyl + 1);
     }
     printf("TD_GETGEOMETRY ");
     if ((rc = DoIO((struct IORequest *) tio)) != 0) {
@@ -1211,7 +1286,7 @@ drive_geometry(void)
 
     printf("READ_CAPACITY_10 ");
     scsi_read_capacity_10_data_t *cap10;
-    rc = do_scsi_read_capacity_10(tio, g_unitno, &cap10);
+    rc = do_scsi_read_capacity_10(tio, &cap10);
     if (cap10 == NULL) {
         printf("%5c %12c %19s", '-', '-', "");
         print_fail_nl(rc);
@@ -2486,16 +2561,9 @@ test_cmd_getgeometry(struct IOExtTD *tio)
     int rc;
     struct DriveGeometry dg;
 
-    /* Geometry */
-    tio->iotd_Req.io_Command = TD_GETGEOMETRY;
-    tio->iotd_Req.io_Actual  = 0xa5;
-    tio->iotd_Req.io_Offset  = 0;
-    tio->iotd_Req.io_Length  = sizeof (dg);
-    tio->iotd_Req.io_Data    = &dg;
-    tio->iotd_Req.io_Flags   = 0;
-    tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_GETGEOMETRY");
-    rc = DoIO((struct IORequest *) tio);
+
+    rc = do_getgeometry(tio, &dg);
     if (rc == 0) {
         printf("Success  %"PRIu32" x %"PRIu32"  C=%"PRIu32" H=%"PRIu32" "
                "S=%"PRIu32" Type=%u%s\n",
@@ -2830,7 +2898,7 @@ static int
 test_cmd_read(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
     uint readoffset = 0;
     uint bufsize = BUFSIZE;
 
@@ -2866,8 +2934,8 @@ static int
 test_etd_read(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
-    uint readoffset;
+    uint8_t **buf = g_tbuf;
+    uint readoffset = 0;
     uint bufsize = BUFSIZE;
 
     get_args_2(&bufsize, &readoffset);
@@ -2898,7 +2966,7 @@ static int
 test_td_read64(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
     uint bufsize = BUFSIZE;
     uint readoffset = 0;
     uint readoffsethi = 0;
@@ -2924,7 +2992,7 @@ test_td_read64(struct IOExtTD *tio)
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_READ64");
     rc = DoIO((struct IORequest *) tio);
-    if (rc == 0) {
+    if ((rc == 0) && (readoffsethi == 0)) {
         rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
         if (rc != 0) {
             print_fail(rc);
@@ -2947,7 +3015,7 @@ static int
 test_nsd_devicequery(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
 
     NSDeviceQueryResult_t *nsd_r = (NSDeviceQueryResult_t *) buf[1];
     memset(buf[1], 0xa5, BUFSIZE);
@@ -2986,7 +3054,7 @@ static int
 test_nscmd_td_read64(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
     uint bufsize = BUFSIZE;
     uint readoffset = 0;
     uint readoffsethi = 0;
@@ -3012,7 +3080,7 @@ test_nscmd_td_read64(struct IOExtTD *tio)
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("NSCMD_TD_READ64");
     rc = DoIO((struct IORequest *) tio);
-    if (rc == 0) {
+    if ((rc == 0) && (readoffsethi == 0)) {
         rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
         if (rc != 0) {
             print_fail(rc);
@@ -3035,7 +3103,7 @@ static int
 test_nscmd_etd_read64(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
     uint bufsize = BUFSIZE;
     uint readoffset = 0;
     uint readoffsethi = 0;
@@ -3088,7 +3156,7 @@ test_td_seek(struct IOExtTD *tio)
         printf("Success\n");
     } else {
         /* Commodore scsi.device requires a buffer for TD_SEEK? */
-        uint8_t **buf = g_buf;
+        uint8_t **buf = g_tbuf;
         memset(buf[1], 0xa5, BUFSIZE);
         tio->iotd_Req.io_Command = TD_SEEK;
         tio->iotd_Req.io_Offset  = seekoffset;
@@ -3117,7 +3185,7 @@ test_etd_seek(struct IOExtTD *tio)
     get_args_1(&seekoffset);
     seekoffset += g_devstart;
 
-    rc = test_etd_command(tio, ETD_SEEK, "ETD_SEEK", BUFSIZE, g_buf[1],
+    rc = test_etd_command(tio, ETD_SEEK, "ETD_SEEK", BUFSIZE, g_tbuf[1],
                           0, seekoffset);
     if (rc == 0)
         printf("Success\n");
@@ -3143,7 +3211,7 @@ test_td_seek64(struct IOExtTD *tio)
     tio->iotd_Req.io_Actual  = seekoffsethi;  // High 64 bits
     tio->iotd_Req.io_Offset  = seekoffset;
     tio->iotd_Req.io_Length  = BUFSIZE;
-    tio->iotd_Req.io_Data    = g_buf[1];
+    tio->iotd_Req.io_Data    = g_tbuf[1];
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_SEEK64");
@@ -3172,7 +3240,7 @@ test_nscmd_td_seek64(struct IOExtTD *tio)
     tio->iotd_Req.io_Actual  = seekoffsethi;  // High 64 bits
     tio->iotd_Req.io_Offset  = seekoffset;
     tio->iotd_Req.io_Length  = BUFSIZE;
-    tio->iotd_Req.io_Data    = g_buf[1];
+    tio->iotd_Req.io_Data    = g_tbuf[1];
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("NSCMD_TD_SEEK64");
@@ -3192,7 +3260,7 @@ test_nscmd_etd_seek64(struct IOExtTD *tio)
     get_args_2(&seekoffset, &seekoffsethi);
 
     rc = test_etd_command(tio, NSCMD_ETD_SEEK64, "NSCMD_ETD_SEEK64",
-                          BUFSIZE, g_buf[1], seekoffsethi, seekoffset);
+                          BUFSIZE, g_tbuf[1], seekoffsethi, seekoffset);
     if (rc == 0)
         printf("Success\n");
     return (rc);
@@ -3680,7 +3748,7 @@ static int
 test_cmd_write(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
     uint writeoffset = 0;
     uint bufsize = BUFSIZE;
 
@@ -3715,7 +3783,7 @@ static int
 test_etd_write(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
     uint writeoffset = 0;
     uint bufsize = BUFSIZE;
 
@@ -3739,7 +3807,7 @@ static int
 test_td_write64(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
     uint bufsize = BUFSIZE;
     uint writeoffset = 0;
     uint writeoffsethi = 0;
@@ -3796,7 +3864,7 @@ static int
 test_nscmd_td_write64(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
     uint bufsize = BUFSIZE;
     uint writeoffset = 0;
     uint writeoffsethi = 0;
@@ -3858,7 +3926,7 @@ static int
 test_nscmd_etd_write64(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
 
     memset(buf[0], 0xe5, BUFSIZE);
     rc = test_etd_command(tio, NSCMD_ETD_WRITE64, "NSCMD_ETD_WRITE64",
@@ -3892,7 +3960,7 @@ static int
 test_td_format(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
 
     /* Format (acts the same same as write) */
     memset(buf[0], 0xdb, BUFSIZE);
@@ -3920,7 +3988,7 @@ static int
 test_etd_format(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
 
     memset(buf[0], 0xca, BUFSIZE);
     rc = test_etd_command(tio, ETD_FORMAT, "ETD_FORMAT", BUFSIZE, buf[0], 0, 0);
@@ -3937,7 +4005,7 @@ static int
 test_td_format64(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
 
     memset(buf[0], 0xf4, BUFSIZE);
     tio->iotd_Req.io_Command = TD_FORMAT64;
@@ -3988,7 +4056,7 @@ static int
 test_nscmd_td_format64(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
 
     memset(buf[0], 0x1e, BUFSIZE);
     tio->iotd_Req.io_Command = NSCMD_TD_FORMAT64;
@@ -4039,7 +4107,7 @@ static int
 test_nscmd_etd_format64(struct IOExtTD *tio)
 {
     int rc;
-    uint8_t **buf = g_buf;
+    uint8_t **buf = g_tbuf;
 
     memset(buf[0], 0xe5, BUFSIZE);
     rc = test_etd_command(tio, NSCMD_ETD_FORMAT64, "NSCMD_ETD_FORMAT64",
@@ -4202,131 +4270,89 @@ buf_alloc_failed:
 #define TEST_ETD_RAWWRITE       UBIT(39)
 
 static const test_cmds_t test_cmds[] = {
-    { "CHANGEINT",   2, TEST_ADDREMCHANGEINT,
-                        "TD_ADDREMCHANGEINT", "Test change interrupt",
-                        NULL },
-    { "CHANGENUM",   0, TEST_TD_CHANGENUM,
-                        "CMD_CHANGENUM", "Get media change count",
-                        NULL },
-    { "CHANGESTATE", 0, TEST_TD_CHANGESTATE,
-                        "CMD_CHANGESTATE", "Get media change state",
-                        NULL },
-    { "DRIVETYPE",   0, TEST_TD_GETDRIVETYPE,
-                        "CMD_GETDRIVETYPE", "Get drive type",
-                        NULL },
-    { "GEOMETRY",    0, TEST_CMD_GETGEOMETRY,
-                        "CMD_GETGEOMETRY", "Get device geometry",
-                        NULL },
-    { "NSD",         0, TEST_NSD_DEVICEQUERY,
-                        "CMD_NSD_DEVICEQUERY", "Query for NSD",
-                        NULL },
-    { "NUMTRACKS",   0, TEST_TD_GETNUMTRACKS,
-                        "TD_GETNUMTRACKS", "Get track count",
-                        NULL },
-    { "INQUIRY",     0, TEST_HD_SCSICMD_INQ,
-                        "HD_SCSICMD_INQ", "SCSI Inquiry command",
-                        NULL },
-    { "PROTSTATUS",  0, TEST_TD_PROTSTATUS,
-                        "CMD_PROTSTATUS", "Get protected state",
-                        NULL },
-    { "TUR",         0, TEST_HD_SCSICMD_TUR,
-                        "HD_SCSICMD_TUR", "SCSI Test Unit Ready command",
-                        NULL },
-    { "RAWREAD",     0, TEST_TD_RAWREAD,
-                        "TD_RAWREAD", "Read raw track from (floppy) device",
-                        NULL },
+    { "CHANGEINT",   2, TEST_ADDREMCHANGEINT, NULL,
+                        "TD_ADDREMCHANGEINT Test change interrupt" },
+    { "CHANGENUM",   0, TEST_TD_CHANGENUM, NULL,
+                        "CMD_CHANGENUM Get media change count" },
+    { "CHANGESTATE", 0, TEST_TD_CHANGESTATE, NULL,
+                        "CMD_CHANGESTATE Get media change state" },
+    { "DRIVETYPE",   0, TEST_TD_GETDRIVETYPE, NULL,
+                        "CMD_GETDRIVETYPE Get drive type" },
+    { "GEOMETRY",    0, TEST_CMD_GETGEOMETRY, NULL,
+                        "CMD_GETGEOMETRY Get device geometry" },
+    { "NSD",         0, TEST_NSD_DEVICEQUERY, NULL,
+                        "CMD_NSD_DEVICEQUERY Query for NSD" },
+    { "NUMTRACKS",   0, TEST_TD_GETNUMTRACKS, NULL,
+                        "TD_GETNUMTRACKS Get track count" },
+    { "INQUIRY",     0, TEST_HD_SCSICMD_INQ, NULL,
+                        "HD_SCSICMD_INQ SCSI Inquiry command" },
+    { "PROTSTATUS",  0, TEST_TD_PROTSTATUS, NULL,
+                        "CMD_PROTSTATUS Get protected state" },
+    { "TUR",         0, TEST_HD_SCSICMD_TUR, NULL,
+                        "HD_SCSICMD_TUR SCSI Test Unit Ready command" },
+    { "RAWREAD",     0, TEST_TD_RAWREAD, NULL,
+                        "TD_RAWREAD read raw track from (floppy) device" },
 #if 0
     /* These are not implemented yet */
-    { "RAWWRITE",    0, TEST_TD_RAWWRITE,
-                        "TD_RAWWRITE", "Write raw track to (floppy) device",
-                        NULL },
-    { "ERAWREAD",    0, TEST_ETD_RAWREAD,
-                        "ETD_RAWREAD",
-                        "Extended read raw track from (floppy) device",
-                        NULL },
-    { "ERAWWRITE",   0, TEST_ETD_RAWWRITE,
-                        "ETD_RAWWRITE",
-                        "Extended write raw track to (floppy) device",
-                        NULL },
+    { "RAWWRITE",    0, TEST_TD_RAWWRITE, NULL,
+                        "TD_RAWWRITE write raw track to (floppy) device" },
+    { "ERAWREAD",    0, TEST_ETD_RAWREAD, NULL,
+                        "ETD_RAWREAD read raw track from (floppy) device" },
+    { "ERAWWRITE",   0, TEST_ETD_RAWWRITE, NULL,
+                        "ETD_RAWWRITE write raw track to (floppy) device" },
 #endif
-    { "READ",        0, TEST_CMD_READ,
-                        "CMD_READ", "Read from device",
-                        "size,offset" },
-    { "EREAD",       0, TEST_ETD_READ,
-                        "ETD_READ", "Extended read from device",
-                        "size,offset" },
-    { "READ64",      0, TEST_TD_READ64,
-                        "TD_READ64", "TD64 read from device",
-                        "size,offset,offsethi" },
-    { "NSDREAD",     0, TEST_NSCMD_TD_READ64,
-                        "NSCMD_TD_READ64", "NSD Read from device",
-                        "size,offset,offsethi" },
-    { "NSDEREAD",    0, TEST_NSCMD_ETD_READ64,
-                        "NSCMD_ETD_READ64", "NSD extended read from device",
-                        "size,offset" },
-    { "SEEK",        0, TEST_TD_SEEK,
-                        "TD_SEEK", "Seek to offset",
-                        "offset" },
-    { "ESEEK",       0, TEST_ETD_SEEK,
-                        "ETD_SEEK", "Extended seek to offset",
-                        "offset" },
-    { "SEEK64",      0, TEST_TD_SEEK64,
-                        "TD_SEEK64", "TD64 seek to offset",
-                        "offset,offsethi" },
-    { "NSDSEEK",     0, TEST_NSCMD_TD_SEEK64,
-                        "NSCMD_TD_SEEK64", "NSD seek to offset",
-                        "offset,offsethi" },
-    { "NSDESEEK",    0, TEST_NSCMD_ETD_SEEK64,
-                        "NSCMD_ETD_SEEK64", "NSD extended seek from device",
-                        "offset,offsethi" },
-    { "WRITE",       1, TEST_CMD_WRITE,
-                        "CMD_WRITE", "Write to device",
-                        "size,offset" },
-    { "EWRITE",      1, TEST_ETD_WRITE,
-                        "ETD_WRITE", "Extended write to device",
-                        "size,offset" },
-    { "WRITE64",     1, TEST_TD_WRITE64,
-                        "TD_WRITE64", "TD64 write to device",
-                        "size,offset,offsethi" },
-    { "NSDWRITE",    1, TEST_NSCMD_TD_WRITE64,
-                        "NSCMD_TD_WRITE64", "NSD write to device",
-                        "size,offset,offsethi" },
-    { "NSDEWRITE",   0, TEST_NSCMD_ETD_WRITE64,
-                        "NSCMD_ETD_WRITE64", "NSD extended write to device",
-                        "size,offset,offsethi" },
-    { "FORMAT",      1, TEST_TD_FORMAT,
-                        "TD_FORMAT", "Format device",
-                        NULL },
-    { "EFORMAT",     1, TEST_ETD_FORMAT,
-                        "ETD_FORMAT", "Extended format device",
-                        NULL },
-    { "FORMAT64",    1, TEST_TD_FORMAT64,
-                        "TD_FORMAT64", "TD64 format device",
-                        NULL },
-    { "NSDFORMAT",   1, TEST_NSCMD_TD_FORMAT64,
-                        "NSCMD_TD_FORMAT64", "NSD format device",
-                        NULL },
-    { "NSDEFORMAT",  0, TEST_NSCMD_ETD_FORMAT64,
-                        "NSCMD_ETD_FORMAT64", "NSD extended format to device",
-                        NULL },
-    { "MOTOROFF",    2, TEST_TD_MOTOR_OFF,
-                        "TD_MOTOR OFF", "Stop motor (spin down)",
-                        NULL },
-    { "MOTORON",     2, TEST_TD_MOTOR_ON,
-                        "TD_MOTOR ON", "Start motor (spin up)",
-                        NULL },
-    { "START",       2, TEST_CMD_START,
-                        "CMD_START", "Start device (spin up)",
-                        NULL },
-    { "STOP",        2, TEST_CMD_STOP,
-                        "CMD_STOP", "Stop device (spin down)",
-                        NULL },
-    { "EJECT",       2, TEST_TD_EJECT,
-                        "TD_EJECT", "Eject device",
-                        NULL },
-    { "LOAD",        2, TEST_TD_LOAD,
-                        "TD_LOAD", "Load device (insert media)",
-                        NULL },
+    { "READ",        0, TEST_CMD_READ, "size,offset",
+                        "CMD_READ Read from device" },
+    { "EREAD",       0, TEST_ETD_READ, "size,offset",
+                        "ETD_READ Extended read from device" },
+    { "READ64",      0, TEST_TD_READ64, "size,offset,offsethi",
+                        "TD_READ64 TD64 read from device" },
+    { "NSDREAD",     0, TEST_NSCMD_TD_READ64, "size,offset,offsethi",
+                        "NSCMD_TD_READ64 NSD Read from device" },
+    { "NSDEREAD",    0, TEST_NSCMD_ETD_READ64, "size,offset",
+                        "NSCMD_ETD_READ64 NSD extended read from device" },
+    { "SEEK",        0, TEST_TD_SEEK, "offset",
+                        "TD_SEEK Seek to offset" },
+    { "ESEEK",       0, TEST_ETD_SEEK, "offset",
+                        "ETD_SEEK sxtended seek" },
+    { "SEEK64",      0, TEST_TD_SEEK64, "offset,offsethi",
+                        "TD_SEEK64 TD64 seek" },
+    { "NSDSEEK",     0, TEST_NSCMD_TD_SEEK64, "offset,offsethi",
+                        "NSCMD_TD_SEEK64 NSD seek" },
+    { "NSDESEEK",    0, TEST_NSCMD_ETD_SEEK64, "offset,offsethi",
+                        "NSCMD_ETD_SEEK64 NSD extended seek" },
+    { "WRITE",       1, TEST_CMD_WRITE, "size,offset",
+                        "CMD_WRITE write to device", },
+    { "EWRITE",      1, TEST_ETD_WRITE, "size,offset",
+                        "ETD_WRITE extended write", },
+    { "WRITE64",     1, TEST_TD_WRITE64, "size,offset,offsethi",
+                        "TD_WRITE64 TD64 write" },
+    { "NSDWRITE",    1, TEST_NSCMD_TD_WRITE64, "size,offset,offsethi",
+                        "NSCMD_TD_WRITE64 NSD write" },
+    { "NSDEWRITE",   0, TEST_NSCMD_ETD_WRITE64, "size,offset,offsethi",
+                        "NSCMD_ETD_WRITE64 NSD extended write" },
+    { "FORMAT",      1, TEST_TD_FORMAT, NULL,
+                        "TD_FORMAT format device" },
+    { "EFORMAT",     1, TEST_ETD_FORMAT, NULL,
+                        "ETD_FORMAT extended format device" },
+    { "FORMAT64",    1, TEST_TD_FORMAT64, NULL,
+                        "TD_FORMAT64 TD64 format device" },
+    { "NSDFORMAT",   1, TEST_NSCMD_TD_FORMAT64, NULL,
+                        "NSCMD_TD_FORMAT64 NSD format device" },
+    { "NSDEFORMAT",  0, TEST_NSCMD_ETD_FORMAT64, NULL,
+                        "NSCMD_ETD_FORMAT64 NSD extended format" },
+    { "MOTOROFF",    2, TEST_TD_MOTOR_OFF, NULL,
+                        "TD_MOTOR OFF stop motor (spin down)" },
+    { "MOTORON",     2, TEST_TD_MOTOR_ON, NULL,
+                        "TD_MOTOR ON start motor (spin up)" },
+    { "START",       2, TEST_CMD_START, NULL,
+                        "CMD_START spin up device" },
+    { "STOP",        2, TEST_CMD_STOP, NULL,
+                        "CMD_STOP spin down device" },
+    { "EJECT",       2, TEST_TD_EJECT, NULL,
+                        "TD_EJECT device" },
+    { "LOAD",        2, TEST_TD_LOAD, NULL,
+                        "TD_LOAD device (insert media)" },
 };
 
 static int
@@ -4445,7 +4471,7 @@ test_packets_ll(uint64_t test_mask, struct IOExtTD *tio)
          * Capture data before it is overwritten by any of the
          * destructive commands.
          */
-        save_overwritten_data(tio, g_buf);
+        save_overwritten_data(tio, g_tbuf);
 
         if ((test_mask & TEST_CMD_WRITE) && test_cmd_write(tio)) {
             test_mask &= ~(TEST_ETD_WRITE | TEST_TD_WRITE64 |
@@ -4533,7 +4559,7 @@ test_packets(int do_destructive, int test_level,
         }
     }
     g_lun = lun;
-    g_buf = buf;
+//  g_tbuf = buf;
 
     if (test_count == 0) {
         /* Run all available tests */
@@ -4695,7 +4721,7 @@ show_diffs(void *expected, void *data, uint len, const char *type)
     uint8_t *dptr = (uint8_t *) data;
     for (pos = 0; pos < len; pos++) {
         if (*eptr != *dptr) {
-            if ((miscompares++ < 9) || g_verbose)
+            if ((miscompares++ < 9) || (g_verbose > 1))
                 printf("  %06x: %02x != %s %02x [diff %02x]\n",
                        pos, *dptr, type, *eptr, *dptr ^ *eptr);
         }
@@ -4726,17 +4752,508 @@ static const uint8_t chkpat[] = {
 };
 
 static int
-test_integrity(uint pattern, uint32_t memtype, uint bufsize, uint align)
+test_integrity_simple(struct IOExtTD *tio, uint bufsize)
 {
-    int       rc = 0;
-    uint      bnum;
-    uint      cur;
-    uint      memtypex = memtype;
+    int             rc = 0;
+    static uint64_t pos = 0;
+    static uint8_t  curbuf = 0;
+    uint64_t        devend;
+    uint64_t        devsize;
+
+    if (g_devend != 0)
+        devend = g_devend;
+    else
+        devend = g_devsize;
+    devsize = devend - g_devstart;
+
+    /*
+     * g_ibuf is the collection of buffers for integrity testing.
+     *     g_ialign is located within the buffer g_ibuf
+     *
+     * g_align[0] is the data pattern to write
+     * g_align[1] is the alternate (inverted) data pattern to write
+     * g_align[2] is read buffer; initially patterned with 0x5a, but
+     *               not re-patterned at every read
+     * g_align[3] is second read buffer (when miscompare happens
+     *               on the first read). Re-patterned with 0xa5 at
+     *               every re-read.
+     * g_ibuf[4] is the original data buffer, unless -dd specified
+     * g_ibuf[5] is not used for this test
+     */
+
+    if (pos + bufsize > devsize) {
+        pos = 0;
+        checknum++;
+    }
+
+    if (flag_destructive < 2)
+        rc = do_read_cmd(tio, pos, bufsize, g_tbuf[4], g_has_nsd);
+
+    if (g_verbose) {
+        uint percent = pos * 1000 / devsize;
+        printf("Sector %s (%u.%u%% of media check #%u)\n",
+               llu_sector_to_str(pos), percent / 10, percent % 10, checknum);
+    }
+    if (flag_destructive) {
+        rc = do_write_cmd(tio, pos, bufsize, g_align[curbuf], g_has_nsd);
+        if (rc != 0) {
+            printf("write failed at %s\n", llu_sector_to_str(pos));
+            goto integrity_fail;
+        }
+    }
+    rc = do_read_cmd(tio, pos, bufsize, g_align[2], g_has_nsd);
+    if (rc != 0) {
+        printf("read failed at %s\n", llu_sector_to_str(pos));
+        goto integrity_fail;
+    }
+    if ((flag_destructive &&
+         (memcmp(g_align[curbuf], g_align[2], bufsize) != 0)) ||
+        (!flag_destructive &&
+         (memcmp(g_tbuf[4], g_align[2], bufsize) != 0))) {
+        /*
+         * Read data either mismatches the newly written pattern
+         * (destructive mode) or mismatches the previously read data
+         * (read-only mode).
+         */
+        printf("Miscompare at %s\n", llu_sector_to_str(pos));
+        if (memcmp_const(g_align[2], bufsize, 0xa5) == 0) {
+            printf("Read buffer was not updated\n");
+        } else if (flag_destructive) {
+            show_diffs(g_align[curbuf], g_align[2], bufsize, "expected");
+        } else {
+            show_diffs(g_tbuf[4], g_align[2], bufsize, "original");
+        }
+
+        /* Pattern the second read buffer */
+        memset(g_align[3], 0x5a, bufsize);
+
+        rc = do_read_cmd(tio, pos, bufsize, g_align[3], g_has_nsd);
+        if (rc != 0) {
+            printf("Re-read failed at %s\n", llu_sector_to_str(pos));
+            goto integrity_fail;
+        }
+        if (memcmp_const(g_align[3], bufsize, 0x5a) == 0) {
+            printf("Re-read buffer was not updated\n");
+        } else if (memcmp(g_align[2], g_align[3], bufsize) == 0) {
+            if (flag_destructive) {
+                printf("Re-read of data matches what was read "
+                       "(write failure?)\n");
+            } else {
+                printf("Re-read of data matches what was read "
+                       "the second time\n");
+            }
+        } else if (flag_destructive &&
+                   (memcmp(g_align[curbuf], g_align[3], bufsize) == 0)) {
+            printf("Re-read of data matches what was written "
+                   "(read failure?)\n");
+        } else if (memcmp(g_tbuf[4], g_align[3], bufsize) == 0) {
+            printf("Re-read of data matches what was originally on disk\n");
+        } else {
+            printf("Re-read of data differs (floating data?)\n");
+            if (flag_destructive) {
+                show_diffs(g_align[curbuf], g_align[3], bufsize, "expected");
+                show_diffs(g_align[2], g_align[3], bufsize, "first read");
+            } else {
+                show_diffs(g_tbuf[4], g_align[3], bufsize, "first read");
+                show_diffs(g_align[2], g_align[3], bufsize, "second read");
+            }
+        }
+        CacheClearU();
+        if (flag_destructive) {
+            if (memcmp(g_align[curbuf], g_align[2], bufsize) == 0) {
+                printf("Initial read data now matches what was written "
+                       "(CPU cache or memory failure?)\n");
+            }
+        } else {
+            if (memcmp(g_tbuf[4], g_align[2], bufsize) == 0) {
+                printf("Initial read data now matches second read "
+                       "(CPU cache or memory failure?)\n");
+            }
+        }
+        rc = 1;
+        goto integrity_fail;
+    }
+
+integrity_fail:
+    if (flag_destructive == 1) {
+        int rc2 = do_write_cmd(tio, pos, bufsize, g_ibuf[4], g_has_nsd);
+        if (rc2 != 0) {
+            /* Bad day: you may have lost data */
+            printf("restore of original data failed at %s\n",
+                   llu_sector_to_str(pos));
+            if (rc == 0)
+                rc = rc2;
+        }
+    }
+    if (rc == 0) {
+        pos += bufsize;
+        curbuf ^= 1;
+    }
+    return (rc);
+}
+
+/*
+ * test_integrity_butterfly
+ * ------------------------
+ * This test will repeatedly do a butterfly pattern on the media.
+ * The entire device is not done in a single test loop. Instead, if we
+ * segment the media into zones of contiguous blocks, each zone is touched
+ * in a butterfly pattern at each loop.
+ *
+ * For example: Consider a device with 56 blocks. It is divided into
+ *              8 zones, each one with 7 blocks (A...G)
+ *
+ * Pass| Zone0 | Zone1 | Zone2 | Zone3 | Zone4 | Zone5 | Zone6 | Zone7 |
+ *      ABCDEFG ABCDEFG ABCDEFG ABCDEFG ABCDEFG ABCDEFG ABCDEFG ABCDEFG
+ *  1   1                                                       2
+ *  1           3                                       4
+ *  1                   5                       6
+ *  1                            7      8
+ *  1                             9      10
+ *  1                    11                      12
+ *  1            13                                      14
+ *  1    15                                                      16
+ *
+ *  The above ends the first pass. This function returns. When called
+ *  again, it will resume the butterfly test at block C in all zones.
+ *  This will continue until all blocks in all zones have been touched,
+ *  in which case the test will start over with block A.
+ *
+ * Pass| Zone0 | Zone1 | Zone2 | Zone3 | Zone4 | Zone5 | Zone6 | Zone7 |
+ *      ABCDEFG ABCDEFG ABCDEFG ABCDEFG ABCDEFG ABCDEFG ABCDEFG ABCDEFG
+ *  2     1                                                       2
+ *  2             3                                       4
+ *  2                     5                       6
+ *  2                              7      8
+ *  2                               9      10
+ *  2                      11                      12
+ *  2              13                                      14
+ *  2      15                                                      16
+ */
+static int
+test_integrity_butterfly(struct IOExtTD *tio, uint bufsize)
+{
+    int rc = 0;
+    static uint64_t zoneoffset = 0;
+    uint64_t devblocks;
+    uint64_t bytes_per_zone;
+    uint64_t leftoffset;
+    uint64_t rightoffset;
+    uint64_t devend;
+    uint64_t devsize;
+    uint     iter;
+    uint     fail = 0;
+
+    if (g_devend != 0)
+        devend = g_devend;
+    else
+        devend = g_devsize;
+    devsize = devend - g_devstart;
+
+#define ZONES 31  // Must be a prime number to avoid duplicates
+
+    devblocks = devsize / g_sector_size;
+    bytes_per_zone = (devsize / ZONES) & ~(uint64_t)(bufsize - 1);
+
+    if (g_verbose > 1) {
+        printf("devsize=%s ", llu_to_str(devsize));
+        printf("devblocks=%s ", llu_to_str(devblocks));
+        printf("bpz=%s\n", llu_to_str(bytes_per_zone));
+    }
+    if (g_verbose == 1) {
+        uint percent = zoneoffset * 1000 / bytes_per_zone;
+        printf("  Zone sector %s (%u.%u%% of media check #%u) %s\n",
+               llu_sector_to_str(zoneoffset), percent / 10, percent % 10,
+               checknum + 1,
+               bytes_to_human_str(bytes_per_zone * checknum + zoneoffset,
+                                  ZONES * 2));
+    }
+
+    leftoffset = zoneoffset;
+    for (iter = 0; iter < ZONES; iter++) {
+        rightoffset = devsize - leftoffset - bufsize;
+
+        /* Check for overlap */
+        if (((leftoffset <= rightoffset) &&
+             (leftoffset + bufsize > rightoffset)) ||
+            ((leftoffset > rightoffset) &&
+             (rightoffset + bufsize > leftoffset))) {
+            /* Overlap detected */
+            if (leftoffset < bufsize) {
+#if 0
+                printf("Butterfly offsets %s and ", llu_to_str(leftoffset));
+                printf("%s overlap ", llu_to_str(rightoffset));
+                printf("at sector %s.\n", llu_sector_to_str(leftoffset));
+#endif
+                printf("Device is not large enough to test with block "
+                       "size %u\n", bufsize);
+                fail++;
+                goto fail_cleanup;
+            }
+            rightoffset = 0;
+        }
+
+        /*
+         * Algorithm at each iteration:
+         *   Save left
+         *   Save right
+         *   Write left
+         *   Write right
+         *   Verify left
+         *   Verify right
+         *   Restore left
+         *   Restore right
+         */
+        if (g_verbose > 1) {
+            printf("%12s  ", llu_sector_to_str(leftoffset));
+            printf("%12s\n", llu_sector_to_str(rightoffset));
+        }
+        if (flag_destructive < 2) {
+            /* Save a copies of the original data */
+            rc = do_read_cmd(tio, leftoffset, bufsize, g_ibuf[4], g_has_nsd);
+            if (rc != 0) {
+                printf("Read failed at %s\n", llu_sector_to_str(leftoffset));
+                break;
+            }
+            rc = do_read_cmd(tio, rightoffset, bufsize, g_ibuf[5], g_has_nsd);
+            if (rc != 0) {
+                printf("Read failed at %s\n", llu_sector_to_str(rightoffset));
+                break;
+            }
+        }
+        if (flag_destructive) {
+            /* Write data patterns */
+            rc = do_write_cmd(tio, leftoffset, bufsize, g_align[0], g_has_nsd);
+            if (rc != 0) {
+                printf("Write failed at %s\n", llu_sector_to_str(leftoffset));
+                fail++;
+                goto fail_cleanup;
+            }
+            rc = do_write_cmd(tio, rightoffset, bufsize, g_align[1], g_has_nsd);
+            if (rc != 0) {
+                printf("Write failed at %s\n", llu_sector_to_str(rightoffset));
+                fail++;
+                goto fail_cleanup;
+            }
+        }
+
+        /* Handle the left data block */
+        rc = do_read_cmd(tio, leftoffset, bufsize, g_align[2], g_has_nsd);
+        if (rc != 0) {
+            printf("Read failed at %s\n", llu_sector_to_str(leftoffset));
+            fail++;
+            goto fail_cleanup;
+        }
+        if ((flag_destructive &&
+             (memcmp(g_align[0], g_align[2], bufsize) != 0)) ||
+            (!flag_destructive &&
+             (memcmp(g_ibuf[4], g_align[2], bufsize) != 0))) {
+            /*
+             * Read data either mismatches the newly written pattern
+             * (destructive mode) or mismatches the previously read data
+             * (read-only mode).
+             */
+            printf("Miscompare at %s\n", llu_sector_to_str(leftoffset));
+            if (memcmp_const(g_align[2], bufsize, 0xa5) == 0) {
+                printf("Read buffer was not updated\n");
+            } else if (flag_destructive &&
+                       (memcmp(g_align[1], g_align[2], bufsize) == 0)) {
+                printf("Read buffer has previously written data: "
+                       "read did not succeed?\n");
+            } else if (flag_destructive) {
+                show_diffs(g_align[0], g_align[2], bufsize, "expected");
+            } else {
+                show_diffs(g_ibuf[4], g_align[2], bufsize, "first read");
+            }
+            fail++;
+        }
+        if (fail) {
+            /* Pattern the second read buffer */
+            memset(g_align[3], 0xa5, bufsize);
+
+            /* Re-read data */
+            rc = do_read_cmd(tio, leftoffset, bufsize, g_align[3],
+                             g_has_nsd);
+            if (memcmp(g_align[2], g_align[3], bufsize) == 0) {
+                if (flag_destructive) {
+                    printf("Re-read of data matches what was read "
+                           "(write failure?)\n");
+                } else {
+                    printf("Re-read of data matches what was read "
+                           "the second time\n");
+                }
+            } else if (memcmp_const(g_align[3], bufsize, 0xa5) == 0) {
+                printf("Re-read buffer was not updated\n");
+            } else if (flag_destructive &&
+                       (memcmp(g_align[0], g_align[3], bufsize) == 0)) {
+                printf("Re-read of data matches what was written "
+                       "(read failure?)\n");
+            } else if (!flag_destructive &&
+                       (memcmp(g_ibuf[4], g_align[3], bufsize) == 0)) {
+                printf("Re-read of data matches first read "
+                       "(read failure?)\n");
+            } else {
+                printf("Re-read of data differs (floating data?)\n");
+                if (flag_destructive) {
+                    show_diffs(g_align[0], g_align[3], bufsize, "expected");
+                    show_diffs(g_align[2], g_align[3], bufsize, "first read");
+                } else {
+                    show_diffs(g_ibuf[4], g_align[3], bufsize, "first read");
+                    show_diffs(g_align[2], g_align[3], bufsize, "second read");
+                }
+            }
+            CacheClearU();
+            if (flag_destructive) {
+                if (memcmp(g_align[0], g_align[2], bufsize) == 0) {
+                    printf("Initial read data now matches what was written "
+                           "(CPU cache or memory failure?)\n");
+                }
+            } else {
+                if (memcmp(g_ibuf[4], g_align[2], bufsize) == 0) {
+                    printf("Initial read data now matches second read "
+                           "(CPU cache or memory failure?)\n");
+                }
+            }
+            goto fail_cleanup;
+        }
+
+        /* Handle the right data block */
+        rc = do_read_cmd(tio, rightoffset, bufsize, g_align[2], g_has_nsd);
+        if (rc != 0) {
+            printf("Read failed at %s\n", llu_sector_to_str(rightoffset));
+            fail++;
+            goto fail_cleanup;
+        }
+        if ((flag_destructive &&
+             (memcmp(g_align[1], g_align[2], bufsize) != 0)) ||
+            (!flag_destructive &&
+             (memcmp(g_ibuf[5], g_align[2], bufsize) != 0))) {
+            /*
+             * Read data either mismatches the newly written pattern
+             * (destructive mode) or mismatches the previously read data
+             * (read-only mode).
+             */
+            printf("Miscompare at %s\n", llu_sector_to_str(rightoffset));
+            if (memcmp_const(g_align[2], bufsize, 0xa5) == 0) {
+                printf("Read buffer was not updated\n");
+            } else if (flag_destructive &&
+                       (memcmp(g_align[1], g_align[2], bufsize) == 0)) {
+                printf("Read buffer has previously written data: "
+                       "read did not succeed?\n");
+            } else if (flag_destructive) {
+                show_diffs(g_align[1], g_align[2], bufsize, "expected");
+            } else {
+                show_diffs(g_ibuf[5], g_align[2], bufsize, "first read");
+            }
+            fail++;
+        }
+        if (fail) {
+            /* Pattern the second read buffer */
+            memset(g_align[3], 0xa5, bufsize);
+
+            /* Re-read data */
+            rc = do_read_cmd(tio, rightoffset, bufsize, g_align[3],
+                             g_has_nsd);
+            if (memcmp(g_align[2], g_align[3], bufsize) == 0) {
+                if (flag_destructive) {
+                    printf("Re-read of data matches what was read "
+                           "(write failure?)\n");
+                } else {
+                    printf("Re-read of data matches what was read "
+                           "the second time\n");
+                }
+            } else if (memcmp_const(g_align[3], bufsize, 0xa5) == 0) {
+                printf("Re-read buffer was not updated\n");
+            } else if (flag_destructive &&
+                       (memcmp(g_align[1], g_align[3], bufsize) == 0)) {
+                printf("Re-read of data matches what was written "
+                       "(read failure?)\n");
+            } else if (!flag_destructive &&
+                       (memcmp(g_ibuf[5], g_align[3], bufsize) == 0)) {
+                printf("Re-read of data matches first read "
+                       "(read failure?)\n");
+            } else {
+                printf("Re-read of data differs (floating data?)\n");
+                if (flag_destructive) {
+                    show_diffs(g_align[1], g_align[3], bufsize, "expected");
+                    show_diffs(g_align[2], g_align[3], bufsize, "first read");
+                } else {
+                    show_diffs(g_ibuf[5], g_align[3], bufsize, "first read");
+                    show_diffs(g_align[2], g_align[3], bufsize, "second read");
+                }
+            }
+            CacheClearU();
+            if (flag_destructive) {
+                if (memcmp(g_align[1], g_align[2], bufsize) == 0) {
+                    printf("Initial read data now matches what was written "
+                           "(CPU cache or memory failure?)\n");
+                }
+            } else {
+                if (memcmp(g_ibuf[5], g_align[2], bufsize) == 0) {
+                    printf("Initial read data now matches second read "
+                           "(CPU cache or memory failure?)\n");
+                }
+            }
+            goto fail_cleanup;
+        }
+
+fail_cleanup:
+        if (flag_destructive == 1) {
+            /* Restore original data */
+            rc = do_write_cmd(tio, leftoffset, bufsize, g_ibuf[4], g_has_nsd);
+            if (rc != 0) {
+                /* Try again */
+                printf("Write failed at %s", llu_sector_to_str(leftoffset));
+                rc = do_write_cmd(tio, rightoffset, bufsize, g_ibuf[5],
+                                  g_has_nsd);
+                if (rc != 0)
+                    printf("; data compromised");
+                printf("\n");
+                fail++;
+            }
+            rc = do_write_cmd(tio, rightoffset, bufsize, g_ibuf[5], g_has_nsd);
+            if (rc != 0) {
+                /* Try again */
+                printf("Write failed at %s", llu_sector_to_str(rightoffset));
+                rc = do_write_cmd(tio, rightoffset, bufsize, g_ibuf[5],
+                                  g_has_nsd);
+                if (rc != 0)
+                    printf("; data compromised");
+                printf("\n");
+                fail++;
+            }
+        }
+        if (fail) {
+            /* A failure occurred */
+            rc = 1;
+            break;
+        }
+
+        leftoffset += bytes_per_zone;
+        if (is_user_abort()) {
+            printf("^C abort\n");
+            rc = 1;
+            break;
+        }
+    }
+    zoneoffset += bufsize;
+    if (zoneoffset + bufsize > bytes_per_zone) {
+        zoneoffset = 0;
+        checknum++;
+    }
+
+    return (rc);
+}
+
+static int
+test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
+               uint align)
+{
     struct IOExtTD *tio;
     struct MsgPort *mp;
-    static uint    pos = 0;
-    static uint8_t curbuf = 0;
-    static uint8_t chkcur = 0;
+    uint8_t chkcur = 0;
+    uint    bnum;
+    int     rc = 0;
 
     mp = CreatePort(0, 0);
     if (mp == NULL) {
@@ -4750,6 +5267,7 @@ test_integrity(uint pattern, uint32_t memtype, uint bufsize, uint align)
         rc = 1;
         goto extio_fail;
     }
+
     if ((rc = open_device(tio)) != 0) {
         printf("Open %s Unit %u: ", g_devname, g_unitno);
         print_fail_nl(rc);
@@ -4757,29 +5275,26 @@ test_integrity(uint pattern, uint32_t memtype, uint bufsize, uint align)
         goto opendev_fail;
     }
 
-    if (g_sector_size == 0)
-        g_sector_size = 512;
-
-    if (g_devsize == 0)
-        g_devsize = 720 << 10;  // At least 720K
-
-    for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++) {
-        /*
-         * g_ibuf is the collection of buffers for integrity testing.
-         *     g_ialign is located within the buffer g_ibuf
-         *
-         * g_align[0] is the data pattern to write
-         * g_align[1] is the alternatte (inverted) data pattern to write
-         * g_align[2] is read buffer; initially patterened with 0x5a, but
-         *               not re-patterned at every read
-         * g_align[3] is second read buffer (when miscompare happens
-         *               on the first read). Re-patterned with 0xa5 at
-         *               every re-read.
-         * g_ibuf[4] is the original data buffer, unless -dd specified
-         */
-        if (g_ibuf[bnum] == NULL) {
+    if (g_ibuf[0] == NULL) {
+        for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++) {
             uint32_t base;
-            if ((bnum == 5) && (flag_destructive > 1))
+            uint     cur;
+            uint     memtypex = memtype;
+            /*
+             * g_ibuf is the collection of buffers for integrity testing.
+             *     g_ialign is located within the buffer g_ibuf
+             *
+             * g_align[0] is the data pattern to write
+             * g_align[1] is the alternate (inverted) data pattern to write
+             * g_align[2] is read buffer; initially patterned with 0x5a, but
+             *               not re-patterned at every read
+             * g_align[3] is second read buffer (when miscompare happens
+             *               on the first read). Re-patterned with 0xa5 at
+             *               every re-read.
+             * g_ibuf[4] is original data buffer 1, unless -dd specified
+             * g_ibuf[5] is original data buffer 2, unless -dd specified
+             */
+            if (((bnum == 4) || (bnum == 5)) && (flag_destructive > 1))
                 continue;
             g_ibuf[bnum] = AllocMemType(bufsize + align, memtypex);
             if (g_ibuf[bnum] == NULL) {
@@ -4787,22 +5302,27 @@ test_integrity(uint pattern, uint32_t memtype, uint bufsize, uint align)
                 rc = ENOMEM;
                 goto integrity_fail;
             }
+
             /*
              * Create specific alignment
+             * If the address is aligned at a lower order of alignment,
+             * then need to increase the alignment by rounding up.
+             *    Example: address = 0x0004  desired_alignment = 8
+             *             address = 0x0008
              * If the address is already aligned at a higher order than
              * the requested alignment, need to reduce the alignment.
-             * If the address is aligned at a lower order of alignment,
-             * then need to increase the alignment.
+             *    Example: address = 0x0004  desired_alignment = 1
+             *             address = 0x0005
              */
             base = (uintptr_t) g_ibuf[bnum];
             if (base & (align - 1)) {
                 /* Lower order of alignment; round up */
                 g_align[bnum] = (void *) ((base + align - 1) & ~(align - 1));
             } else {
-                /* Lower order of alignment; force alignment */
+                /* Higher order of alignment; force alignment */
                 g_align[bnum] = (void *) (base + align);
             }
-            if (g_verbose)
+            if (g_verbose > 1)
                 printf("Align %p\n", g_align[bnum]);
 
             if (memtypex > MEMTYPE_MAX)
@@ -4822,9 +5342,9 @@ test_integrity(uint pattern, uint32_t memtype, uint bufsize, uint align)
                         break;
                     case 3: {
                         for (cur = 0; cur < bufsize; cur++) {
+                            g_align[bnum][cur] = chkpat[chkcur++];
                             if (chkcur >= ARRAY_SIZE(chkpat))
                                 chkcur = 0;
-                            g_align[bnum][cur] = chkpat[chkcur++];
                         }
                         break;
                     }
@@ -4838,75 +5358,24 @@ test_integrity(uint pattern, uint32_t memtype, uint bufsize, uint align)
             }
         }
     }
-    if (pos + bufsize > g_devsize)
-        pos = 0;
 
-    if (flag_destructive == 1)
-        rc = do_read_cmd(tio, pos, bufsize, g_buf[4], g_has_nsd);
-
-    rc = do_write_cmd(tio, pos, bufsize, g_align[curbuf], g_has_nsd);
-    if (rc != 0) {
-        printf("write failed at 0x%x\n", pos);
+    if ((g_devsize == 0) && ((rc = get_devsize(tio)) != 0)) {
+        printf("Failed to get device size\n");
         goto integrity_fail;
     }
-    rc = do_read_cmd(tio, pos, bufsize, g_align[2], g_has_nsd);
-    if (rc != 0) {
-        printf("read failed at 0x%x\n", pos);
-        goto integrity_fail;
-    }
-    if (memcmp(g_align[curbuf], g_align[2], bufsize) != 0) {
-        printf("Miscompare at 0x%x\n", pos);
-        if (memcmp_const(g_align[2], bufsize, 0xa5) == 0) {
-            printf("Read buffer was not updated\n");
-        } else {
-            show_diffs(g_align[curbuf], g_align[2], bufsize, "expected");
-        }
 
-        /* Pattern the second receive buffer */
-        memset(g_align[3], 0x5a, bufsize);
-
-        rc = do_read_cmd(tio, pos, bufsize, g_align[3], g_has_nsd);
-        if (rc != 0) {
-            printf("Re-read failed at 0x%x\n", pos);
-            goto integrity_fail;
-        }
-        if (memcmp(g_align[curbuf], g_align[3], bufsize) == 0) {
-            printf("Re-read of data matches what was written "
-                   "(read failure?)\n");
-        } else if (memcmp_const(g_align[3], bufsize, 0x5a) == 0) {
-            printf("Re-read buffer was not updated\n");
-        } else if (memcmp(g_align[2], g_align[3], bufsize) == 0) {
-            printf("Re-read of data matches what was read "
-                   "(write failure?)\n");
-        } else {
-            printf("Re-read of data differs (floating data?)\n");
-            show_diffs(g_align[curbuf], g_align[3], bufsize, "expected");
-            show_diffs(g_align[2], g_align[3], bufsize, "first read");
-        }
-        CacheClearU();
-        if (memcmp(g_align[curbuf], g_align[2], bufsize) == 0) {
-            printf("Initial read data now matches what was written "
-                   "(CPU cache or memory failure?)\n");
-        }
-        rc = 1;
-        goto integrity_fail;
+    switch (mode) {
+        case 0:  // Mode not specified with -k
+        case 1:  // -k simple
+        default:
+            rc = test_integrity_simple(tio, bufsize);
+            break;
+        case 2:  // -k butterfly
+            rc = test_integrity_butterfly(tio, bufsize);
+            break;
     }
 
 integrity_fail:
-    if (flag_destructive == 1) {
-        int rc2 = do_write_cmd(tio, pos, bufsize, g_ibuf[4], g_has_nsd);
-        if (rc2 != 0) {
-            /* Bad day: you may have lost data */
-            printf("restore of original data failed at 0x%x\n", pos);
-            if (rc == 0)
-                rc = rc2;
-        }
-    }
-    if (rc == 0) {
-        pos += bufsize;
-        curbuf ^= 1;
-    }
-
     close_device(tio);
 opendev_fail:
     DeleteExtIO((struct IORequest *) tio);
@@ -4920,11 +5389,14 @@ static void
 show_cmds(void)
 {
     size_t bit;
-    printf("  Name        Command             Description\n"
-           "  ----------- ------------------- --------------------------\n");
-    for (bit = 0; bit < ARRAY_SIZE(test_cmds); bit++)
-        printf("  %-11s %-19s %s\n",
-               test_cmds[bit].alias, test_cmds[bit].name, test_cmds[bit].desc);
+    printf("  Name        Args                 Description\n"
+           "  ----------- -------------------- --------------------------\n");
+    for (bit = 0; bit < ARRAY_SIZE(test_cmds); bit++) {
+        printf("  %-11s %-20s %s\n",
+               test_cmds[bit].alias,
+               test_cmds[bit].args ? test_cmds[bit].args : NULL,
+               test_cmds[bit].desc);
+    }
 }
 
 static void
@@ -4937,7 +5409,7 @@ usage_cmd(void)
 static void
 show_arg_help(const char *str, uint cmd)
 {
-    const char *const arg_help = test_cmds[cmd].arg_help;
+    const char *const arg_help = test_cmds[cmd].args;
     if (arg_help == NULL)
         printf("No arguments for this command\n");
     else
@@ -4959,8 +5431,7 @@ get_cmd(const char *str, args_t *args)
         *(arg++) = '\0';
 
     for (pos = 0; pos < ARRAY_SIZE(test_cmds); pos++) {
-        if ((strcasecmp(test_cmds[pos].alias, str) == 0) ||
-            (strcasecmp(test_cmds[pos].name, str) == 0)) {
+        if (strcasecmp(test_cmds[pos].alias, str) == 0) {
             if (arg != NULL) {
                 int count;
                 uint val;
@@ -5007,7 +5478,7 @@ main(int argc, char *argv[])
     int arg;
     int rc;
     uint bnum;
-    uint loop;
+    uint loop = 0;
     uint loops = 1;
 #define MAX_CMD_MASKS 32
     static uint test_cmd_count = 0;
@@ -5021,6 +5492,7 @@ main(int argc, char *argv[])
     uint did_open = 0;
     uint tsize = BUFSIZE;
     uint talign = 16;
+    uint test_mode = 0;
     char *unit = NULL;
     struct EClockVal dummy;
 
@@ -5115,9 +5587,28 @@ main(int argc, char *argv[])
                                 exit(RETURN_ERROR);
                             }
                         } else {
-                            printf("%s requires an argument\n", ptr);
+                            printf("-%s requires an argument\n", ptr);
                             printf("    Transfer size: 512 1M 64k etc\n"
                                    "    optional alignment: ,1 ,2 ,4 etc\n");
+                            exit(RETURN_ERROR);
+                        }
+                        break;
+                    case 'k':
+                        /* Integrity test mode required */
+                        if (++arg < argc) {
+                            int len = strlen(argv[arg]);
+                            if (strncmp(argv[arg], "butterfly", len) == 0) {
+                                test_mode = 2;
+                            } else if (strncmp(argv[arg], "simple", len) == 0) {
+                                test_mode = 1;
+                            } else {
+                                printf("Unknown integrity test mode %s\n",
+                                       argv[arg]);
+                                exit(RETURN_ERROR);
+                            }
+                        } else {
+                            printf("-%s requires an argument\n", ptr);
+                            printf("    One of: simple or butterfly\n");
                             exit(RETURN_ERROR);
                         }
                         break;
@@ -5126,7 +5617,7 @@ main(int argc, char *argv[])
                         if (++arg < argc) {
                             loops = atoi(argv[arg]);
                         } else {
-                            printf("%s requires an argument\n", ptr);
+                            printf("-%s requires an argument\n", ptr);
                             printf("    The number of loop iterations\n");
                             exit(RETURN_ERROR);
                         }
@@ -5165,7 +5656,7 @@ main(int argc, char *argv[])
                                 exit(RETURN_ERROR);
                             }
                         } else {
-                            printf("%s requires an argument\n", ptr);
+                            printf("-%s requires an argument\n", ptr);
                             printf("    One of: chip, fast, 24bit, zorro, "
                                    "accel, coproc, or <addr>\n");
                             exit(RETURN_ERROR);
@@ -5202,18 +5693,19 @@ main(int argc, char *argv[])
             exit(RETURN_ERROR);
         }
     }
-    if (flag_integrity && !flag_destructive) {
-        printf("Integrity test requires -d (destructive) flag\n");
-        exit(RETURN_ERROR);
-    }
-    if (flag_destructive && (force_yes == 0) &&
-        (are_you_sure("Destructive test") == FALSE)) {
+    if (test_mode && !flag_integrity) {
+        printf("You must specify -i <tsize> with -k\n");
+        usage();
         exit(RETURN_ERROR);
     }
     if ((flag_benchmark || flag_geometry || flag_integrity || flag_openclose ||
          flag_testpackets || flag_probe || test_cmd_mask[0]) == 0) {
         printf("You must specify an operation to perform\n");
         usage();
+        exit(RETURN_ERROR);
+    }
+    if (flag_destructive && (force_yes == 0) &&
+        (are_you_sure("Destructive test") == FALSE)) {
         exit(RETURN_ERROR);
     }
     if (strchr(g_devname, ':')) {
@@ -5227,10 +5719,11 @@ main(int argc, char *argv[])
         g_envec       = (struct DosEnvec *) BTOC(startup->fssm_Environ);
         if (g_envec != NULL) {
             g_sector_size = g_envec->de_SizeBlock * 4;
-            g_devstart = g_envec->de_LowCyl * g_envec->de_Surfaces *
+            g_devstart = (uint64_t) g_envec->de_LowCyl * g_envec->de_Surfaces *
                          g_envec->de_BlocksPerTrack * g_sector_size;
-            g_devend = (g_envec->de_HighCyl + 1) * g_envec->de_Surfaces *
-                       g_envec->de_BlocksPerTrack * g_sector_size;
+            g_devend = (uint64_t) (g_envec->de_HighCyl + 1) *
+                       g_envec->de_Surfaces * g_envec->de_BlocksPerTrack *
+                       g_sector_size;
         }
         printf("Device %s %u\n", g_devname, g_unitno);
         goto got_unit;
@@ -5248,7 +5741,16 @@ main(int argc, char *argv[])
         usage();
         exit(RETURN_ERROR);
     }
+
 got_unit:
+    memset(g_tbuf, 0, sizeof (g_tbuf));
+    for (bnum = 0; bnum < ARRAY_SIZE(g_tbuf); bnum++) {
+        g_tbuf[bnum] = (uint8_t *) AllocMemType(BUFSIZE, memtype);
+        if (g_tbuf[bnum] == NULL) {
+            printf("  AllocMem %x (%x) fail\n", BUFSIZE, memtype);
+            goto allocmem_fail;
+        }
+    }
 
     for (loop = 0; loop < loops; loop++) {
         uint stop_on_error = (loop != 0) || (loops == 1);
@@ -5279,8 +5781,9 @@ got_unit:
         if (flag_geometry && drive_geometry() && stop_on_error)
             break;
         if (flag_integrity &&
-            test_integrity(flag_integrity, memtype, tsize, talign))
+            test_integrity(test_mode, flag_integrity, memtype, tsize, talign)) {
             break;
+        }
         if (flag_testpackets &&
             test_packets(flag_destructive, flag_testpackets, 0, NULL) &&
             stop_on_error) {
@@ -5305,6 +5808,11 @@ got_unit:
     }
     if (did_open)
         close_device(&tio);
+
+allocmem_fail:
+    for (bnum = 0; bnum < ARRAY_SIZE(g_tbuf); bnum++)
+        if (g_tbuf[bnum] != NULL)
+            FreeMemType(g_tbuf[bnum], BUFSIZE);
 
     for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++)
         if (g_ibuf[bnum] != NULL)
