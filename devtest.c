@@ -388,18 +388,19 @@ usage(void)
 // Undocumented: -dd skips save/restore of data with -i integrity test
            "   -g                    report drive geometry\n"
            "   -h                    display help\n"
-           "   -i <tsize>[,<align>]  integrity test [-d=destructive]\n"
+           "   -i <tsize>[,<align>]  integrity test [-d=destructive] "
+                    "[-dd=no save]\n"
            "                         [-i=random -ii=address -iii=pattern]\n"
            "   -k <mode>             integrity test mode: simple or butterfly\n"
            "   -l <loops>            run multiple times\n"
            "   -m <addr>             "
-                    "use specific memory (Chip Fast Zorro MB Accel -=list)\n"
+                    "use specific memory (Chip Fast Zorro MB Copr -=list)\n"
            "   -mm <addr>            "
                     "use specific address without allocation by OS\n"
            "   -o                    test open/close\n"
            "   -p                    probe SCSI bus for devices\n"
-           "   -t                    test all packet types (basic, TD64, NSD) "
-                    "[-tt = more]\n"
+           "   -t                    test all packet types (basic, TD64, NSD);"
+                    " -tt=more\n"
            "   -y                    answer all prompts with 'yes'\n",
            version + 7);
 }
@@ -1262,7 +1263,7 @@ drive_geometry(void)
     scsi_inquiry_data_t *inq_res;
     rc = do_scsi_inquiry(tio, g_unitno, &inq_res);
     if (rc != 0) {
-        printf("%51c  -    Fail\n", '-');
+        printf("%51c  -    Fail %d\n", '-', rc);
     } else {
         printf("%46s 0x%02x %s", "",
                inq_res->device & SID_TYPE,
@@ -1327,7 +1328,7 @@ drive_geometry(void)
 
     rc = scsi_read_mode_pages(tio, &pages);
     if (pages == NULL) {
-        printf("Mode Pages%40s", "");
+        printf("Mode Pages%45s", "");
         print_fail_nl(rc);
     } else {
         uint pos = 4;
@@ -2323,7 +2324,7 @@ static const char *
 memtype_str(uint32_t mem)
 {
     const char *type;
-    if (((mem > MEMTYPE_CHIP_START) && (mem < MEMTYPE_CHIP_START + MEMTYPE_CHIP_SIZE)) || (mem == MEMTYPE_CHIP)) {
+    if (((mem >= MEMTYPE_CHIP_START) && (mem < MEMTYPE_CHIP_START + MEMTYPE_CHIP_SIZE)) || (mem == MEMTYPE_CHIP)) {
         type = "Chip";
     } else if ((mem >= MEMTYPE_SLOW_START) && (mem < MEMTYPE_SLOW_START + MEMTYPE_SLOW_SIZE)) {
         type = "Slow";
@@ -5725,7 +5726,8 @@ main(int argc, char *argv[])
                        g_envec->de_Surfaces * g_envec->de_BlocksPerTrack *
                        g_sector_size;
         }
-        printf("Device %s %u\n", g_devname, g_unitno);
+        if (g_verbose)
+            printf("Device %s %u\n", g_devname, g_unitno);
         goto got_unit;
     }
     if (unit == NULL) {

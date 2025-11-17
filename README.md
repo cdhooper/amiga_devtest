@@ -175,20 +175,38 @@ geometry, including direct SCSI commands. These methods are reported
 by devtest.
 ```
     9.OS322:> devtest -g a4091.device 1
-                     SSize TotalSectors   Cyl  Head  Sect  DType Removable
-    TD_GETGEOMETRY     512      4194304  8192    32    16  0x00  No
-    Inquiry                                                0x00  No
+                     SSize TotalSectors    Cyl Head  Sect DType Removable
+    TD_GETGEOMETRY     512      4194304   8192   32    16  0x00 No
+    Inquiry                                                0x00 No
     READ_CAPACITY_10   512      4194304
     READ_CAPACITY_16     -            -                    Fail 52 ERROR_SENSE_CODE
     Read-to capacity   512      4194304
     Mode Page 0x03     512                             63
-    Mode Page 0x04                        261   255
+    Mode Page 0x04                         261  255
 ```
 
 Not all drivers or devices support all commands or mode pages. A good example
 is SCSI READ_CAPACITY_16. This command is practically unnecessary for any
 drive smaller than 2 TB. It first appeared in the SCSI specification in the
 early 2000's, so older drives will definitely not support it.
+
+The latest version of devtest allows you to specify a device or volume name
+instead of a driver and unit. Additional details are provided when a device
+or volume name is specified.
+```
+    9.OS322:> devtest -g Work:
+                     SSize TotalSectors    Cyl Head  Sect DType Removable
+    Partition          512     16738688   1042    1 16064  scsi.device 0
+    Partition-start    512      2104384    131
+    Partition-end      512     18843072   1173
+    TD_GETGEOMETRY     512     18874368   1174  255    63  0x00 No
+    Inquiry                                                0x00 No
+    READ_CAPACITY_10   512     18874368
+    READ_CAPACITY_16     -            -                    Fail 45 HFERR_BadStatus
+    Read-to capacity   512     16738687
+    Mode Page 0x03     512                             63
+    Mode Page 0x04                        1174  255
+```
 
 ## 5. Data integrity
 The benchmark test is a good tool for verifying the Amiga's bus interface
@@ -286,3 +304,20 @@ the low and high data match what was written. In non-destructive mode,
 the test reads data at the low and high offset, then reads it a second
 time from the low and high offset. It then verifies the low and high
 data match what was previously read.
+```
+    8.SDH0:> devtest scsi.device 1 -i 256k -k butterfly -ddyv -l 300
+    Pass 1  2020-03-30 15:04:43
+      Zone sector 0 (0.0% of media check #1) 0 KB
+    Pass 2  2020-03-30 15:05:00
+      Zone sector 512 (1.5% of media check #1) 16 MB
+    Pass 3  2020-03-30 15:05:15
+      Zone sector 1024 (3.1% of media check #1) 32 MB
+...
+    Pass 64  2020-03-30 15:20:44
+      Zone sector 32256 (98.4% of media check #1) 1023 MB
+    Pass 65  2020-03-30 15:20:59
+      Zone sector 0 (0.0% of media check #2) 1040 MB
+    Pass 66  2020-03-30 15:21:15
+...
+```
+The above is test ran at about 1 MB/sec.
