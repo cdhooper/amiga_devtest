@@ -2362,14 +2362,32 @@ show_memlist(void)
          mem = (struct MemHeader *)mem->mh_Node.ln_Succ) {
         uint32_t    size = (uint8_t *) mem->mh_Upper - (uint8_t *) mem;
         uint32_t    upper = (uintptr_t) mem->mh_Upper;
+        uint16_t    attr  = mem->mh_Attributes;
         const char *type = memtype_str((uint32_t) mem);
 
-        printf("%s RAM at %p size=0x%x\n", type, (void *) mem, size);
+        printf("%s RAM at %p size=0x%x", type, (void *) mem, size);
+        if (g_verbose) {
+            if (attr & MEMF_PUBLIC)
+                printf(" PUBLIC");
+            if (attr & MEMF_CHIP)
+                printf(" CHIP");
+            if (attr & MEMF_FAST)
+                printf(" FAST");
+            if (attr & MEMF_LOCAL)
+                printf(" LOCAL");
+            if (attr & MEMF_24BITDMA)
+                printf(" 24BITDMA");
+            if (attr & MEMF_KICK)
+                printf(" KICK");
+            printf(" pri=%d \"%.20s\"",
+                   mem->mh_Node.ln_Pri, mem->mh_Node.ln_Name);
+        }
+        printf("\n");
 
         for (chunk = mem->mh_First; chunk != NULL;
              chunk = chunk->mc_Next) {
             uint bytes = chunk->mc_Bytes;
-            if (g_verbose || (chunk->mc_Bytes >= 512)) {
+            if ((g_verbose > 1) || (chunk->mc_Bytes >= 512)) {
                 printf("  %p 0x%x", (void *) chunk, bytes);
                 if ((uintptr_t) chunk + bytes > upper)
                     printf(" ** CORRUPT: 0x%x is maximum size",
@@ -5489,6 +5507,7 @@ main(int argc, char *argv[])
     uint flag_integrity = 0;
     uint flag_openclose = 0;
     uint flag_probe = 0;
+    uint flag_showmemlist = 0;
     uint flag_testpackets = 0;
     uint did_open = 0;
     uint tsize = BUFSIZE;
@@ -5632,8 +5651,7 @@ main(int argc, char *argv[])
                             mem_skip_alloc++;
                         } else if (++arg < argc) {
                             if (strcmp(argv[arg], "-") == 0) {
-                                show_memlist();
-                                exit(RETURN_OK);
+                                flag_showmemlist = 1;
                             } else if (strncasecmp(argv[arg], "chip", 4) == 0) {
                                 memtype = MEMTYPE_CHIP;
                             } else if (strncasecmp(argv[arg], "fast", 4) == 0) {
@@ -5693,6 +5711,10 @@ main(int argc, char *argv[])
             usage();
             exit(RETURN_ERROR);
         }
+    }
+    if (flag_showmemlist) {
+        show_memlist();
+        exit(RETURN_OK);
     }
     if (test_mode && !flag_integrity) {
         printf("You must specify -i <tsize> with -k\n");
