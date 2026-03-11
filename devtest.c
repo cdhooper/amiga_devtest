@@ -4788,7 +4788,7 @@ test_integrity_simple(struct IOExtTD *tio, uint bufsize)
     }
 
     if (flag_destructive < 2)
-        rc = do_read_cmd(tio, pos, bufsize, g_tbuf[4], g_has_nsd);
+        rc = do_read_cmd(tio, pos, bufsize, g_ibuf[4], g_has_nsd);
 
     if (g_verbose) {
         uint percent = pos * 1000 / devsize;
@@ -4810,7 +4810,7 @@ test_integrity_simple(struct IOExtTD *tio, uint bufsize)
     if ((flag_destructive &&
          (memcmp(g_align[curbuf], g_align[2], bufsize) != 0)) ||
         (!flag_destructive &&
-         (memcmp(g_tbuf[4], g_align[2], bufsize) != 0))) {
+         (memcmp(g_ibuf[4], g_align[2], bufsize) != 0))) {
         /*
          * Read data either mismatches the newly written pattern
          * (destructive mode) or mismatches the previously read data
@@ -4822,7 +4822,7 @@ test_integrity_simple(struct IOExtTD *tio, uint bufsize)
         } else if (flag_destructive) {
             show_diffs(g_align[curbuf], g_align[2], bufsize, "expected");
         } else {
-            show_diffs(g_tbuf[4], g_align[2], bufsize, "original");
+            show_diffs(g_ibuf[4], g_align[2], bufsize, "original");
         }
 
         /* Pattern the second read buffer */
@@ -4847,7 +4847,7 @@ test_integrity_simple(struct IOExtTD *tio, uint bufsize)
                    (memcmp(g_align[curbuf], g_align[3], bufsize) == 0)) {
             printf("Re-read of data matches what was written "
                    "(read failure?)\n");
-        } else if (memcmp(g_tbuf[4], g_align[3], bufsize) == 0) {
+        } else if (memcmp(g_ibuf[4], g_align[3], bufsize) == 0) {
             printf("Re-read of data matches what was originally on disk\n");
         } else {
             printf("Re-read of data differs (floating data?)\n");
@@ -4855,7 +4855,7 @@ test_integrity_simple(struct IOExtTD *tio, uint bufsize)
                 show_diffs(g_align[curbuf], g_align[3], bufsize, "expected");
                 show_diffs(g_align[2], g_align[3], bufsize, "first read");
             } else {
-                show_diffs(g_tbuf[4], g_align[3], bufsize, "first read");
+                show_diffs(g_ibuf[4], g_align[3], bufsize, "first read");
                 show_diffs(g_align[2], g_align[3], bufsize, "second read");
             }
         }
@@ -4866,7 +4866,7 @@ test_integrity_simple(struct IOExtTD *tio, uint bufsize)
                        "(CPU cache or memory failure?)\n");
             }
         } else {
-            if (memcmp(g_tbuf[4], g_align[2], bufsize) == 0) {
+            if (memcmp(g_ibuf[4], g_align[2], bufsize) == 0) {
                 printf("Initial read data now matches second read "
                        "(CPU cache or memory failure?)\n");
             }
