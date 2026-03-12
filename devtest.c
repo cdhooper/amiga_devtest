@@ -119,10 +119,12 @@ struct Device   *TimerBase;
 #define MEMTYPE_FAST   2
 #define MEMTYPE_24BIT  3
 #define MEMTYPE_ZORRO  4
-#define MEMTYPE_ACCEL  5
-#define MEMTYPE_COPROC 6
-#define MEMTYPE_MB     7
-#define MEMTYPE_MAX    7
+#define MEMTYPE_ZORRO2 5
+#define MEMTYPE_ZORRO3 6
+#define MEMTYPE_ACCEL  7
+#define MEMTYPE_COPROC 8
+#define MEMTYPE_MB     9
+#define MEMTYPE_MAX    9
 
 // memory areas
 #define MEMTYPE_CHIP_START      0x00001000u  // chip memory start
@@ -280,6 +282,7 @@ typedef struct {
 
 static int do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len,
                        void *buf, int nsd);
+static void report_allocmem_fail(uint bufsize, uint memtype);
 
 #define TEST_MAX_CMDS 32
 #define BUF_COUNT     6   // General test buffers
@@ -312,6 +315,7 @@ static args_t   *cur_test_args = NULL;
 static uint      flag_destructive = 0;
 static uint      force_yes = 0;
 static uint      checknum = 0;
+static uint      g_turn_motor_off;    // Drive read/write likely turned motor on
 
 static BOOL
 is_user_abort(void)
@@ -354,6 +358,20 @@ ask_again:
 }
 
 static int
+turn_motor_off(struct IOExtTD *tio)
+{
+    /* Spin down device's motor */
+    tio->iotd_Req.io_Command = TD_MOTOR;
+    tio->iotd_Req.io_Actual  = 0;
+    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Length  = 0;
+    tio->iotd_Req.io_Data    = NULL;
+    tio->iotd_Req.io_Flags   = 0;
+    tio->iotd_Req.io_Error   = 0xa5;
+    return (DoIO((struct IORequest *) tio));
+}
+
+static int
 open_device(struct IOExtTD *tio)
 {
     uint flags = 0;
@@ -365,6 +383,10 @@ open_device(struct IOExtTD *tio)
 static void
 close_device(struct IOExtTD *tio)
 {
+    if (g_turn_motor_off) {
+        g_turn_motor_off = 0;
+        turn_motor_off(tio);
+    }
     CloseDevice((struct IORequest *)tio);
 }
 
@@ -563,6 +585,8 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
             addr = AllocMem(byteSize, MEMF_PUBLIC | MEMF_24BITDMA);
             break;
         case MEMTYPE_ZORRO:
+        case MEMTYPE_ZORRO2:
+        case MEMTYPE_ZORRO3:
         case MEMTYPE_COPROC:
         case MEMTYPE_MB:
         case MEMTYPE_ACCEL: {
@@ -592,6 +616,18 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
                      (((uint32_t) mem < MEMTYPE_COPROC_START) ||
                       ((uint32_t) mem >= MEMTYPE_COPROC_START + MEMTYPE_COPROC_SIZE))) {
                     /* Not in Coprocessor address range */
+                    continue;
+                }
+                if ((memtype == MEMTYPE_ZORRO2) &&
+                    (((uint32_t) mem < E_MEMORYBASE) ||
+                     ((uint32_t) mem >= E_MEMORYBASE + E_MEMORYSIZE))) {
+                    /* Not in Zorro II address range */
+                    continue;
+                }
+                if ((memtype == MEMTYPE_ZORRO3) &&
+                     (((uint32_t) mem < MEMTYPE_ZORRO3_START) ||
+                      ((uint32_t) mem >= MEMTYPE_ZORRO3_START + MEMTYPE_ZORRO3_SIZE))) {
+                    /* Not in Zorro III address range */
                     continue;
                 }
                 if ((memtype == MEMTYPE_ZORRO) &&
@@ -725,7 +761,7 @@ do_scsidirect_cmd(struct IOExtTD *tio, scsi_generic_t *cmd, uint cmdlen,
     if (reslen > 0) {
         res = AllocMemType(reslen, memtype);
         if (res == NULL) {
-            printf("  AllocMem %x (%x) fail\n", reslen, memtype);
+            report_allocmem_fail(reslen, memtype);
             g_sense_length = 0;
             return (ENOMEM);
         }
@@ -829,7 +865,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
 
     buf = (uint8_t *) AllocMemType(g_sector_size, memtype);
     if (buf == NULL) {
-        printf("  AllocMem %x (%x) fail\n", g_sector_size, memtype);
+        report_allocmem_fail(g_sector_size, memtype);
         return (1);
     }
 
@@ -846,8 +882,12 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
                 incdec = offset;
                 offset *= 2;
             } else {
-                if (offset + incdec >= max_offset)
+                while (offset + incdec >= max_offset) {
                     incdec /= 2;
+                    incdec &= ~(g_sector_size - 1);
+                    if (incdec == 0)
+                        break;
+                }
                 offset += incdec;
             }
         } else {
@@ -855,15 +895,19 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
             max_offset = offset;
             if (incdec >= offset)
                 break;
-            if (offset - incdec <= min_offset)
+            while (offset - incdec <= min_offset) {
                 incdec /= 2;
+                incdec &= ~(g_sector_size - 1);
+                if (incdec == 0)
+                    break;
+            }
             offset -= incdec;
         }
     }
-    offset &= ~(g_sector_size - 1);
 
     FreeMemType(buf, g_sector_size);
     *sectors = min_offset / g_sector_size;
+    g_turn_motor_off = 1;
     return (0);
 }
 
@@ -1803,7 +1847,7 @@ latency_scsidirect_cmd_seq(uint8_t iocmd, uint8_t *buf, int num_iter,
 
     scmd = AllocMemType(sizeof (*scmd) * num_iter, memtype);
     if (scmd == NULL) {
-        printf("  AllocMem %x (%x) fail\n", sizeof (*scmd) * num_iter, memtype);
+        report_allocmem_fail(sizeof (*scmd) * num_iter, memtype);
         return (1);
     }
 
@@ -1853,7 +1897,7 @@ latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
 
     scmd = AllocMemType(sizeof (*scmd) * num_iter, memtype);
     if (scmd == NULL) {
-        printf("  AllocMem %x (%x) fail\n", sizeof (*scmd) * num_iter, memtype);
+        report_allocmem_fail(sizeof (*scmd) * num_iter, memtype);
         return (1);
     }
 
@@ -1901,7 +1945,7 @@ latency_read(struct IOExtTD **tio, int max_iter)
 
     buf = AllocMemType(BUFSIZE, memtype);
     if (buf == NULL) {
-        printf("  AllocMem %x (%x) fail\n", BUFSIZE, memtype);
+        report_allocmem_fail(BUFSIZE, memtype);
         return (1);
     }
 
@@ -2015,7 +2059,7 @@ latency_write(struct IOExtTD **tio, int max_iter)
 
     buf = AllocMemType(BUFSIZE, memtype);
     if (buf == NULL) {
-        printf("  AllocMem %x (%x) fail\n", BUFSIZE, memtype);
+        report_allocmem_fail(BUFSIZE, memtype);
         return (1);
     }
 
@@ -2109,7 +2153,7 @@ drive_latency(int do_destructive)
 #define NUM_MTIO 1000
     mtio = AllocMemType(sizeof (*mtio) * NUM_MTIO, memtype);
     if (mtio == NULL) {
-        printf("  AllocMem %x (%x) fail\n", sizeof (*mtio) * NUM_MTIO, memtype);
+        report_allocmem_fail(sizeof (*mtio) * NUM_MTIO, memtype);
         rc = 1;
         goto need_delete_tio;
     }
@@ -2336,9 +2380,11 @@ memtype_str(uint32_t mem)
         type = "Coprocessor";
     } else if (mem == MEMTYPE_ZORRO) {
         type = "Zorro";
-    } else if ((mem >= E_MEMORYBASE) && (mem < E_MEMORYBASE + E_MEMORYSIZE)) {
+    } else if ((mem == MEMTYPE_ZORRO2) ||
+               ((mem >= E_MEMORYBASE) && (mem < E_MEMORYBASE + E_MEMORYSIZE))) {
         type = "Zorro II";
-    } else if ((mem >= MEMTYPE_ZORRO3_START) && (mem < MEMTYPE_ZORRO3_START + MEMTYPE_ZORRO3_SIZE)) {
+    } else if ((mem == MEMTYPE_ZORRO3) ||
+               ((mem >= MEMTYPE_ZORRO3_START) && (mem < MEMTYPE_ZORRO3_START + MEMTYPE_ZORRO3_SIZE))) {
         type = "Zorro III";
     } else if (((mem >= MEMTYPE_ACCEL_START) && (mem < MEMTYPE_ACCEL_START + MEMTYPE_ACCEL_SIZE)) ||
                 (mem == MEMTYPE_ACCEL)) {
@@ -2347,6 +2393,12 @@ memtype_str(uint32_t mem)
         type = "Unknown";
     }
     return (type);
+}
+
+static void
+report_allocmem_fail(uint bufsize, uint memtype)
+{
+    printf("  AllocMem %x (%s) fail\n", bufsize, memtype_str(memtype));
 }
 
 static void
@@ -2481,6 +2533,8 @@ try_again:
     if (do_destructive && (rc == 0))
         rc += run_bandwidth(CMD_WRITE, tio, buf, perf_buf_size);
 
+    g_turn_motor_off = 1;
+
 allocmem_fail:
     for (i = 0; i < ARRAY_SIZE(buf); i++)
         if (buf[i] != NULL)
@@ -2513,8 +2567,14 @@ do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
 
-    if ((g_devend != 0) && (offset + len >= g_devend))
+#if 0
+    /*
+     * Disabling this might break end of device detection.
+     * Limited testing says that this is not needed.
+     */
+    if ((g_devend != 0) && (offset + len > g_devend))
         return (1);
+#endif
 
     if (((offset + len) >> 32) > 0) {
         /* Need TD64 or NSD */
@@ -3330,16 +3390,8 @@ test_td_motor_off(struct IOExtTD *tio)
 {
     int rc;
 
-    /* Spin down device's motor */
-    tio->iotd_Req.io_Command = TD_MOTOR;
-    tio->iotd_Req.io_Actual  = 0;
-    tio->iotd_Req.io_Offset  = 0;
-    tio->iotd_Req.io_Length  = 0;
-    tio->iotd_Req.io_Data    = NULL;
-    tio->iotd_Req.io_Flags   = 0;
-    tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_MOTOR OFF");
-    rc = DoIO((struct IORequest *) tio);
+    rc = turn_motor_off(tio);
     print_fail_nl(rc);
 
     return (rc);
@@ -4276,7 +4328,7 @@ buf_alloc_failed:
 #define TEST_TD_FORMAT64        UBIT(26)
 #define TEST_NSCMD_TD_FORMAT64  UBIT(27)
 #define TEST_NSCMD_ETD_FORMAT64 UBIT(28)
-#define TEST_TD_MOTOR_OFF       UBIT(28)
+#define TEST_TD_MOTOR_OFF       UBIT(29)
 #define TEST_TD_MOTOR_ON        UBIT(30)
 #define TEST_CMD_STOP           UBIT(31)
 #define TEST_CMD_START          UBIT(32)
@@ -4573,7 +4625,7 @@ test_packets(int do_destructive, int test_level,
     for (i = 0; i < ARRAY_SIZE(buf); i++) {
         buf[i] = (uint8_t *) AllocMemType(BUFSIZE, memtype);
         if (buf[i] == NULL) {
-            printf("  AllocMem %x (%x) fail\n", BUFSIZE, memtype);
+            report_allocmem_fail(BUFSIZE, memtype);
             goto allocmem_fail;
         }
     }
@@ -5317,7 +5369,7 @@ test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
                 continue;
             g_ibuf[bnum] = AllocMemType(bufsize + align, memtypex);
             if (g_ibuf[bnum] == NULL) {
-                printf("  AllocMem %x (%x) fail\n", bufsize + align, memtypex);
+                report_allocmem_fail(bufsize + align, memtypex);
                 rc = ENOMEM;
                 goto integrity_fail;
             }
@@ -5393,6 +5445,7 @@ test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
             rc = test_integrity_butterfly(tio, bufsize);
             break;
     }
+    g_turn_motor_off = 1;
 
 integrity_fail:
     close_device(tio);
@@ -5660,7 +5713,15 @@ main(int argc, char *argv[])
                                 memtype = MEMTYPE_24BIT;
                             } else if (strncasecmp(argv[arg],
                                                    "zorro", 5) == 0) {
-                                memtype = MEMTYPE_ZORRO;
+                                if ((strcmp(argv[arg] + 5, "2") == 0) ||
+                                    (strcasecmp(argv[arg] + 5, "ii") == 0)) {
+                                    memtype = MEMTYPE_ZORRO2;
+                                } else if ((strcmp(argv[arg] + 5, "3") == 0) ||
+                                     (strcasecmp(argv[arg] + 5, "iii") == 0)) {
+                                    memtype = MEMTYPE_ZORRO3;
+                                } else {
+                                    memtype = MEMTYPE_ZORRO;
+                                }
                             } else if (strncasecmp(argv[arg], "copr", 3) == 0) {
                                 memtype = MEMTYPE_COPROC;
                             } else if (strncasecmp(argv[arg], "acce", 4) == 0) {
@@ -5676,8 +5737,8 @@ main(int argc, char *argv[])
                             }
                         } else {
                             printf("-%s requires an argument\n", ptr);
-                            printf("    One of: chip, fast, 24bit, zorro, "
-                                   "accel, coproc, or <addr>\n");
+                            printf("    One of: chip, fast, 24bit, mb, "
+                                   "zorro[2|3], accel, coproc, or <addr>\n");
                             exit(RETURN_ERROR);
                         }
                         break;
@@ -5771,7 +5832,7 @@ got_unit:
     for (bnum = 0; bnum < ARRAY_SIZE(g_tbuf); bnum++) {
         g_tbuf[bnum] = (uint8_t *) AllocMemType(BUFSIZE, memtype);
         if (g_tbuf[bnum] == NULL) {
-            printf("  AllocMem %x (%x) fail\n", BUFSIZE, memtype);
+            report_allocmem_fail(BUFSIZE, memtype);
             goto allocmem_fail;
         }
     }
