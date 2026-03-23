@@ -60,22 +60,22 @@ Testing with Zorro memory
     write  32 KB xfers          4031 KB/sec
 ```
 
+Normally, the destructive test will still attempt to read the data
+beforehand and write it back after completing the test. Adding a
+second `-d` option will skip the read and restore. This will speed
+up the test, but not affect the reported performance.
+
 Sometimes there is a type of memory which is at a specific range
-of addresses, and you want to use an address in that range.
-With the -m option, you may both discover free memory and specify
-the exact address to use. Use the `-m -` argument to show memory
-blocks in the free list.
+of addresses, and you want to run the benchmark specifally against
+that memoory. You should use an address in that range which is not
+currently allocated. With the -m option, you may both discover free
+memory and specify the exact address to use. Use the `-m -` argument
+to show memory blocks in the free list.
 ```
     9.OS322:> devtest -m -
     Coprocessor RAM at 0x8000000 size=0x8000000
       0x86b6220 0x400
-      0x86ba370 0x200
-      0x86bca90 0x400
-      0x86c8af0 0x220
-      0x86d1af8 0x3b8
       0x86d1ef0 0x230
-      0x8766bd0 0xa08
-      0x876d6c8 0x1650
       0x87892c0 0x7876d40
     MB RAM at 0x7000000 size=0x1000000
       0x7000020 0xffffe0
@@ -83,14 +83,53 @@ blocks in the free list.
       0x40000020 0xfffffe0
     Zorro III RAM at 0x60000000 size=0x10000000
       0x60000020 0xfffffe0
+    Zorro II RAM at 0x2000000 size=0x2000000
+      0x200020 0x1fffe0
     Chip RAM at 0x004000 size=0x1fc000
       0x0202d8 0x1dfd28
 ```
 
-Use the ```-m <address>``` option to specify a particular block of memory.
-Example:
+Use the ```-m <address>``` option to specify a particular block or type
+of memory.
+Examples:
 ```
     9.OS322:> devtest a4091.device 1 -bd -m 0x60000020
+```
+```
+    9.OS322:> devtest a4091.device 1 -bd -m zorro2
+```
+
+Adding a second `-b` option will cause devtest to also measure
+latency of a variety of packets. Example:
+```
+    9.OS322:> devtest -bbd a4091.device 1
+    Test a4091.device 1 with Coprocessor RAM
+    read  512 KB xfers          5995 KB/sec
+    read  128 KB xfers          5768 KB/sec
+    read   32 KB xfers          4906 KB/sec
+    write 512 KB xfers          5800 KB/sec
+    write 128 KB xfers          5027 KB/sec
+    write  32 KB xfers          4020 KB/sec
+    OpenDevice / CloseDevice    2.090 ms
+    OpenDevice multiple         0.003 ms
+    CloseDevice multiple        0.001 ms
+    TD_GETGEOMETRY sequential   2.021 ms
+    TD_GETGEOMETRY parallel     1.100 ms
+    TD_CHANGENUM                0.006 ms
+    TD_CHANGENUM quick          0.006 ms
+    CMD_INVALID                 0.006 ms
+    CMD_START                   1.001 ms
+    CMD_READ butterfly average  1.063 ms
+    CMD_READ butterfly far      1.057 ms
+    CMD_READ butterfly constant 1.058 ms
+    CMD_READ sequential         2.077 ms
+    CMD_READ parallel           2.059 ms
+    HD_SCSICMD read sequential  2.072 ms
+    HD_SCSICMD read parallel    2.058 ms
+    CMD_WRITE sequential        3.052 ms
+    CMD_WRITE parallel          3.034 ms
+    HD_SCSICMD write sequential 3.054 ms
+    HD_SCSICMD write parallel   3.036 ms
 ```
 
 ## 3. Packet support
@@ -136,38 +175,11 @@ Example:
     TD_MOTOR ON        Success
     TD_MOTOR OFF       Success
 ```
-Adding a second `-b` option will cause devtest to also measure
-latency of a variety of packets. Example:
-```
-    9.OS322:> devtest -bbd a4091.device 1
-    Test a4091.device 1 with Coprocessor RAM
-    read  512 KB xfers          5995 KB/sec
-    read  128 KB xfers          5768 KB/sec
-    read   32 KB xfers          4906 KB/sec
-    write 512 KB xfers          5800 KB/sec
-    write 128 KB xfers          5027 KB/sec
-    write  32 KB xfers          4020 KB/sec
-    OpenDevice / CloseDevice    2.090 ms
-    OpenDevice multiple         0.003 ms
-    CloseDevice multiple        0.001 ms
-    TD_GETGEOMETRY sequential   2.021 ms
-    TD_GETGEOMETRY parallel     1.100 ms
-    TD_CHANGENUM                0.006 ms
-    TD_CHANGENUM quick          0.006 ms
-    CMD_INVALID                 0.006 ms
-    CMD_START                   1.001 ms
-    CMD_READ butterfly average  1.063 ms
-    CMD_READ butterfly far      1.057 ms
-    CMD_READ butterfly constant 1.058 ms
-    CMD_READ sequential         2.077 ms
-    CMD_READ parallel           2.059 ms
-    HD_SCSICMD read sequential  2.072 ms
-    HD_SCSICMD read parallel    2.058 ms
-    CMD_WRITE sequential        3.052 ms
-    CMD_WRITE parallel          3.034 ms
-    HD_SCSICMD write sequential 3.054 ms
-    HD_SCSICMD write parallel   3.036 ms
-```
+
+Adding a second `-t` option will cause devtest to test additional
+packet types. Some packets may cause your media to eject or trigger
+known bugs in Amiga device drivers.
+
 
 ## 4. Device Geometry
 On the Amiga, there are multiple methods to acquire a drive's physical
@@ -185,14 +197,35 @@ by devtest.
     Mode Page 0x04                         261  255
 ```
 
-Not all drivers or devices support all commands or mode pages. A good example
-is SCSI READ_CAPACITY_16. This command is practically unnecessary for any
-drive smaller than 2 TB. It first appeared in the SCSI specification in the
-early 2000's, so older drives will definitely not support it.
+TD_GETGEOMETRY is implemented by the Amiga device driver. It is the
+responsibility of the driver to acquire details from the device to fill
+the DriveGeometry structure. It is known that Commodore's scsi.device
+for IDE is sometimes not able to acquire geometry information from CF
+drives, and may fail this command.
 
-The latest version of devtest allows you to specify a device or volume name
-instead of a driver and unit. Additional details are provided when a device
-or volume name is specified.
+Inquiry is a SCSI INQUIRY, sent to the drive using SCSI Direct. The only
+details reported by INQUIRY which are relevant here are the drive type
+and removable flag.
+
+READ_CAPACITY_10 is the SCSI READ_CAPACITY_10 result. Some very old drives
+(SASI) do not support this command, but nearly all drives from the 90's
+and newer do.
+
+READ_CAPACITY_16 is unnecessary and likely unimplemented for any drive
+smaller than 2 TB. It first appeared in the SCSI specification in the early
+2000's, so older drives will definitely not support it. This command is
+supported by PiSCSI regardless of the exported device size.
+
+Read-to capacity is implemented by devtest as a as-fast-as-possible means
+to determine the actual readable capacity of the drive. It uses a search
+based on power-of-two sector addresses.
+
+Many SCSI drives support mode pages, and depending on the specific page,
+provide details such as the number of cylinders, heads, and sectors that
+are present on the device.
+
+You may specify a device or volume name instead of a driver and unit.
+Additional details are provided when a device or volume name is specified.
 ```
     9.OS322:> devtest -g Work:
                      SSize TotalSectors    Cyl Head  Sect DType Removable
@@ -274,15 +307,20 @@ Some items to note:
    never updated by the SDMAC on the read back from disk.
 
 The default mode of the integrity test is to generate a pseudo-random pattern
-for the write data. There are two other generated data modes.
-If -ii is specified, the written data will be the byte offset of the data
-within the buffer.
-    Example: 0x00, 0x01, 0x02, ... 0xfe, 0xff, 0x00, 0x01 ...
+for the write data, alternating between the random values and inverted random
+values. There are two other generated data modes. If -ii is specified, the
+written data will be the byte offset of the data within the buffer.
+    0x00, 0x01, 0x02, ... 0xfe, 0xff, 0x00, 0x01 ...
+and alternate:
+    0xff, 0xfe, 0xfd, ... 0x01, 0x00, 0xff, 0xfe ...
 
-If -iii is specified, the written data will be one of 0xa5, 0x5a, 0xc3, 0x3c,
-0x81, 0x00, 0xff, in a rotating cycle. The fact that there are 7 values in
-the -iii mode is by design. The prime will cause different power-of-two
-addresses to experience different data patterns.
+If -iii is specified, the written data will be one of 7 specific values
+in a rotating cycle. The fact that there are 7 values (a prime number) in
+the -iii mode is by design. This will cause different power-of-two
+addresses to experience different data patterns. Pattern values:
+    0xa5, 0x5a, 0xc3, 0x3c, 0x81, 0x00, 0xff
+and alternate:
+    0x5a, 0xa5, 0x3c, 0xc3, 0x7e, 0xff, 0x00
 
 The simple integrity test, as shown above, performs a sequential check of
 all media on the device. At each pass in destructive mode, it writes a chunk,
@@ -320,4 +358,4 @@ data match what was previously read.
     Pass 66  2020-03-30 15:21:15
 ...
 ```
-The above is test ran at about 1 MB/sec.
+The above test ran at about 1 MB/sec.

@@ -405,6 +405,7 @@ usage(void)
            "usage: devtest <options> <x.device> <unit>\n"
            "   -b                    benchmark device performance "
                     "[-bb tests latency]\n"
+           "   -B <tsize>[,<#tio>]   set benchmark arguments, default: 512k,4\n"
            "   -c <cmd>[(arg,...)]   test a specific device driver request\n"
            "   -d                    also do destructive operations (write)\n"
 // Undocumented: -dd skips save/restore of data with -i integrity test
@@ -420,7 +421,8 @@ usage(void)
            "   -mm <addr>            "
                     "use specific address without allocation by OS\n"
            "   -o                    test open/close\n"
-           "   -p                    probe SCSI bus for devices\n"
+           "   -p                    probe SCSI bus for devices "
+                    "(unit is optional)\n"
            "   -t                    test all packet types (basic, TD64, NSD);"
                     " -tt=more\n"
            "   -y                    answer all prompts with 'yes'\n",
@@ -677,7 +679,7 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
             break;
     }
     if (g_verbose > 1)
-        printf("Alloc %p\n", addr);
+        printf("Alloc %p %u\n", addr, byteSize);
     return (addr);
 }
 
@@ -1491,8 +1493,12 @@ static void
 print_perf_type(int is_write, uint xfer_size)
 {
     if (g_verbose == 0) {
-        printf("%s %3u KB xfers ", is_write ? "write" : "read ",
-               xfer_size / 1024);
+        printf("%s ", is_write ? "write" : "read ");
+        if (xfer_size > 1024)
+            printf("%3u KB ", xfer_size / 1024);
+        else
+            printf("%3u byte ", xfer_size);
+        printf("xfers ");
         fflush(stdout);
         fflush(NULL);  // gcc bug? fflush(stdout) doesn't seem to work
     }
@@ -2228,7 +2234,8 @@ need_delete_port:
 }
 
 #define PERF_BUF_SIZE (512 << 10)
-#define NUM_TIO 4
+#define NUM_TIO       4
+#define MAX_NUM_TIO   32
 
 static void
 print_perf(uint ttime, uint freq, uint xfer_kb, int is_write, uint xfer_size)
@@ -2265,38 +2272,42 @@ print_perf(uint ttime, uint freq, uint xfer_kb, int is_write, uint xfer_size)
     }
 }
 
+static uint32_t user_perf_size = 0;
+static uint     user_num_tio   = 0;
+
 static int
-run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
-              uint32_t bufsize)
+run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
+              uint32_t bufsize, uint num_tio)
 {
     int xfer;
     int xfer_good;
-    int i;
+    uint i;
     int rc = 0;
-    uint8_t issued[NUM_TIO];
-    int cur = 0;
+    uint32_t issued;
+    uint cur = 0;
     uint32_t pos;
     struct EClockVal stime;
     struct EClockVal etime;
     uint32_t freq;
     uint32_t diff_ticks;
+    uint64_t xfer_total;
 
     int rep;
 
     for (rep = 0; rep < 10; rep++) {
         pos = 0;
-        memset(issued, 0, sizeof (issued));
+        issued = 0;
 
         ReadEClock(&stime);
 
         print_perf_type((iocmd == CMD_READ) ? 0 : 1, bufsize);
         xfer_good = 0;
         for (xfer = 0; xfer < 50; xfer++) {
-            if (issued[cur]) {
+            if (issued & BIT(cur)) {
                 int failcode = WaitIO((struct IORequest *) tio[cur]);
                 if (failcode == 0)
                     failcode = tio[cur]->iotd_Req.io_Error;
-                issued[cur] = 0;
+                issued &= ~BIT(cur);
                 if (failcode == 0) {
                     xfer_good++;
                 } else {
@@ -2321,17 +2332,17 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
             tio[cur]->iotd_Req.io_Length = bufsize;
             tio[cur]->iotd_Req.io_Offset = pos;
             SendIO((struct IORequest *) tio[cur]);
-            issued[cur] = 1;
+            issued |= BIT(cur);
             pos += bufsize;
-            if (++cur >= NUM_TIO)
+            if (++cur >= num_tio)
                 cur = 0;
         }
-        for (i = 0; i < NUM_TIO; i++) {
-            if (issued[cur]) {
+        for (i = 0; i < num_tio; i++) {
+            if (issued & BIT(cur)) {
                 int failcode = WaitIO((struct IORequest *) tio[cur]);
                 if (failcode == 0)
                     failcode = tio[cur]->iotd_Req.io_Error;
-                issued[cur] = 0;
+                issued &= ~BIT(cur);
                 if (failcode == 0) {
                     xfer_good++;
                 } else {
@@ -2341,14 +2352,15 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
                     rc++;
                 }
             }
-            if (++cur >= NUM_TIO)
+            if (++cur >= num_tio)
                 cur = 0;
         }
 
         freq = ReadEClock(&etime);
         diff_ticks = diff_e_clock(&stime, &etime);
 
-        print_perf(diff_ticks, freq, bufsize / 1000 * xfer_good,
+        xfer_total = (uint64_t) bufsize * (uint64_t) xfer_good / 1000;
+        print_perf(diff_ticks, freq, (uint) xfer_total,
                    (iocmd == CMD_READ) ? 0 : 1, bufsize);
         bufsize >>= 2;
         if (bufsize < 16384)
@@ -2359,6 +2371,8 @@ run_bandwidth(UWORD iocmd, struct IOExtTD *tio[NUM_TIO], uint8_t *buf[NUM_TIO],
             rc++;
             break;
         }
+        if (user_perf_size != 0)
+            break;  // Only run the specified size
     }
 
     return (rc);
@@ -2456,13 +2470,21 @@ show_memlist(void)
 static int
 drive_benchmark(int do_destructive, uint32_t memtype)
 {
-    struct IOExtTD *tio[NUM_TIO];
-    uint8_t *buf[NUM_TIO];
-    uint8_t opened[NUM_TIO];
+    struct IOExtTD *tio[MAX_NUM_TIO];
+    uint8_t *buf[MAX_NUM_TIO];
+    uint32_t opened;
     uint32_t perf_buf_size = PERF_BUF_SIZE;
     struct MsgPort *mp;
     size_t i;
     int rc = 0;
+    uint num_tio = NUM_TIO;
+
+    if (user_perf_size != 0)
+        perf_buf_size = user_perf_size;
+    if (user_num_tio != 0)
+        num_tio = user_num_tio;
+    if (num_tio > MAX_NUM_TIO)
+        num_tio = MAX_NUM_TIO;
 
     mp = CreatePort(0, 0);
     if (mp == NULL) {
@@ -2471,7 +2493,7 @@ drive_benchmark(int do_destructive, uint32_t memtype)
     }
 
     memset(tio, 0, sizeof (tio));
-    for (i = 0; i < ARRAY_SIZE(tio); i++) {
+    for (i = 0; i < num_tio; i++) {
         tio[i] = (struct IOExtTD *) CreateExtIO(mp, sizeof (struct IOExtTD));
         if (tio[i] == NULL) {
             printf("Failed to create tio struct\n");
@@ -2480,20 +2502,20 @@ drive_benchmark(int do_destructive, uint32_t memtype)
         }
     }
 
-    memset(opened, 0, sizeof (opened));
-    for (i = 0; i < ARRAY_SIZE(tio); i++) {
+    opened = 0;
+    for (i = 0; i < num_tio; i++) {
         if ((rc = open_device(tio[i])) != 0) {
             printf("Open %s Unit %u: ", g_devname, g_unitno);
             print_fail_nl(rc);
             rc = 1;
             goto opendevice_fail;
         }
-        opened[i] = 1;
+        opened |= BIT(i);
     }
 
     memset(buf, 0, sizeof (buf));
 try_again:
-    for (i = 0; i < ARRAY_SIZE(buf); i++) {
+    for (i = 0; i < num_tio; i++) {
         uint32_t amemtype = memtype;
         if (amemtype > 0x10000)
             amemtype += perf_buf_size * i;
@@ -2523,30 +2545,30 @@ try_again:
     printf("Test %s %u with %s RAM",
            g_devname, g_unitno, memtype_str((uint32_t) buf[0]));
     if (g_verbose) {
-        for (i = 0; i < ARRAY_SIZE(buf); i++)
+        for (i = 0; i < num_tio; i++)
             printf(" %08x", (uint32_t) buf[i]);
     }
     printf("\n");
 
-    rc += run_bandwidth(CMD_READ, tio, buf, perf_buf_size);
+    rc += run_bandwidth(CMD_READ, tio, buf, perf_buf_size, num_tio);
 
     if (do_destructive && (rc == 0))
-        rc += run_bandwidth(CMD_WRITE, tio, buf, perf_buf_size);
+        rc += run_bandwidth(CMD_WRITE, tio, buf, perf_buf_size, num_tio);
 
     g_turn_motor_off = 1;
 
 allocmem_fail:
-    for (i = 0; i < ARRAY_SIZE(buf); i++)
+    for (i = 0; i < num_tio; i++)
         if (buf[i] != NULL)
             FreeMemType(buf[i], perf_buf_size);
 
 opendevice_fail:
-    for (i = 0; i < ARRAY_SIZE(tio); i++)
-        if (opened[i] != 0)
+    for (i = 0; i < num_tio; i++)
+        if ((opened & BIT(i)) != 0)
             close_device(tio[i]);
 
 create_tio_fail:
-    for (i = 0; i < ARRAY_SIZE(tio); i++)
+    for (i = 0; i < num_tio; i++)
         if (tio[i] != NULL)
             DeleteExtIO((struct IORequest *) tio[i]);
 
@@ -2567,14 +2589,9 @@ do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
 
-#if 0
-    /*
-     * Disabling this might break end of device detection.
-     * Limited testing says that this is not needed.
-     */
+    /* Ensure read does not go past end of partition (only in partition mode */
     if ((g_devend != 0) && (offset + len > g_devend))
         return (1);
-#endif
 
     if (((offset + len) >> 32) > 0) {
         /* Need TD64 or NSD */
@@ -5544,11 +5561,45 @@ get_cmd(const char *str, args_t *args)
     exit(RETURN_ERROR);
 }
 
+static void
+parse_tsize(const char *arg, uint *tsize, int *pos)
+{
+    *pos = 0;
+    if ((sscanf(arg, "%i%n", (int *) tsize, pos) != 1) || (*pos == 0)) {
+        printf("Invalid transfer size %s\n", arg);
+        exit(RETURN_ERROR);
+    }
+    switch (arg[*pos]) {
+        case '\0':
+            break;
+        case ',':
+            break;
+        case 'k':
+        case 'K':
+            *tsize <<= 10;
+            (*pos)++;
+            if ((arg[*pos] == 'b') || (arg[*pos] == 'B'))
+                (*pos)++;
+            break;
+        case 'm':
+        case 'M':
+            *tsize <<= 20;
+            (*pos)++;
+            if ((arg[*pos] == 'b') || (arg[*pos] == 'B'))
+                (*pos)++;
+            break;
+        default:
+            printf("Invalid transfer size %s\n", arg);
+            exit(RETURN_ERROR);
+    }
+}
+
 int
 main(int argc, char *argv[])
 {
     int arg;
     int rc;
+    int pos;
     uint bnum;
     uint loop = 0;
     uint loops = 1;
@@ -5584,6 +5635,27 @@ main(int argc, char *argv[])
                     case 'b':
                         flag_benchmark++;
                         break;
+                    case 'B':
+                        if (flag_benchmark == 0)
+                            flag_benchmark++;
+                        if (++arg >= argc) {
+                            printf("-%s requires an argument\n", ptr);
+                            printf("    Transfer size: 512 1M 64k etc\n"
+                                   "    optional alignment: ,1 ,2 ,3 etc\n");
+                            exit(RETURN_ERROR);
+                        }
+                        parse_tsize(argv[arg], &user_perf_size, &pos);
+                        if (argv[arg][pos] == ',') {
+                            char *str = argv[arg] + pos + 1;
+                            if ((sscanf(str, "%i%n", (int *) &user_num_tio,
+                                        &pos) != 1) || (pos == 0) ||
+                                (user_num_tio < 1) ||
+                                (user_num_tio > MAX_NUM_TIO)) {
+                                printf("Invalid TIO count %s\n", str);
+                                exit(RETURN_ERROR);
+                            }
+                        }
+                        break;
                     case 'c':
                         if (++arg < argc) {
                             test_cmd_mask[test_cmd_count] |=
@@ -5609,38 +5681,7 @@ main(int argc, char *argv[])
                         if (flag_integrity++ > 0)
                             break;
                         if (++arg < argc) {
-                            int pos = 0;
-                            if ((sscanf(argv[arg], "%i%n", (int *) &tsize,
-                                        &pos) != 1) || (pos == 0)) {
-                                printf("Invalid transfer size %s\n", argv[arg]);
-                                exit(RETURN_ERROR);
-                            }
-                            switch (argv[arg][pos]) {
-                                case '\0':
-                                    break;
-                                case ',':
-                                    break;
-                                case 'k':
-                                case 'K':
-                                    tsize <<= 10;
-                                    pos++;
-                                    if ((argv[arg][pos] == 'b') ||
-                                        (argv[arg][pos] == 'B'))
-                                        pos++;
-                                    break;
-                                case 'm':
-                                case 'M':
-                                    tsize <<= 20;
-                                    pos++;
-                                    if ((argv[arg][pos] == 'b') ||
-                                        (argv[arg][pos] == 'B'))
-                                        pos++;
-                                    break;
-                                default:
-                                    printf("Invalid transfer size %s\n",
-                                           argv[arg]);
-                                    exit(RETURN_ERROR);
-                            }
+                            parse_tsize(argv[arg], &tsize, &pos);
                             if (argv[arg][pos] == ',') {
                                 char *str = argv[arg] + pos + 1;
                                 if ((sscanf(str, "%i%n", (int *) &talign,
@@ -5792,8 +5833,9 @@ main(int argc, char *argv[])
         (are_you_sure("Destructive test") == FALSE)) {
         exit(RETURN_ERROR);
     }
-    if (strchr(g_devname, ':')) {
+    if ((g_devname != NULL) && (strchr(g_devname, ':') != 0)) {
         struct FileSysStartupMsg *startup = find_startup(g_devname);
+        static char unitbuf[10];
         if (startup == NULL) {
             printf("Error opening %s\n", g_devname);
             exit(RETURN_ERROR);
@@ -5811,6 +5853,8 @@ main(int argc, char *argv[])
         }
         if (g_verbose)
             printf("Device %s %u\n", g_devname, g_unitno);
+        sprintf(unitbuf, "%u", g_unitno);
+        unit = unitbuf;
         goto got_unit;
     }
     if (unit == NULL) {
