@@ -4749,20 +4749,24 @@ find_startup(char *name)
     }
 
     if (found) {
-        startup = (struct FileSysStartupMsg *) BTOC(devinfo->dvi_Startup);
+        if (devinfo->dvi_Type == DLT_DEVICE) {
+            startup = (struct FileSysStartupMsg *) BTOC(devinfo->dvi_Startup);
+        } else {
+            startup = NULL;
+        }
         if (startup == NULL) {
-            /* Try searching for a volume which matches the task pointer */
+            /* Try searching for a device which matches the task pointer */
             APTR task = devinfo->dvi_Task;
             devinfo  = (struct DevInfo *) BTOC(dosinfo->di_DevInfo);
             while (devinfo != NULL) {
                 if ((devinfo->dvi_Task == task) &&
-                    (devinfo->dvi_Type == DLT_DEVICE))
+                    (devinfo->dvi_Type == DLT_DEVICE)) {
+                    startup = (struct FileSysStartupMsg *)
+                        BTOC(devinfo->dvi_Startup);
                     break;
+                }
                 devinfo = (struct DevInfo *) BTOC(devinfo->dvi_Next);
             }
-            if (devinfo != NULL)
-                startup = (struct FileSysStartupMsg *)
-                    BTOC(devinfo->dvi_Startup);
         }
     } else {
         startup = NULL;
