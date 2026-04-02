@@ -5442,7 +5442,7 @@ test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
                     }
                 }
             } else if (bnum == 1) {
-                for (cur = 0; cur < bufsize / 4; cur++)
+                for (cur = 0; cur < bufsize; cur++)
                     g_align[bnum][cur] = ~g_align[0][cur];
             } else if (bnum == 2) {
                 /* Pattern the receive buffer */
