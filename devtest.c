@@ -4615,7 +4615,6 @@ test_packets(int do_destructive, int test_level,
     struct IOExtTD *tio;
     struct MsgPort *mp = NULL;
     uint8_t *buf[BUF_COUNT];
-    uint64_t test_mask;
     uint lun = g_unitno / 10;
     size_t i;
 
@@ -4651,7 +4650,7 @@ test_packets(int do_destructive, int test_level,
 
     if (test_count == 0) {
         /* Run all available tests */
-        test_mask = 0xffffffffffffffff;
+        uint64_t test_mask = 0xffffffffffffffff;
         cur_test_args = NULL;
         if (test_level <= 1) {
             /* Only do extended commands if requested "-tt" */
@@ -4694,7 +4693,7 @@ test_packets(int do_destructive, int test_level,
         }
     }
 
-    if (test_mask == 0) {
+    if (test_count == 0) {
         /*
          * Ignore individual test failures above, since no driver passes all
          * tests. If specific tests were requested, then the failure status
@@ -5442,7 +5441,7 @@ test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
                     }
                 }
             } else if (bnum == 1) {
-                for (cur = 0; cur < bufsize / 4; cur++)
+                for (cur = 0; cur < bufsize; cur++)
                     g_align[bnum][cur] = ~g_align[0][cur];
             } else if (bnum == 2) {
                 /* Pattern the receive buffer */
