@@ -4314,6 +4314,46 @@ buf_alloc_failed:
     return (0);
 }
 
+static int
+test_cmd_update(struct IOExtTD *tio)
+{
+    int rc;
+
+    /* Spin up device's motor */
+    tio->iotd_Req.io_Command = CMD_UPDATE;
+    tio->iotd_Req.io_Actual  = 0;
+    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Length  = 1;
+    tio->iotd_Req.io_Data    = NULL;
+    tio->iotd_Req.io_Flags   = 0;
+    tio->iotd_Req.io_Error   = 0xa5;
+    print_test_name("CMD_UPDATE");
+    rc = DoIO((struct IORequest *) tio);
+    print_fail_nl(rc);
+
+    return (rc);
+}
+
+static int
+test_cmd_clear(struct IOExtTD *tio)
+{
+    int rc;
+
+    /* Spin up device's motor */
+    tio->iotd_Req.io_Command = CMD_CLEAR;
+    tio->iotd_Req.io_Actual  = 0;
+    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Length  = 1;
+    tio->iotd_Req.io_Data    = NULL;
+    tio->iotd_Req.io_Flags   = 0;
+    tio->iotd_Req.io_Error   = 0xa5;
+    print_test_name("CMD_CLEAR");
+    rc = DoIO((struct IORequest *) tio);
+    print_fail_nl(rc);
+
+    return (rc);
+}
+
 #define UBIT(x) (1ULL << (x))
 
 #define TEST_CMD_GETGEOMETRY    UBIT(0)
@@ -4356,6 +4396,8 @@ buf_alloc_failed:
 #define TEST_TD_RAWWRITE        UBIT(37)
 #define TEST_ETD_RAWREAD        UBIT(38)
 #define TEST_ETD_RAWWRITE       UBIT(39)
+#define TEST_CMD_UPDATE         UBIT(40)
+#define TEST_CMD_CLEAR          UBIT(41)
 
 static const test_cmds_t test_cmds[] = {
     { "CHANGEINT",   2, TEST_ADDREMCHANGEINT, NULL,
@@ -4429,6 +4471,10 @@ static const test_cmds_t test_cmds[] = {
                         "NSCMD_TD_FORMAT64 NSD format device" },
     { "NSDEFORMAT",  0, TEST_NSCMD_ETD_FORMAT64, NULL,
                         "NSCMD_ETD_FORMAT64 NSD extended format" },
+    { "UPDATE",      0, TEST_CMD_UPDATE, NULL,
+                        "CMD_UPDATE flushes the floppy track buffer" },
+    { "CLEAR",       0, TEST_CMD_CLEAR, NULL,
+                        "CMD_CLEAR discards the floppy track buffer" },
     { "MOTOROFF",    2, TEST_TD_MOTOR_OFF, NULL,
                         "TD_MOTOR OFF stop motor (spin down)" },
     { "MOTORON",     2, TEST_TD_MOTOR_ON, NULL,
@@ -4470,6 +4516,11 @@ test_packets_ll(uint64_t test_mask, struct IOExtTD *tio)
         test_mask &= ~TEST_TD_RAWWRITE;
         rc++;
     }
+    if ((test_mask & TEST_CMD_UPDATE) && test_cmd_update(tio))
+        rc++;
+    if ((test_mask & TEST_CMD_CLEAR) && test_cmd_clear(tio))
+        rc++;
+
     if (0 && (test_mask & TEST_TD_RAWWRITE) && test_td_rawwrite(tio))
         rc++;
     if ((test_mask & TEST_HD_SCSICMD_INQ) && test_hd_scsicmd_inquiry(tio))
@@ -4666,7 +4717,8 @@ test_packets(int do_destructive, int test_level,
                            TEST_TD_FORMAT | TEST_ETD_FORMAT |
                            TEST_TD_FORMAT64 |
                            TEST_NSCMD_TD_FORMAT64 | TEST_NSCMD_ETD_FORMAT64 |
-                           TEST_TD_RAWWRITE);
+                           TEST_TD_RAWWRITE |
+                           TEST_CMD_CLEAR);
         }
         rc = test_packets_ll(test_mask, tio);
     } else {
