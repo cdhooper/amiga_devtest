@@ -752,7 +752,7 @@ do_scsidirect_cmd(struct IOExtTD *tio, scsi_generic_t *cmd, uint cmdlen,
 {
     int            rc;
     void          *res;
-    struct SCSICmd scmd;
+    struct SCSICmd *scmd;
 
     if (reslen > 0) {
         res = AllocMemType(reslen, memtype);
@@ -765,19 +765,33 @@ do_scsidirect_cmd(struct IOExtTD *tio, scsi_generic_t *cmd, uint cmdlen,
     } else {
         res = NULL;
     }
-    setup_scsidirect_cmd(&scmd, cmd, cmdlen, res, reslen);
+
+    scmd = AllocMemType(sizeof (*scmd), memtype);
+    if (scmd == NULL) {
+        if (reslen != 0)
+            FreeMemType(res, reslen);
+        report_allocmem_fail(sizeof (*scmd), memtype);
+        g_sense_length = 0;
+        return (ENOMEM);
+    }
+
+    setup_scsidirect_cmd(scmd, cmd, cmdlen, res, reslen);
     tio->iotd_Req.io_Command = HD_SCSICMD;
-    tio->iotd_Req.io_Length  = sizeof (scmd);
-    tio->iotd_Req.io_Data    = &scmd;
+    tio->iotd_Req.io_Length  = sizeof (*scmd);
+    tio->iotd_Req.io_Data    = scmd;
 
     rc = DoIO((struct IORequest *) tio);
+    g_sense_length = scmd->scsi_SenseActual;
+    tio->iotd_Req.io_Data = NULL;
+    tio->iotd_Req.io_Length = 0;
+    FreeMemType(scmd, sizeof (*scmd));
+
     if (rc != 0) {
         if (reslen != 0) {
             FreeMemType(res, reslen);
             res = NULL;
         }
     }
-    g_sense_length = scmd.scsi_SenseActual;
     if (resp != NULL)
         *resp = res;
     return (rc);
