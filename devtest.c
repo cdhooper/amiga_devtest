@@ -57,17 +57,11 @@ struct Device   *TimerBase;
 #endif
 
 /*
- * ULONG has changed from NDK 3.9 to NDK 3.2.
- * However, PRI*32 did not. What is the right way to implement this?
+ * uint32_t may be unsigned int or unsigned long, 
+ * depending on the toolchain.
  */
-#if INCLUDE_VERSION < 47
-#undef PRIu32
-#define PRIu32 "lu"
-#undef PRId32
-#define PRId32 "ld"
-#undef PRIx32
-#define PRIx32 "lx"
-#endif
+#define U32(v)  ((unsigned int)(uint32_t)(v))
+
 
 /*
  * Trackdisk-64 enhanced commands
@@ -679,7 +673,7 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
             break;
     }
     if (g_verbose > 1)
-        printf("Alloc %p %u\n", addr, byteSize);
+        printf("Alloc %p %u\n", addr, U32(byteSize));
     return (addr);
 }
 
@@ -1117,14 +1111,14 @@ scsi_probe_unit(uint unit, struct IOExtTD *tio)
             return (erc);
         if (erc == 0) {
             printf(" %-*.*s %-*.*s %-*.*s %-7s",
-               sizeof (inq_res->vendor),
-               sizeof (inq_res->vendor),
+               (int) sizeof (inq_res->vendor),
+               (int) sizeof (inq_res->vendor),
                trim_spaces(inq_res->vendor, sizeof (inq_res->vendor)),
-               sizeof (inq_res->product),
-               sizeof (inq_res->product),
+               (int) sizeof (inq_res->product),
+               (int) sizeof (inq_res->product),
                trim_spaces(inq_res->product, sizeof (inq_res->product)),
-               sizeof (inq_res->revision),
-               sizeof (inq_res->revision),
+               (int) sizeof (inq_res->revision),
+               (int) sizeof (inq_res->revision),
                trim_spaces(inq_res->revision, sizeof (inq_res->revision)),
                devtype_str((inq_res->device) & SID_TYPE));
             FreeMemType(inq_res, sizeof (*inq_res));
@@ -1276,17 +1270,19 @@ drive_geometry(void)
         blocks = (uint64_t) cyls * g_envec->de_Surfaces *
                  g_envec->de_BlocksPerTrack;
         printf("Partition        %5u %12s %6u %4u %5u  %s %u\n",
-               g_sector_size, llu_to_str(blocks), cyls,
-               g_envec->de_Surfaces, g_envec->de_BlocksPerTrack,
+               U32(g_sector_size), llu_to_str(blocks), U32(cyls),
+               U32(g_envec->de_Surfaces), U32(g_envec->de_BlocksPerTrack),
                g_devname, g_unitno);
         blocks = (uint64_t) g_envec->de_LowCyl *
                  g_envec->de_Surfaces * g_envec->de_BlocksPerTrack;
         printf("Partition-start  %5u %12s %6u\n",
-               g_sector_size, llu_to_str(blocks), g_envec->de_LowCyl);
+               U32(g_sector_size), llu_to_str(blocks),
+               U32(g_envec->de_LowCyl));
         blocks = (uint64_t) (g_envec->de_HighCyl + 1) *
                  g_envec->de_Surfaces * g_envec->de_BlocksPerTrack;
         printf("Partition-end    %5u %12s %6u\n",
-               g_sector_size, llu_to_str(blocks), g_envec->de_HighCyl + 1);
+               U32(g_sector_size), llu_to_str(blocks),
+               U32(g_envec->de_HighCyl + 1));
     }
     printf("TD_GETGEOMETRY ");
     if ((rc = DoIO((struct IORequest *) tio)) != 0) {
@@ -1294,12 +1290,13 @@ drive_geometry(void)
                '-', '-', '-', '-', '-');
         print_fail_nl(rc);
     } else {
-        printf("%7"PRIu32" %12"PRIu32" %6"PRIu32" ",
-               dg.dg_SectorSize, dg.dg_TotalSectors, dg.dg_Cylinders);
-        printf("%*"PRIu32" ",
-               (dg.dg_Cylinders < 1000000) ? 4 : 3, dg.dg_Heads);
-        printf("%5"PRIu32"  0x%02x %s\n",
-               dg.dg_TrackSectors, dg.dg_DeviceType,
+        printf("%7u %12u %6u ",
+               U32(dg.dg_SectorSize), U32(dg.dg_TotalSectors),
+               U32(dg.dg_Cylinders));
+        printf("%*u ",
+               (dg.dg_Cylinders < 1000000) ? 4 : 3, U32(dg.dg_Heads));
+        printf("%5u  0x%02x %s\n",
+               U32(dg.dg_TrackSectors), dg.dg_DeviceType,
                (dg.dg_Flags & DGF_REMOVABLE) ? "Yes" : "No");
         g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
         g_sector_size = dg.dg_SectorSize;
@@ -1341,7 +1338,7 @@ drive_geometry(void)
         last_sector = *(uint32_t *) &cap10->addr;
         sector_size = *(uint32_t *) &cap10->length;
         FreeMemType(cap10, sizeof (*cap10));
-        printf("%5u %12s\n", sector_size, llu_to_str(last_sector + 1));
+        printf("%5u %12s\n", U32(sector_size), llu_to_str(last_sector + 1));
         if (g_devsize == 0) {
             g_devsize = (uint64_t) sector_size * (last_sector + 1);
             g_sector_size = sector_size;
@@ -1358,7 +1355,7 @@ drive_geometry(void)
         last_sector = *(uint64_t *) &cap16->addr;
         sector_size = *(uint32_t *) &cap16->length;
         FreeMemType(cap16, sizeof (*cap16));
-        printf("%5u %12s\n", sector_size, llu_to_str(last_sector + 1));
+        printf("%5u %12s\n", U32(sector_size), llu_to_str(last_sector + 1));
         g_devsize = (uint64_t) sector_size * (last_sector + 1);
         g_sector_size = sector_size;
     }
@@ -2313,7 +2310,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
                 } else {
                     printf("  %s ", (iocmd == CMD_READ) ? "Read" : "Write");
                     print_fail(failcode);
-                    printf(" at 0x%x\n", tio[cur]->iotd_Req.io_Offset);
+                    printf(" at 0x%x\n", U32(tio[cur]->iotd_Req.io_Offset));
                     rc++;
                     break;
                 }
@@ -2348,7 +2345,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
                 } else {
                     printf("  %s ", (iocmd == CMD_READ) ? "Read" : "Write");
                     print_fail(failcode);
-                    printf(" at 0x%x\n", tio[cur]->iotd_Req.io_Offset);
+                    printf(" at 0x%x\n", U32(tio[cur]->iotd_Req.io_Offset));
                     rc++;
                 }
             }
@@ -2431,7 +2428,7 @@ show_memlist(void)
         uint16_t    attr  = mem->mh_Attributes;
         const char *type = memtype_str((uint32_t) mem);
 
-        printf("%s RAM at %p size=0x%x", type, (void *) mem, size);
+        printf("%s RAM at %p size=0x%x", type, (void *) mem, U32(size));
         if (g_verbose) {
             if (attr & MEMF_PUBLIC)
                 printf(" PUBLIC");
@@ -2457,7 +2454,7 @@ show_memlist(void)
                 printf("  %p 0x%x", (void *) chunk, bytes);
                 if ((uintptr_t) chunk + bytes > upper)
                     printf(" ** CORRUPT: 0x%x is maximum size",
-                           upper - (uintptr_t) chunk);
+                           U32(upper - (uintptr_t) chunk));
                 printf("\n");
             }
             if ((uintptr_t) chunk + bytes >= upper)
@@ -2536,7 +2533,7 @@ try_again:
                 printf("%s ", memtype_str((uint32_t) memtype));
             printf("RAM");
             if (memtype > MEMTYPE_MAX)
-                printf(" at 0x%08x", memtype);
+                printf(" at 0x%08x", U32(memtype));
             printf("\n");
             rc = 1;
             goto allocmem_fail;
@@ -2546,7 +2543,7 @@ try_again:
            g_devname, g_unitno, memtype_str((uint32_t) buf[0]));
     if (g_verbose) {
         for (i = 0; i < num_tio; i++)
-            printf(" %08x", (uint32_t) buf[i]);
+            printf(" %08x", U32(buf[i]));
     }
     printf("\n");
 
@@ -2661,10 +2658,10 @@ test_cmd_getgeometry(struct IOExtTD *tio)
 
     rc = do_getgeometry(tio, &dg);
     if (rc == 0) {
-        printf("Success  %"PRIu32" x %"PRIu32"  C=%"PRIu32" H=%"PRIu32" "
-               "S=%"PRIu32" Type=%u%s\n",
-               dg.dg_TotalSectors, dg.dg_SectorSize, dg.dg_Cylinders,
-               dg.dg_Heads, dg.dg_TrackSectors, dg.dg_DeviceType,
+        printf("Success  %u x %u  C=%u H=%u "
+               "S=%u Type=%u%s\n",
+               U32(dg.dg_TotalSectors), U32(dg.dg_SectorSize), U32(dg.dg_Cylinders),
+               U32(dg.dg_Heads), U32(dg.dg_TrackSectors), U32(dg.dg_DeviceType),
                (dg.dg_Flags & DGF_REMOVABLE) ? " Removable" : "");
         g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
         g_sector_size = dg.dg_SectorSize;
@@ -2690,7 +2687,7 @@ test_td_changenum(struct IOExtTD *tio)
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
         g_changenum = tio->iotd_Req.io_Actual;
-        printf("Success  Count=%"PRIu32"\n", tio->iotd_Req.io_Actual);
+        printf("Success  Count=%u\n", U32(tio->iotd_Req.io_Actual));
     } else {
         print_fail_nl(rc);
     }
@@ -2761,8 +2758,8 @@ test_td_getdrivetype(struct IOExtTD *tio)
     print_test_name("TD_GETDRIVETYPE");
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        printf("Success  Type=%"PRIu32" %s\n",
-               tio->iotd_Req.io_Actual,
+        printf("Success  Type=%u %s\n",
+               U32(tio->iotd_Req.io_Actual),
                floppy_type_string(tio->iotd_Req.io_Actual));
     } else {
         print_fail_nl(rc);
@@ -2784,7 +2781,7 @@ test_td_getnumtracks(struct IOExtTD *tio)
     print_test_name("TD_GETNUMTRACKS");
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        printf("Success  Tracks=%"PRIu32"\n", tio->iotd_Req.io_Actual);
+        printf("Success  Tracks=%u\n", U32(tio->iotd_Req.io_Actual));
     } else {
         print_fail_nl(rc);
     }
@@ -2803,13 +2800,13 @@ test_hd_scsicmd_inquiry(struct IOExtTD *tio)
     print_test_name("SCSICMD Inquiry");
     if (rc == 0) {
         printf("Success  V='%.*s' P='%.*s' R='%.*s' DT=0x%x",
-               sizeof (inq_res->vendor),
+               (int) sizeof (inq_res->vendor),
                trim_spaces(inq_res->vendor, sizeof (inq_res->vendor)),
-               sizeof (inq_res->product),
+               (int) sizeof (inq_res->product),
                trim_spaces(inq_res->product, sizeof (inq_res->product)),
-               sizeof (inq_res->revision),
+               (int) sizeof (inq_res->revision),
                trim_spaces(inq_res->revision, sizeof (inq_res->revision)),
-               inq_res->device & SID_TYPE);
+               U32(inq_res->device & SID_TYPE));
         if (inq_res->dev_qual2 & SID_QUAL_LU_NOTPRESENT)
             printf(" Removed");
         else if (inq_res->dev_qual2 & SID_REMOVABLE)
@@ -3130,7 +3127,7 @@ test_nsd_devicequery(struct IOExtTD *tio)
             printf("Unexpected DevQueryFormat %"PRIx32, nsd_r->DevQueryFormat);
             g_has_nsd = 0;
         } else if (nsd_r->DeviceType != NSDEVTYPE_TRACKDISK) {
-            printf("Unexpected DeviceType %x", nsd_r->DeviceType);
+            printf("Unexpected DeviceType %x", U32(nsd_r->DeviceType));
             g_has_nsd = 0;
         } else {
             printf("Success");
@@ -3617,14 +3614,14 @@ test_addremchangeint(struct IOExtTD *tio)
 
     if (int_count_remove != 0) {
         print_test_name("TD_REMOVE");
-        printf("Fail - Premature interrupt: %u\n", int_count_remove);
+        printf("Fail - Premature interrupt: %u\n", U32(int_count_remove));
         if (rc == 0)
             rc = 1;
         int_count_remove = 0;
     }
     if (int_count_addrem != 0) {
         print_test_name("TD_ADDCHANGEINT");
-        printf("Fail - Premature interrupt: %u\n", int_count_addrem);
+        printf("Fail - Premature interrupt: %u\n", U32(int_count_addrem));
         if (rc == 0)
             rc = 1;
         int_count_addrem = 0;
@@ -5677,7 +5674,10 @@ main(int argc, char *argv[])
 
     memset(test_cmd_mask, 0, sizeof (test_cmd_mask));
 #ifndef _DCC
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds="
     SysBase = *(struct ExecBase **)4UL;
+#pragma GCC diagnostic pop
 #endif
     TimerBase = (struct Device *) FindName(&SysBase->DeviceList, TIMERNAME);
     g_e_freq = ReadEClock(&dummy);
@@ -5699,7 +5699,7 @@ main(int argc, char *argv[])
                                    "    optional alignment: ,1 ,2 ,3 etc\n");
                             exit(RETURN_ERROR);
                         }
-                        parse_tsize(argv[arg], &user_perf_size, &pos);
+                        parse_tsize(argv[arg], (uint *)&user_perf_size, &pos);
                         if (argv[arg][pos] == ',') {
                             char *str = argv[arg] + pos + 1;
                             if ((sscanf(str, "%i%n", (int *) &user_num_tio,
@@ -5826,10 +5826,15 @@ main(int argc, char *argv[])
                                                     "motherboard", 4) == 0) ||
                                        (strcasecmp(argv[arg], "mb") == 0)) {
                                 memtype = MEMTYPE_MB;
-                            } else if (sscanf(argv[arg], "%x", &memtype) != 1) {
-                                printf("invalid argument %s for %s\n",
-                                       argv[arg], ptr);
-                                exit(RETURN_ERROR);
+                            } else {
+                                unsigned int memtype_arg;
+
+                                if (sscanf(argv[arg], "%x", &memtype_arg) != 1) {
+                                    printf("invalid argument %s for %s\n",
+                                           argv[arg], ptr);
+                                    exit(RETURN_ERROR);
+                                }
+                                memtype = (uint32_t) memtype_arg;
                             }
                         } else {
                             printf("-%s requires an argument\n", ptr);
