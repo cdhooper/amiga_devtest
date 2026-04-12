@@ -1,8 +1,8 @@
 # Amiga block device test utility (devtest)
 
 This utility interacts directly with an Amiga block device driver to test
-the driver and physical device. There are several different operation types
-that the utility can perform:
+the driver and physical device. There are several operation types that the
+utility can perform:
    * Device probe
    * Performance
    * Packet support
