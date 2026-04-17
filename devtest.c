@@ -19,6 +19,7 @@ const char *version = "\0$VER: devtest " VER " ("__DATE__") \xA9 Chris Hooper";
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <time.h>
 #include <exec/types.h>
 #include <devices/trackdisk.h>
 #include <devices/scsidisk.h>
@@ -1494,7 +1495,12 @@ print_time(void)
     struct tm *tm;
     time_t timet;
     time(&timet);
-    tm = localtime(&timet);
+    /*
+     * AmigaDOS DateStamp() is already local wall-clock time.  Using
+     * localtime() here applies the C library timezone a second time and
+     * can shift the displayed hour.  Decode it as-is.
+     */
+    tm = gmtime(&timet);
     printf("%04d-%02d-%02d %02d:%02d:%02d",
            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
            tm->tm_hour, tm->tm_min, tm->tm_sec);
