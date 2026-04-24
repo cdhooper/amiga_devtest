@@ -13,11 +13,7 @@ CFLAGS  := -Wall -Wextra -Wno-pointer-sign -fomit-frame-pointer
 CFLAGS  += -Wno-strict-aliasing
 CFLAGS  += -Wpedantic -Wno-overflow
 
-# clib2 crashes on exit under Kickstart 2.x
 LDFLAGS := -Xlinker -Map=$(OBJDIR)/$@.map -Wa,-a > $(OBJDIR)/$@.lst -fomit-frame-pointer -lgcc -lc -lamiga -mcrt=clib2
-
-# -noixemul generates significantly larger binaries, but KS 2.x is supported
-#LDFLAGS := -Xlinker -Map=$(OBJDIR)/$@.map -Wa,-a > $(OBJDIR)/$@.lst -fomit-frame-pointer -lgcc -lc -lamiga -noixemul
 
 #CFLAGS += -flto
 #LDFLAGS += -flto

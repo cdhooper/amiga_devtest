@@ -284,6 +284,12 @@ static void report_allocmem_fail(uint bufsize, uint memtype);
 #define IBUF_COUNT    6   // Integrity test buffers
 
 BOOL __check_abort_enabled = 0;       // Disable gcc clib2 ^C break handling
+/*
+ * KS2.x lacks Exec memory pools, so clib2 otherwise tracks malloc chunks
+ * with its own Exec list.  Force the slab allocator; BUFSIZE is 8192, so
+ * keep this larger than standard I/O buffers.
+ */
+unsigned long __slab_max_size = 16384;
 
 static int       g_verbose = 0;       // Verbose output
 static int       g_changenum = 0;     // Current device media change number
