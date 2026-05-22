@@ -39,18 +39,19 @@ different Amiga memory types (default is fastmem).
 Examples:
 ```
     9.OS322:> devtest a4091.device 1 -bd
-    Test a4091.device 1 with Coprocessor RAM
-    read  512 KB xfers          5992 KB/sec
-    read  128 KB xfers          5783 KB/sec
-    read   32 KB xfers          4937 KB/sec
-    write 512 KB xfers          5821 KB/sec
-    write 128 KB xfers          4887 KB/sec
-    write  32 KB xfers          3913 KB/sec
+    Destructive test - are you sure? (y/n) y
+    Test a4091.device 1 with MB RAM
+    read  512 KB xfers          6242 KB/sec (13% CPU)
+    read  128 KB xfers          5781 KB/sec (27% CPU)
+    read   32 KB xfers          4449 KB/sec (60% CPU)
+    write 512 KB xfers          4099 KB/sec (9% CPU)
+    write 128 KB xfers          3358 KB/sec (16% CPU)
+    write  32 KB xfers          3064 KB/sec (41% CPU)
 ```
 
 Testing with Zorro memory
 ```
-    9.OS322:> devtest a4091.device 1 -bd -m zorro
+    9.OS322:> devtest a4091.device 1 -bdyC -m zorro
     Test a4091.device 1 with Zorro III RAM
     read  512 KB xfers          7377 KB/sec
     read  128 KB xfers          7063 KB/sec
@@ -60,13 +61,20 @@ Testing with Zorro memory
     write  32 KB xfers          4031 KB/sec
 ```
 
+In the first example, CPU utilization is reported during the test.
+Determining CPU utilization has a measured effect on performance,
+in the range of 1% to 5%. The -C option can turn off this feature.
+While benchmarking a fast device, that device may consume considerable
+CPU bus bandwidth. This would increase CPU utilization, as the CPU
+needs to wait for access to the bus.
+
 Normally, the destructive test will still attempt to read the data
 beforehand and write it back after completing the test. Adding a
 second `-d` option will skip the read and restore. This will speed
 up the test, but not affect the reported performance.
 
 Sometimes there is a type of memory which is at a specific range
-of addresses, and you want to run the benchmark specifally against
+of addresses, and you want to run the benchmark soecifically against
 that memoory. You should use an address in that range which is not
 currently allocated. With the -m option, you may both discover free
 memory and specify the exact address to use. Use the `-m -` argument
@@ -102,34 +110,34 @@ Examples:
 Adding a second `-b` option will cause devtest to also measure
 latency of a variety of packets. Example:
 ```
-    9.OS322:> devtest -bbd a4091.device 1
-    Test a4091.device 1 with Coprocessor RAM
-    read  512 KB xfers          5995 KB/sec
-    read  128 KB xfers          5768 KB/sec
-    read   32 KB xfers          4906 KB/sec
-    write 512 KB xfers          5800 KB/sec
-    write 128 KB xfers          5027 KB/sec
-    write  32 KB xfers          4020 KB/sec
-    OpenDevice / CloseDevice    2.090 ms
-    OpenDevice multiple         0.003 ms
-    CloseDevice multiple        0.001 ms
-    TD_GETGEOMETRY sequential   2.021 ms
-    TD_GETGEOMETRY parallel     1.100 ms
-    TD_CHANGENUM                0.006 ms
-    TD_CHANGENUM quick          0.006 ms
-    CMD_INVALID                 0.006 ms
-    CMD_START                   1.001 ms
-    CMD_READ butterfly average  1.063 ms
-    CMD_READ butterfly far      1.057 ms
-    CMD_READ butterfly constant 1.058 ms
-    CMD_READ sequential         2.077 ms
-    CMD_READ parallel           2.059 ms
-    HD_SCSICMD read sequential  2.072 ms
-    HD_SCSICMD read parallel    2.058 ms
-    CMD_WRITE sequential        3.052 ms
-    CMD_WRITE parallel          3.034 ms
-    HD_SCSICMD write sequential 3.054 ms
-    HD_SCSICMD write parallel   3.036 ms
+    9.OS322:> devtest -bbdy a4091.device 1
+    Test a4091.device 1 with MB RAM
+    read  512 KB xfers          6166 KB/sec (14% CPU)
+    read  128 KB xfers          5726 KB/sec (24% CPU)
+    read   32 KB xfers          4444 KB/sec (60% CPU)
+    write 512 KB xfers          4743 KB/sec (10% CPU)
+    write 128 KB xfers          2449 KB/sec (12% CPU)
+    write  32 KB xfers          3052 KB/sec (41% CPU)
+    OpenDevice / CloseDevice    5.053 ms
+    OpenDevice multiple         0.024 ms
+    CloseDevice multiple        0.013 ms
+    TD_GETGEOMETRY sequential   5.008 ms
+    TD_GETGEOMETRY parallel     6.054 ms
+    TD_CHANGENUM                0.013 ms
+    TD_CHANGENUM quick          0.012 ms
+    CMD_INVALID                 0.013 ms
+    CMD_START                   2.077 ms
+    CMD_READ butterfly average  3.034 ms
+    CMD_READ butterfly far      2.099 ms
+    CMD_READ butterfly constant 5.012 ms
+    CMD_READ sequential         3.085 ms
+    CMD_READ parallel           3.067 ms
+    HD_SCSICMD read sequential  3.086 ms
+    HD_SCSICMD read parallel    3.069 ms
+    CMD_WRITE sequential        5.013 ms
+    CMD_WRITE parallel          5.005 ms
+    HD_SCSICMD write sequential 5.027 ms
+    HD_SCSICMD write parallel   4.084 ms
 ```
 
 ## 3. Packet support
@@ -188,13 +196,13 @@ by devtest.
 ```
     9.OS322:> devtest -g a4091.device 1
                      SSize TotalSectors    Cyl Head  Sect DType Removable
-    TD_GETGEOMETRY     512      4194304   8192   32    16  0x00 No
+    TD_GETGEOMETRY     512      1048576   8192   16     8  0x00 No
     Inquiry                                                0x00 No
-    READ_CAPACITY_10   512      4194304
-    READ_CAPACITY_16     -            -                    Fail 52 ERROR_SENSE_CODE
-    Read-to capacity   512      4194304
+    READ_CAPACITY_10   512      1048576
+    READ_CAPACITY_16     -            -                    Fail 52  ERROR_SENSE_CODE
+    Read-to capacity   512      1048576
     Mode Page 0x03     512                             63
-    Mode Page 0x04                         261  255
+    Mode Page 0x04                          65  255
 ```
 
 TD_GETGEOMETRY is implemented by the Amiga device driver. It is the
@@ -214,7 +222,9 @@ and newer do.
 READ_CAPACITY_16 is unnecessary and likely unimplemented for any drive
 smaller than 2 TB. It first appeared in the SCSI specification in the early
 2000's, so older drives will definitely not support it. This command is
-supported by PiSCSI regardless of the exported device size.
+supported by PiSCSI regardless of the exported device size. All SCSI to
+IDE and SD card adapters that have been tried do not yet support this
+command.
 
 Read-to capacity is implemented by devtest as a as-fast-as-possible means
 to determine the actual readable capacity of the drive. It uses a search
@@ -235,7 +245,7 @@ Additional details are provided when a device or volume name is specified.
     TD_GETGEOMETRY     512     18874368   1174  255    63  0x00 No
     Inquiry                                                0x00 No
     READ_CAPACITY_10   512     18874368
-    READ_CAPACITY_16     -            -                    Fail 45 HFERR_BadStatus
+    READ_CAPACITY_16     -            -                    Fail 45  HFERR_BadStatus
     Read-to capacity   512     16738687
     Mode Page 0x03     512                             63
     Mode Page 0x04                        1174  255

@@ -58,7 +58,7 @@ struct Device   *TimerBase;
 #endif
 
 /*
- * uint32_t may be unsigned int or unsigned long, 
+ * uint32_t may be unsigned int or unsigned long,
  * depending on the toolchain.
  */
 #define U32(v)  ((unsigned int)(uint32_t)(v))
@@ -313,10 +313,17 @@ static uint32_t  memtype = MEMTYPE_ANY; // Memory type
 static uint64_t  test_cmd_mask[32];
 static args_t    test_cmd_args[TEST_MAX_CMDS];
 static args_t   *cur_test_args = NULL;
-static uint      flag_destructive = 0;
+static UWORD     flag_destructive = 0;
+static uint      flag_cpu_utilization = 1;
 static uint      force_yes = 0;
 static uint      checknum = 0;
 static uint      g_turn_motor_off;    // Drive read/write likely turned motor on
+static struct Task     *main_task;
+static struct Task     *idle_task;
+static volatile int8_t  main_signal;
+static volatile uint    idle_task_stop;
+static volatile uint    idle_time;
+static struct EClockVal idle_stime;
 
 static BOOL
 is_user_abort(void)
@@ -404,8 +411,8 @@ usage(void)
      */
     printf("%s\n\n"
            "usage: devtest <options> <x.device> <unit>\n"
-           "   -b                    benchmark device performance "
-                    "[-bb tests latency]\n"
+           "   -b                    benchmark device [-bb show latency, "
+                                     "-C no CPU %%]\n"
            "   -B <tsize>[,<#tio>]   set benchmark arguments, default: 512k,4\n"
            "   -c <cmd>[(arg,...)]   test a specific device driver request\n"
            "   -d                    also do destructive operations (write)\n"
@@ -524,7 +531,7 @@ print_fail(int rc)
     printf("Fail %d", rc);
     for (i = 0; i < ARRAY_SIZE(err_to_str); i++) {
         if (err_to_str[i].errcode == rc) {
-            printf(" %s", err_to_str[i].errstr);
+            printf("  %s", err_to_str[i].errstr);
             break;
         }
     }
@@ -2261,13 +2268,15 @@ need_delete_port:
 #define MAX_NUM_TIO   32
 
 static void
-print_perf(uint ttime, uint freq, uint xfer_kb, int is_write, uint xfer_size)
+print_perf(uint ttime, uint itime, uint freq, uint xfer_kb, int is_write,
+           uint xfer_size)
 {
     uint tsec;
     uint trem;
     uint rep = xfer_kb;
     char c1 = 'K';
     char c2 = 'K';
+    uint cpu_load;
 
     if (rep >= 10000) {
         rep /= 1000;
@@ -2275,6 +2284,9 @@ print_perf(uint ttime, uint freq, uint xfer_kb, int is_write, uint xfer_size)
     }
     if (ttime == 0)
         ttime = 1;
+    if (itime > ttime)
+        itime = ttime;
+    cpu_load = (ttime - itime) * 100 / ttime;  // Round down on purpose
     tsec = ttime / freq;
     trem = ttime % freq;
 
@@ -2286,13 +2298,14 @@ print_perf(uint ttime, uint freq, uint xfer_kb, int is_write, uint xfer_size)
     xfer_kb = (uint64_t) xfer_kb * (uint64_t) freq / (uint64_t) ttime;
 
     if (g_verbose) {
-        printf("%4u %cB %s in %2u.%02u sec: %3u KB xfer: %3u %cB/sec\n",
+        printf("%4u %cB %s in %2u.%02u sec: %3u KB xfer: ",
                rep, c1, is_write ? "write" : "read ",
-               tsec, trem * 100 / freq, xfer_size / 1024,
-               xfer_kb, c2);
-    } else {
-        printf("%13u %cB/sec\n", xfer_kb, c2);
+               tsec, trem * 100 / freq, xfer_size / 1024);
     }
+    printf("%13u %cB/sec", xfer_kb, c2);
+    if (flag_cpu_utilization)
+        printf(" (%u%% CPU)", cpu_load);
+    printf("\n");
 }
 
 static uint32_t user_perf_size = 0;
@@ -2314,6 +2327,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
     uint32_t freq;
     uint32_t diff_ticks;
     uint64_t xfer_total;
+    uint32_t idle_ticks;
 
     int rep;
 
@@ -2321,9 +2335,9 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
         pos = 0;
         issued = 0;
 
-        ReadEClock(&stime);
-
         print_perf_type((iocmd == CMD_READ) ? 0 : 1, bufsize);
+        ReadEClock(&stime);
+        idle_time = 0;
         xfer_good = 0;
         for (xfer = 0; xfer < 50; xfer++) {
             if (issued & BIT(cur)) {
@@ -2379,11 +2393,12 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
                 cur = 0;
         }
 
+        idle_ticks = idle_time;
         freq = ReadEClock(&etime);
         diff_ticks = diff_e_clock(&stime, &etime);
 
         xfer_total = (uint64_t) bufsize * (uint64_t) xfer_good / 1000;
-        print_perf(diff_ticks, freq, (uint) xfer_total,
+        print_perf(diff_ticks, idle_ticks, freq, (uint) xfer_total,
                    (iocmd == CMD_READ) ? 0 : 1, bufsize);
         bufsize >>= 2;
         if (bufsize < 16384)
@@ -5672,6 +5687,58 @@ parse_tsize(const char *arg, uint *tsize, int *pos)
     }
 }
 
+static void
+idle_task_ent(void)
+{
+    ReadEClock(&idle_stime);
+}
+
+static void
+idle_task_exit(void)
+{
+    struct EClockVal idle_etime;
+    ReadEClock(&idle_etime);
+    idle_time += diff_e_clock(&idle_stime, &idle_etime);
+}
+
+/*
+ * idle_task_func
+ * --------------
+ * This task is a spin loop which runs at a low priority.
+ * The helper functions above execute every time the scheulder starts
+ * and stops the idle task. The helper functions will accumulate the
+ * number of EClock ticks which have elapsed during each tun of the
+ * idle task. It is up to the caller to determine the percentage of
+ * idle time over a given time period.
+ */
+static void
+idle_task_func(void)
+{
+    static struct Task *task_ptr;
+
+    task_ptr = (struct Task *) FindTask((char *)NULL);
+
+    Forbid();
+    task_ptr->tc_Launch = idle_task_ent;
+    task_ptr->tc_Switch = idle_task_exit;
+    task_ptr->tc_Flags |= TF_SWITCH | TF_LAUNCH;
+    Permit();
+
+    SetTaskPri(task_ptr, -10);
+    Signal(main_task, 1 << main_signal);  // Let main task resume
+
+    while (!idle_task_stop) {
+        __asm("nop");
+    }
+
+    Forbid();
+    task_ptr->tc_Launch = NULL;
+    task_ptr->tc_Switch = NULL;
+    task_ptr->tc_Flags &= ~(TF_SWITCH | TF_LAUNCH);
+    idle_task = NULL;
+    Permit();
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -5748,6 +5815,9 @@ main(int argc, char *argv[])
                             usage_cmd();
                             exit(RETURN_ERROR);
                         }
+                        break;
+                    case 'C':
+                        flag_cpu_utilization = 0;
                         break;
                     case 'd':
                         flag_destructive++;
@@ -5967,6 +6037,24 @@ got_unit:
         }
     }
 
+    if (flag_cpu_utilization) {
+        main_signal = AllocSignal(-1);
+        if (main_signal == -1) {
+            printf("Failed to allocate signal\n");
+            goto idle_fail;
+        }
+        main_task = (struct Task *) FindTask((char *)NULL);
+        idle_task = CreateTask("idle_task", 0, (void *)
+                                (uintptr_t) idle_task_func, 4096);
+        if (idle_task == NULL) {
+            FreeSignal(main_signal);
+            printf("Failed to create idle task\n");
+            goto idle_fail;
+        }
+        Wait(1 << main_signal);
+        FreeSignal(main_signal);
+    }
+
     for (loop = 0; loop < loops; loop++) {
         uint stop_on_error = (loop != 0) || (loops == 1);
         if (loops > 1) {
@@ -6024,6 +6112,7 @@ got_unit:
     if (did_open)
         close_device(&tio);
 
+idle_fail:
 allocmem_fail:
     for (bnum = 0; bnum < ARRAY_SIZE(g_tbuf); bnum++)
         if (g_tbuf[bnum] != NULL)
@@ -6039,6 +6128,14 @@ allocmem_fail:
         else
             printf("%u passes completed successfully\n", loops);
     }
+
+    if (idle_task != NULL) {
+        idle_task_stop = 1;
+        SetTaskPri(idle_task, 0);
+        while (idle_task != NULL)
+            Delay(1);  // Allow idle task to exit
+    }
+
     if (loop < loops)
         exit(RETURN_ERROR);
 
