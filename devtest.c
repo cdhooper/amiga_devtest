@@ -437,6 +437,8 @@ usage(void)
            version + 7);
 }
 
+#define ERROR_SENSE_CODE 52  // a4091.device family specific error code
+
 typedef struct {
     int errcode;
     const char *const errstr;
@@ -480,7 +482,7 @@ static const err_to_str_t err_to_str[] = {
     { 49,                   "ERROR_TRY_AGAIN" },            // 49
     { HFERR_NoBoard,        "HFERR_NoBoard" },              // 50
     { 51,                   "ERROR_BAD_BOARD" },            // 51
-    { 52,                   "ERROR_SENSE_CODE" },           // 52
+    { ERROR_SENSE_CODE,     "ERROR_SENSE_CODE" },           // 52
     /* The following unfortunately overlap several error codes above */
     { EACCES,               "EACCES" },                     // 2
     { EIO,                  "EIO" },                        // 5
@@ -529,6 +531,14 @@ print_fail(int rc)
 {
     size_t i;
     printf("Fail %d", rc);
+    if ((rc == ERROR_SENSE_CODE) &&
+        (SSD_SENSE_KEY(g_sense_data) || SSD_SENSE_ASC(g_sense_data))) {
+        printf("  SENSE %02x.%02x.%x",
+               SSD_SENSE_KEY(g_sense_data),
+               SSD_SENSE_ASC(g_sense_data),
+               SSD_SENSE_ASCQ(g_sense_data));
+        return;
+    }
     for (i = 0; i < ARRAY_SIZE(err_to_str); i++) {
         if (err_to_str[i].errcode == rc) {
             printf("  %s", err_to_str[i].errstr);
@@ -849,7 +859,7 @@ do_scsi_read_capacity_10(struct IOExtTD *tio,
 
     memset(&cmd, 0, sizeof (cmd));
     cmd.opcode = READ_CAPACITY_10;
-    cmd.bytes[0] = g_unitno << 5;
+    cmd.bytes[0] = g_lun << 5;
 
     return (do_scsidirect_cmd(tio, &cmd, 10, len, (void **) cap));
 }
