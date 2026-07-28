@@ -438,6 +438,7 @@ usage(void)
 }
 
 #define ERROR_SENSE_CODE 52  // a4091.device family specific error code
+#define ERROR_PAST_END   70  // past end of device (internal devtest)
 
 typedef struct {
     int errcode;
@@ -483,6 +484,8 @@ static const err_to_str_t err_to_str[] = {
     { HFERR_NoBoard,        "HFERR_NoBoard" },              // 50
     { 51,                   "ERROR_BAD_BOARD" },            // 51
     { ERROR_SENSE_CODE,     "ERROR_SENSE_CODE" },           // 52
+    { 53,                   "ERROR_NOT_READY" },            // 53
+    { ERROR_PAST_END,       "ERROR_PAST_END" },             // 60 (internal)
     /* The following unfortunately overlap several error codes above */
     { EACCES,               "EACCES" },                     // 2
     { EIO,                  "EIO" },                        // 5
@@ -533,7 +536,7 @@ print_fail(int rc)
     printf("Fail %d", rc);
     if ((rc == ERROR_SENSE_CODE) &&
         (SSD_SENSE_KEY(g_sense_data) || SSD_SENSE_ASC(g_sense_data))) {
-        printf("  SENSE %02x.%02x.%x",
+        printf("  SENSE %x/%02x/%02x",
                SSD_SENSE_KEY(g_sense_data),
                SSD_SENSE_ASC(g_sense_data),
                SSD_SENSE_ASCQ(g_sense_data));
@@ -885,7 +888,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
 {
     uint64_t  offset = g_devsize / 2;  // Starting point
     uint64_t  incdec = offset / 2;
-    uint64_t  min_offset = 0;
+    int64_t   min_offset = -1;
     uint64_t  max_offset = 0xffffffffffffffff;
     uint8_t  *buf;
     int       rc = 0;
@@ -905,6 +908,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
 
     *sectors = 0;
 
+    offset &= ~(g_sector_size - 1);
     while (incdec >= g_sector_size / 2) {
         rc = do_read_cmd(tio, offset, g_sector_size, buf, g_has_nsd);
         if (g_verbose)
@@ -927,9 +931,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
         } else {
             double_mode = 0;
             max_offset = offset;
-            if (incdec >= offset)
-                break;
-            while (offset - incdec <= min_offset) {
+            while ((int64_t) (offset - incdec) <= (int64_t) min_offset) {
                 incdec /= 2;
                 incdec &= ~(g_sector_size - 1);
                 if (incdec == 0)
@@ -942,6 +944,8 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
     FreeMemType(buf, g_sector_size);
     *sectors = min_offset / g_sector_size;
     g_turn_motor_off = 1;
+    if (min_offset == -1)  // Nothing could be read
+        return (rc);
     return (0);
 }
 
@@ -1344,9 +1348,10 @@ drive_geometry(void)
     scsi_inquiry_data_t *inq_res;
     rc = do_scsi_inquiry(tio, g_unitno, &inq_res);
     if (rc != 0) {
-        printf("%51c  -    Fail %d\n", '-', rc);
+        printf("%47s", "");
+        print_fail_nl(rc);
     } else {
-        printf("%46s 0x%02x %s", "",
+        printf("%47s0x%02x %s", "",
                inq_res->device & SID_TYPE,
                (inq_res->dev_qual2 & SID_REMOVABLE) ? "Yes" : "No");
         if (inq_res->dev_qual2 & SID_REMOVABLE) {
@@ -2638,8 +2643,8 @@ do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
     tio->iotd_Req.io_Error   = 0xa5;
 
     /* Ensure read does not go past end of partition (only in partition mode */
-    if ((g_devend != 0) && (offset + len > g_devend))
-        return (1);
+    if ((g_devend > g_sector_size) && (offset + len > g_devend))
+        return (ERROR_PAST_END);
 
     if (((offset + len) >> 32) > 0) {
         /* Need TD64 or NSD */
@@ -2665,7 +2670,7 @@ do_write_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
     tio->iotd_Req.io_Error   = 0xa5;
 
     if ((g_devend != 0) && (offset + len >= g_devend))
-        return (1);
+        return (ERROR_PAST_END);
 
     if (((offset + len) >> 32) > 0) {
         /* Need TD64 or NSD */
