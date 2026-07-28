@@ -272,7 +272,7 @@ typedef struct {
 
 typedef struct {
     uint8_t  arg_count;
-    uint32_t arg[4];
+    uint32_t arg[5];
 } args_t;
 
 static int do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len,
@@ -4407,6 +4407,90 @@ test_cmd_clear(struct IOExtTD *tio)
     return (rc);
 }
 
+static int
+test_cmd_scsi(struct IOExtTD *tio)
+{
+    int rc;
+    scsi_generic_t cmd;
+    uint maxreplylen = 1024;  // maximum
+    uint replylen;
+    uint cmdlen;
+    uint8_t *replybuf;
+    char cmdstr[16];
+    args_t *args = cur_test_args;
+    uint pos;
+
+    if (args->arg_count == 0) {
+        printf("SCSI command requires at least two arguments (len and cmd)\n");
+        return (EINVAL);
+    }
+    replylen = (uint16_t) cur_test_args->arg[0];
+    cmdlen   = (uint8_t) (cur_test_args->arg[0] >> 16);
+    if (cmdlen == 0) {
+        printf("SCSI command requires at least two arguments (len and cmd)\n");
+        return (EINVAL);
+    }
+    if (cmdlen > sizeof (cmd.bytes) + 1) {
+        printf("Command length 0x%x is too long\n", cmdlen);
+        return (EINVAL);
+    }
+    if (replylen > maxreplylen)
+        replylen = maxreplylen;
+
+    memset(&cmd, 0, sizeof (cmd));
+    cmd.opcode = (uint8_t) (cur_test_args->arg[0] >> 24);
+    memcpy(&cmd.bytes, &cur_test_args->arg[1], cmdlen - 1);
+    if (g_verbose) {
+        printf("replylen=%u cmdlen=%u CMD=%02x",
+               replylen, cmdlen, cmd.opcode);
+        for (pos = 0; pos < cmdlen - 1; pos++) {
+            printf(" %02x", cmd.bytes[pos]);
+        }
+        printf("\n");
+    }
+
+    rc = do_scsidirect_cmd(tio, &cmd, cmdlen, replylen, (void **) &replybuf);
+
+    sprintf(cmdstr, "SCSICMD %02x", cmd.opcode);
+    print_test_name(cmdstr);
+    if (rc == 0) {
+        printf("Success");
+        if (replybuf != NULL) {
+            if (g_verbose) {
+                uint pos;
+                printf(" ");
+                for (pos = 0; pos < replylen; pos++)
+                    printf(" %02x", replybuf[pos]);
+            }
+            FreeMemType(replybuf, replylen);
+        }
+        printf("\n");
+    } else {
+        int key = SSD_SENSE_KEY(g_sense_data);
+        if (key == SKEY_NOT_READY) {
+            printf("Success  ");
+            if (SSD_SENSE_ASC(g_sense_data) == 0x3a) {
+                printf("Media not present\n");
+            } else {
+                printf("Not ready (ASC=%02x ASCQ=%02x)\n",
+                       SSD_SENSE_ASC(g_sense_data),
+                       SSD_SENSE_ASCQ(g_sense_data));
+            }
+        } else {
+            print_fail(rc);
+            if (rc != ERROR_SENSE_CODE) {
+                printf("  SENSE %x/%02x/%02x",
+                       SSD_SENSE_KEY(g_sense_data),
+                       SSD_SENSE_ASC(g_sense_data),
+                       SSD_SENSE_ASCQ(g_sense_data));
+            }
+            printf("\n");
+        }
+    }
+
+    return (0);
+}
+
 #define UBIT(x) (1ULL << (x))
 
 #define TEST_CMD_GETGEOMETRY    UBIT(0)
@@ -4451,6 +4535,7 @@ test_cmd_clear(struct IOExtTD *tio)
 #define TEST_ETD_RAWWRITE       UBIT(39)
 #define TEST_CMD_UPDATE         UBIT(40)
 #define TEST_CMD_CLEAR          UBIT(41)
+#define TEST_CMD_SCSI           UBIT(42)
 
 static const test_cmds_t test_cmds[] = {
     { "CHANGEINT",   2, TEST_ADDREMCHANGEINT, NULL,
@@ -4532,6 +4617,8 @@ static const test_cmds_t test_cmds[] = {
                         "TD_MOTOR OFF stop motor (spin down)" },
     { "MOTORON",     2, TEST_TD_MOTOR_ON, NULL,
                         "TD_MOTOR ON start motor (spin up)" },
+    { "SCSI",        2, TEST_CMD_SCSI, "rlen,cb0,cb1,cb2...",
+                        "HD_SCSICMD (SCSI direct)" },
     { "START",       2, TEST_CMD_START, NULL,
                         "CMD_START spin up device" },
     { "STOP",        2, TEST_CMD_STOP, NULL,
@@ -4572,6 +4659,8 @@ test_packets_ll(uint64_t test_mask, struct IOExtTD *tio)
     if ((test_mask & TEST_CMD_UPDATE) && test_cmd_update(tio))
         rc++;
     if ((test_mask & TEST_CMD_CLEAR) && test_cmd_clear(tio))
+        rc++;
+    if ((test_mask & TEST_CMD_SCSI) && test_cmd_scsi(tio))
         rc++;
 
     if (0 && (test_mask & TEST_TD_RAWWRITE) && test_td_rawwrite(tio))
@@ -5613,6 +5702,70 @@ show_arg_help(const char *str, uint cmd)
         printf("%s(%s)\n", str, arg_help);
 }
 
+static void
+get_cmd_scsi_args(args_t *args, const char *arg)
+{
+    int count;
+    uint val;
+    uint argpos = 0;
+    if (arg == NULL) {
+        printf("SCSI command requires len and cmd args\n");
+        exit(RETURN_ERROR);
+    }
+    memset(args->arg, 0, sizeof (args->arg));
+    while (sscanf(arg, "%x%n", &val, &count) == 1) {
+        if (count != 0) {
+            arg += count;
+            if (*arg == ',')
+                arg++;
+        }
+        switch (argpos) {
+            case 0:  // reply length
+                args->arg[0] = (uint16_t) val;
+                argpos += 3;
+                break;
+            case 3:  // cmd
+                args->arg[0] |= (val & 0xff) << 24;
+                argpos += 1;
+                break;
+            default:
+                if ((argpos + count / 2) / 4 >= sizeof (args->arg))
+                    break;
+                switch (count) {
+                    case 1:  // One-byte
+                    case 2:
+                        *((uint8_t *) args->arg + argpos) = val;
+                        argpos += 1;
+                        break;
+                    case 3:  // Two-byte
+                    case 4:
+                        *(uint16_t *)((uint8_t *) args->arg + argpos) = val;
+                        argpos += 2;
+                        break;
+                    case 5:  // Three-byte
+                    case 6:
+                        *((uint8_t *) args->arg + argpos) = (val >> 16);
+                        argpos++;
+                        *(uint16_t *)((uint8_t *) args->arg + argpos) = val;
+                        argpos += 2;
+                        break;
+                    case 7:  // Four-byte
+                    case 8:
+                        *(uint32_t *)((uint8_t *) args->arg + argpos) = val;
+                        argpos += 4;
+                        break;
+                    default:  // Eight-byte
+                        *(uint64_t *)((uint8_t *) args->arg + argpos) = val;
+                        argpos += 8;
+                        break;
+                }
+                break;
+        }
+    }
+    args->arg[0] |= ((argpos - 3) & 0xff) << 16;
+    args->arg_count = argpos - 3;
+}
+
 static uint64_t
 get_cmd(const char *str, args_t *args)
 {
@@ -5629,7 +5782,9 @@ get_cmd(const char *str, args_t *args)
 
     for (pos = 0; pos < ARRAY_SIZE(test_cmds); pos++) {
         if (strcasecmp(test_cmds[pos].alias, str) == 0) {
-            if (arg != NULL) {
+            if (test_cmds[pos].mask == TEST_CMD_SCSI) {
+                get_cmd_scsi_args(args, arg);
+            } else if (arg != NULL) {
                 int count;
                 uint val;
                 while (sscanf(arg, "%i%n", (int *) &val, &count) == 1) {
@@ -5638,7 +5793,7 @@ get_cmd(const char *str, args_t *args)
                         if (*arg == ',')
                             arg++;
                     }
-                    if (args->arg_count == 4) {
+                    if (args->arg_count == ARRAY_SIZE(args->arg)) {
                         printf("Too many arguments to %s\n", str);
                         exit(RETURN_ERROR);
                     }
@@ -5720,7 +5875,7 @@ idle_task_exit(void)
  * idle_task_func
  * --------------
  * This task is a spin loop which runs at a low priority.
- * The helper functions above execute every time the scheulder starts
+ * The helper functions above execute every time the scheduler starts
  * and stops the idle task. The helper functions will accumulate the
  * number of EClock ticks which have elapsed during each tun of the
  * idle task. It is up to the caller to determine the percentage of

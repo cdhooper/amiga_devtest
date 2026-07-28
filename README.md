@@ -5,9 +5,10 @@ the driver and physical device. There are several operation types that the
 utility can perform:
    * Device probe
    * Performance
-   * Packet support
    * Device Geometry
    * Data integrity
+   * Packet support
+   * Individual commands
 
 ## 1. Device probe
 
@@ -140,56 +141,7 @@ latency of a variety of packets. Example:
     HD_SCSICMD write parallel   4.084 ms
 ```
 
-## 3. Packet support
-    Trackdisk-compatible drivers often don't support all request
-    packet types that a filesystem may use. This is especially true
-    if it's an older driver that can't handle the packet standards
-    which support larger (4GB+) media. Devtest will test most known
-    trackdisk commands and report whether they are supported.
-**WARNING: The -d option enables the write benchmark, which is destructive to any data on the drive!**
-    Example:
-```
-    9.OS322:> devtest -t a4091.device 1 -d
-    TD_GETGEOMETRY     Success  4194304 x 512  C=8192 H=32 S=16 Type=0
-    TD_CHANGENUM       Success  Count=1
-    TD_CHANGESTATE     Success  Disk present
-    TD_PROTSTATUS      Success  Unprotected
-    TD_GETDRIVETYPE    Fail -3 IOERR_NOCMD (unsupported)
-    TD_GETNUMTRACKS    Fail -3 IOERR_NOCMD (unsupported)
-    TD_RAWREAD         Fail -3 IOERR_NOCMD (unsupported)
-    SCSICMD Inquiry    Success  V='ZULUSCSI' P='HARDDRIVE' R='2.0' DT=0x0 Linked Sync
-    SCSICMD TUR        Success  Ready
-    NSCMD_DEVICEQUERY  Success
-    CMD_READ           Success
-    ETD_READ           Success
-    TD_READ64          Success
-    NSCMD_TD_READ64    Success
-    NSCMD_ETD_READ64   Success
-    TD_SEEK            Success
-    ETD_SEEK           Success
-    TD_SEEK64          Success
-    NSCMD_TD_SEEK64    Success
-    NSCMD_ETD_SEEK64   Success
-    CMD_WRITE          Success
-    ETD_WRITE          Success
-    TD_WRITE64         Success
-    NSCMD_TD_WRITE64   Success
-    NSCMD_ETD_WRITE64  Success
-    TD_FORMAT          Success
-    ETD_FORMAT         Success
-    TD_FORMAT64        Success
-    NSCMD_TD_FORMAT64  Success
-    NSCMD_ETD_FORMAT64 Success
-    TD_MOTOR ON        Success
-    TD_MOTOR OFF       Success
-```
-
-Adding a second `-t` option will cause devtest to test additional
-packet types. Some packets may cause your media to eject or trigger
-known bugs in Amiga device drivers.
-
-
-## 4. Device Geometry
+## 3. Device Geometry
 On the Amiga, there are multiple methods to acquire a drive's physical
 geometry, including direct SCSI commands. These methods are reported
 by devtest.
@@ -251,7 +203,7 @@ Additional details are provided when a device or volume name is specified.
     Mode Page 0x04                        1174  255
 ```
 
-## 5. Data integrity
+## 4. Data integrity
 The benchmark test is a good tool for verifying the Amiga's bus interface
 and timing are being met, but it does no actual data verification. The
 devtest utility can perform tests to verify that data can be reliably stored
@@ -369,3 +321,112 @@ data match what was previously read.
 ...
 ```
 The above test ran at about 1 MB/sec.
+
+## 5. Packet support
+    Trackdisk-compatible drivers often don't support all request
+    packet types that a filesystem may use. This is especially true
+    if it's an older driver that can't handle the packet standards
+    which support larger (4GB+) media. Devtest will test most known
+    trackdisk commands and report whether they are supported.
+**WARNING: The -d option enables the write benchmark, which is destructive to any data on the drive!**
+    Example:
+```
+    9.OS322:> devtest -t a4091.device 1 -d
+    TD_GETGEOMETRY     Success  4194304 x 512  C=8192 H=32 S=16 Type=0
+    TD_CHANGENUM       Success  Count=1
+    TD_CHANGESTATE     Success  Disk present
+    TD_PROTSTATUS      Success  Unprotected
+    TD_GETDRIVETYPE    Fail -3 IOERR_NOCMD (unsupported)
+    TD_GETNUMTRACKS    Fail -3 IOERR_NOCMD (unsupported)
+    TD_RAWREAD         Fail -3 IOERR_NOCMD (unsupported)
+    SCSICMD Inquiry    Success  V='ZULUSCSI' P='HARDDRIVE' R='2.0' DT=0x0 Linked Sync
+    SCSICMD TUR        Success  Ready
+    NSCMD_DEVICEQUERY  Success
+    CMD_READ           Success
+    ETD_READ           Success
+    TD_READ64          Success
+    NSCMD_TD_READ64    Success
+    NSCMD_ETD_READ64   Success
+    TD_SEEK            Success
+    ETD_SEEK           Success
+    TD_SEEK64          Success
+    NSCMD_TD_SEEK64    Success
+    NSCMD_ETD_SEEK64   Success
+    CMD_WRITE          Success
+    ETD_WRITE          Success
+    TD_WRITE64         Success
+    NSCMD_TD_WRITE64   Success
+    NSCMD_ETD_WRITE64  Success
+    TD_FORMAT          Success
+    ETD_FORMAT         Success
+    TD_FORMAT64        Success
+    NSCMD_TD_FORMAT64  Success
+    NSCMD_ETD_FORMAT64 Success
+    TD_MOTOR ON        Success
+    TD_MOTOR OFF       Success
+```
+
+Adding a second `-t` option will cause devtest to test additional
+packet types. Some packets may cause your media to eject or trigger
+known bugs in Amiga device drivers.
+
+## 5. Individual commands
+
+You can issue specific commands to a driver with the `-c` option.
+Example: ```
+    9.OS322:> devtest a4091.device 1 -c inquiry
+    SCSICMD Inquiry    Success  V='ZULUSCSI' P='HARDDRIVE' R='2.0' DT=0x0 Linked Sync
+```
+
+Specify the -c option without an argument to get a list of known
+commands which can be sent. Some commands accept arguments, such as READ.
+Example (read 2 sectors of CD-ROM starting at sector 1): ```
+    9.OS322:> devtest a4091.device 2 -c read(4096,2048
+    CMD_READ           Success
+```
+Command arguments default to decimal, but may be prefixed by `0x` to
+specify hexadecimal values.
+
+The SCSI command can be used to send arbitrary SCSI commands using the
+HD_SCSICMD trackdisk command. Example (send inquiry command):```
+    9.OS322:> devtest a4091.device 2 -c scsi(28,12,000000,28,0)
+    SCSICMD 12         Success
+```
+Issue a READ (6):```
+    9.OS322:> devtest a4091.device 1 -c scsi(200,8,000000,1,0 -v
+replylen=512 cmdlen=6 CMD=08 00 00 00 01 00
+SCSICMD 08         Success  00 00 03 f3 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 02 00 00 45 ee 00 00 00 1f 00 00 04 0a 00 00 03 e9 00 00 45 ee 4e f9 00 00 cf f4 4e 75 20 0c 4e 75 28 6f 00 04 4e 75 00 00 00 24 56 45 52 3a 20 64 65 76 74 65 73 74 20 31 2e 38 62 20 28 4a 75 6c 20 32 37 20 32 30 32 36 29 20 a9 20 43 68 72 69 73 20 48 6f 6f 70 65 72 00 00 2f 0e 70 00 22 00 2c 79 00 00 06 c4 4e ae fe ce 72 0c e2 a8 02 40 00 01 2c 5f 4e 75 25 73 3a 20 79 65 73 0a 00 25 73 20 2d 20 61 72 65 20 79 6f 75 20 73 75 72 65 3f 20 28 79 2f 6e 29 20 00 00 48 e7 30 3e 24 2f 00 20 4a b9 00 00 05 54 66 1e 49 f9 00 00 be 14 4b f9 00 00 bc 2c 47 f9 00 00 bd 44 4d fa ff 9c 26 3c 00 00 bc 1c 60 10 2f 02 48 7a ff aa 4e b9 00 00 be 14 50 8f 60 4e 2f 02 48 7a ff a3 4e 94 20 79 00 00 00 10 2f 28 00 08 4e 95 4f ef 00 0c 60 28 4e 96 4a 40 67 04 70 00 60 2c 20 0a 72 df c0 81 72 59 b2 80 67 1e 72 4e b2 80 67 ea 20 43 4e 90 08 32 00 03 08 01 67 be 4e 93 24 40 70 ff b0 8a 66 ce 60 d2 70 01 4c df 7c 0c 4e 75 74 72 61 63 6b 64 69 73 6b 2e 64 65 76 69 63 65 00 00 2f 0e 2f 02 24 39 00 00 00 2c 48 7a ff e2 2f 02 4e b9 00 00 e1 88 50 8f 4a 80 57 c1 48 81 48 c1 2c 79 00 00 06 c4 20 42 20 39 00 00 00 30 44 81 22 6f 00 0c 4e ae fe 44 48 80 48 c0 24 1f 2c 5f 4e 75 2f 0e 2f 0a 24 6f 00 0c 4a b9 00 00 05 5c 67 32 42 b9 00 00 05 5c 35 7c 00 09 00 1c 42 aa 00 20 42 aa 00 2c 42 aa 00 24 42 aa 00 28 42 2a 00 1e 15 7c 00 a5 00 1f 22 4a 2c 79 00 00 06 c4 4e ae fe 38 22 4a 2c 79 00 00 06 c4 4e ae fe 3e 24 5f 2c 5f 4e 75 25 73 0a 0a 75 73 61 67 65 3a 20 64 65 76 74 65 73 74 20 3c 6f 70
+```
+Do the same with READ (10):```
+    9.OS322:> devtest a4091.device 1 -c scsi(200,28,0,00000000,0,0001,0
+    SCSICMD 28         Success
+```
+How about READ (16), which is unsupported by this device:```
+    9.OS322:> devtest a4091.device 1 -c scsi(200,88,0,0000000000000000,00000001,0,0
+SCSICMD 88         Fail 52  SENSE 5/20/00 Sense Key 5 (ASC=20 ASCQ=00)
+```
+
+The SCSI command arguments are always specified in hexadecimal.
+The first two arguments are the expected response length and the command.
+The expected response length must be at least the length that the SCSI
+target needs to send. Values which follow are command option bytes.
+You may specify the values as a mix of individual bytes or longer values.
+The number of bytes is determined by the number of digits specified.
+|  Digits   |  Byte count  |
+| :------:  | :----------: |
+| 1 or 2    | 1            |
+| 3 or 4    | 2            |
+| 5 or 6    | 3            |
+| 7 or 8    | 4            |
+| 9 or more | 8            |
+
+Example: `200,28,0,00000000,0,0001,0`
+This requests a response of 512 bytes. The command sent is:```
+  28 00 00 00 12 34 00 00 01 00
+```
+Broken down as follows:
+| Command | RDR/D/F/R/O/O | LBA      | Rsv/Group | Sectors | Ctrl |
+| :-----: | :-----------: | :------- | :-------: | :-----: | :--: |
+| 28      | 00            | 00001234 | 00        | 0001    | 00   |
+
+You could specified `200,28,0,00001234,00000100` for the same packet.
