@@ -4412,7 +4412,7 @@ test_cmd_scsi(struct IOExtTD *tio)
 {
     int rc;
     scsi_generic_t cmd;
-    uint maxreplylen = 1024;  // maximum
+    uint maxreplylen = 16384;  // maximum
     uint replylen;
     uint cmdlen;
     uint8_t *replybuf;

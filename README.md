@@ -413,9 +413,28 @@ SCSICMD 88         Fail 52  SENSE 5/20/00 Sense Key 5 (ASC=20 ASCQ=00)
 ```
 
 The SCSI command arguments are always specified in hexadecimal.
-The first two arguments are the expected response length and the command.
-The expected response length must be at least the length that the SCSI
-target needs to send. Values which follow are command option bytes.
+The first argument is the expected response length. This length must be
+at least the length that the SCSI target needs to send. Typically,
+drives like SCSI hard disk use 512-byte sectors (200). CD-ROM drives
+typically 2048-byte sectors (800), so you should use `800` if following
+the SCSI read examples above. The next byte is the SCSI command. Refer
+to a SCSI command reference for the hexadecimal code and expected
+response length. A few typical SCSI commands are:
+| Code  | Command           |
+| :---: | :---------------: |
+| 0     | Test Unit Ready   |
+| 8     | Read(6)           |
+| a     | Write(6)          |
+| 12    | Inquiry           |
+| 1a    | Mode Sense(6)     |
+| 28    | Read(10)          |
+| 2a    | Write(10)         |
+| aa    | Write(12)         |
+| 8a    | Write(16)         |
+| 25    | Read Capacity(10) |
+| 9e10  | Read Capacity(16) |
+
+Values which follow the command are command option bytes.
 You may specify the values as a mix of individual bytes or longer values.
 The number of bytes is determined by the number of digits specified.
 |  Digits   |  Byte count  |
