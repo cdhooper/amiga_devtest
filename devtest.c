@@ -53,7 +53,7 @@ typedef struct { unsigned long hi; unsigned long lo; } uint64_t;
 #include <inline/dos.h>
 #include <inttypes.h>
 struct ExecBase *SysBase;
-struct ExecBase *DOSBase;
+struct DosLibrary *DOSBase;
 struct Device   *TimerBase;
 #endif
 
