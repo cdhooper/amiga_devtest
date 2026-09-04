@@ -4862,6 +4862,10 @@ test_packets(int do_destructive, int test_level,
                            TEST_TD_RAWWRITE |
                            TEST_CMD_CLEAR);
         }
+
+        /* Command line only */
+        test_mask &= ~TEST_CMD_SCSI;
+
         rc = test_packets_ll(test_mask, tio);
     } else {
         /* Run specified tests */
