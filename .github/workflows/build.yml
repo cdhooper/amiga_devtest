@@ -1,0 +1,22 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: stefanreinauer/amiga-gcc:gcc-v13.4
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build devtest
+        run: make
