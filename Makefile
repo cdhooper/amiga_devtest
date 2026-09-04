@@ -76,6 +76,11 @@ lha:
 	$(QUIET)lha -aq2 $(PROGVER).lha $(PROGVER)
 	$(QUIET)rm -rf $(PROGVER)
 
+.PHONY: print-lha-name
+
+print-lha-name:
+	@printf '%s\n' '$(PROGVER).lha'
+
 clean:
 	rm -f $(OBJS) $(OBJDIR)/*.map $(OBJDIR)/*.lst
 
