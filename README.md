@@ -420,34 +420,36 @@ typically 2048-byte sectors (800), so you should use `800` if following
 the SCSI read examples above. The next byte is the SCSI command. Refer
 to a SCSI command reference for the hexadecimal code and expected
 response length. A few typical SCSI commands are:
-| Code  | Command           |
-| :---: | :---------------: |
-| 0     | Test Unit Ready   |
-| 8     | Read(6)           |
-| a     | Write(6)          |
-| 12    | Inquiry           |
-| 1a    | Mode Sense(6)     |
-| 28    | Read(10)          |
-| 2a    | Write(10)         |
-| aa    | Write(12)         |
-| 8a    | Write(16)         |
-| 25    | Read Capacity(10) |
-| 9e10  | Read Capacity(16) |
+| Code  | Command           | Additional Bytes                               |
+| :---: | :---------------: | :--------------------------------------------: |
+| 0     | Test Unit Ready   | [7:5=LUN]                                      |
+| 8     | Read(6)           | addr2...addr0 len ctrl                         |
+| a     | Write(6)          | addr2...addr0 len ctrl                         |
+| 12    | Inquiry           | [7:5=LUN,1=CMMD,0=EVPD] Page 00 len ctrl       |
+| 1a    | Mode Sense(6)     | [3=DBD] page 00 len 00                         |
+| 28    | Read(10)          | 00 addr3...addr0 00 len1 len0 ctrl             |
+| a8    | Read(12)          | byte2 addr3...addr0 00 len3...len0 rsvd ctrl   |
+| 88    | Read(16)          | 00 addr7...addr0 len3...len0 00 ctrl           |
+| 2a    | Write(10)         | 00 addr3 addr2 addr1 addr0 00 len1 len0 ctrl   |
+| aa    | Write(12)         | byte2 addr3...addr0 00 len3...len0 rsvd ctrl   |
+| 8a    | Write(16)         | 00 addr7...addr0 len3...len0 00 ctrl           |
+| 25    | Read Capacity(10) | byte2 addr3...addr0 rsvd2...rsvd0 ctrl         |
+| 9e10  | Read Capacity(16) | addr7...addr0 len3...len0 byte15 ctrl          |
 
 Values which follow the command are command option bytes.
 You may specify the values as a mix of individual bytes or longer values.
 The number of bytes is determined by the number of digits specified.
-|  Digits   |  Byte count  |
-| :------:  | :----------: |
-| 1 or 2    | 1            |
-| 3 or 4    | 2            |
-| 5 or 6    | 3            |
-| 7 or 8    | 4            |
-| 9 or more | 8            |
+|  Digits   |  Byte count  | Example 1 | Example 2  |
+| :------:  | :----------: | :-------: | :--------: |
+| 1 or 2    | 1            | 9         | 98         |
+| 3 or 4    | 2            | 987       | 9876       |
+| 5 or 6    | 3            | 98765     | 987654     |
+| 7 or 8    | 4            | 9876543   | 98765432   |
+| 9 or more | 8            | 987654321 | 9876543210 |
 
 Example:
 ```
-  200,28,0,00000000,0,0001,0
+  200,28,0,00001234,0,0001,0
 ```
 This requests a response of 512 bytes. The command sent is:
 ```
