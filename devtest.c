@@ -2294,7 +2294,7 @@ drive_latency(int do_destructive)
         rc = 1;
         goto need_delete_tio;
     }
-    memset(mtio, 0, sizeof (*mtio));
+    memset(mtio, 0, sizeof (*mtio) * NUM_MTIO);
 
     for (i = 0; i < NUM_MTIO; i++) {
         mtio[i] = (struct IOExtTD *) CreateExtIO(mp, sizeof (struct IOExtTD));
@@ -3110,26 +3110,27 @@ test_etd_command(struct IOExtTD *tio, UWORD cmd, const char *cmd_name,
     return (rc);
 }
 
-static void
+static int
 get_args_1(uint *arg1)
 {
     if (cur_test_args == NULL)
-        return;
+        return (0);
 
     if (cur_test_args->arg_count > 0)
         *arg1 = cur_test_args->arg[0];
 
     if (cur_test_args->arg_count > 1) {
         printf("Too many args for this command\n");
-        exit(RETURN_ERROR);
+        return (1);
     }
+    return (0);
 }
 
-static void
+static int
 get_args_2(uint *arg1, uint *arg2)
 {
     if (cur_test_args == NULL)
-        return;
+        return (0);
 
     if (cur_test_args->arg_count > 0)
         *arg1 = cur_test_args->arg[0];
@@ -3139,15 +3140,16 @@ get_args_2(uint *arg1, uint *arg2)
 
     if (cur_test_args->arg_count > 2) {
         printf("Too many args for this command\n");
-        exit(RETURN_ERROR);
+        return (1);
     }
+    return (0);
 }
 
-static void
+static int
 get_args_3(uint *arg1, uint *arg2, uint *arg3)
 {
     if (cur_test_args == NULL)
-        return;
+        return (0);
 
     if (cur_test_args->arg_count > 0)
         *arg1 = cur_test_args->arg[0];
@@ -3160,8 +3162,9 @@ get_args_3(uint *arg1, uint *arg2, uint *arg3)
 
     if (cur_test_args->arg_count > 3) {
         printf("Too many args for this command\n");
-        exit(RETURN_ERROR);
+        return (1);
     }
+    return (0);
 }
 
 static int
@@ -3172,7 +3175,8 @@ test_cmd_read(struct IOExtTD *tio)
     uint readoffset = 0;
     uint bufsize = BUFSIZE;
 
-    get_args_2(&bufsize, &readoffset);
+    if (get_args_2(&bufsize, &readoffset))
+        return (1);
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
@@ -3208,7 +3212,8 @@ test_etd_read(struct IOExtTD *tio)
     uint readoffset = 0;
     uint bufsize = BUFSIZE;
 
-    get_args_2(&bufsize, &readoffset);
+    if (get_args_2(&bufsize, &readoffset))
+        return (1);
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
@@ -3245,7 +3250,8 @@ test_td_read64(struct IOExtTD *tio)
     uint64_t rel_offset;
     uint64_t io_offset;
 
-    get_args_3(&bufsize, &readoffset, &readoffsethi);
+    if (get_args_3(&bufsize, &readoffset, &readoffsethi))
+        return (1);
 
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
@@ -3333,7 +3339,8 @@ test_nscmd_td_read64(struct IOExtTD *tio)
     uint64_t rel_offset;
     uint64_t io_offset;
 
-    get_args_3(&bufsize, &readoffset, &readoffsethi);
+    if (get_args_3(&bufsize, &readoffset, &readoffsethi))
+        return (1);
 
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
@@ -3381,7 +3388,8 @@ test_nscmd_etd_read64(struct IOExtTD *tio)
     uint readoffsethi = 0;
     uint64_t rel_offset;
 
-    get_args_3(&bufsize, &readoffset, &readoffsethi);
+    if (get_args_3(&bufsize, &readoffset, &readoffsethi))
+        return (1);
 
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
@@ -3416,7 +3424,8 @@ test_td_seek(struct IOExtTD *tio)
     int rc;
     uint seekoffset = 0;
 
-    get_args_1(&seekoffset);
+    if (get_args_1(&seekoffset))
+        return (1);
 
     seekoffset += g_devstart;
 
@@ -3459,7 +3468,8 @@ test_etd_seek(struct IOExtTD *tio)
     int rc;
     uint seekoffset = 0;
 
-    get_args_1(&seekoffset);
+    if (get_args_1(&seekoffset))
+        return (1);
 
     rc = test_etd_command(tio, ETD_SEEK, "ETD_SEEK", BUFSIZE, g_tbuf[1],
                           seekoffset);
@@ -3478,7 +3488,8 @@ test_td_seek64(struct IOExtTD *tio)
     uint seekoffsethi = 0;
     uint64_t io_offset;
 
-    get_args_2(&seekoffset, &seekoffsethi);
+    if (get_args_2(&seekoffset, &seekoffsethi))
+        return (1);
 
     io_offset = ((uint64_t) seekoffsethi << 32) | seekoffset;
     io_offset += g_devstart;
@@ -3507,7 +3518,8 @@ test_nscmd_td_seek64(struct IOExtTD *tio)
     uint seekoffsethi = 0;
     uint64_t io_offset;
 
-    get_args_2(&seekoffset, &seekoffsethi);
+    if (get_args_2(&seekoffset, &seekoffsethi))
+        return (1);
 
     io_offset = ((uint64_t) seekoffsethi << 32) | seekoffset;
     io_offset += g_devstart;
@@ -3535,7 +3547,8 @@ test_nscmd_etd_seek64(struct IOExtTD *tio)
     uint seekoffset = 0;
     uint seekoffsethi = 0;
 
-    get_args_2(&seekoffset, &seekoffsethi);
+    if (get_args_2(&seekoffset, &seekoffsethi))
+        return (1);
 
     rc = test_etd_command(tio, NSCMD_ETD_SEEK64, "NSCMD_ETD_SEEK64",
                           BUFSIZE, g_tbuf[1],
@@ -4126,7 +4139,8 @@ test_cmd_write(struct IOExtTD *tio)
     uint writeoffset = 0;
     uint bufsize = BUFSIZE;
 
-    get_args_2(&bufsize, &writeoffset);
+    if (get_args_2(&bufsize, &writeoffset))
+        return (1);
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
@@ -4162,7 +4176,8 @@ test_etd_write(struct IOExtTD *tio)
     uint writeoffset = 0;
     uint bufsize = BUFSIZE;
 
-    get_args_2(&bufsize, &writeoffset);
+    if (get_args_2(&bufsize, &writeoffset))
+        return (1);
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
@@ -4198,7 +4213,8 @@ test_td_write64(struct IOExtTD *tio)
     uint writeoffsethi = 0;
     uint64_t rel_offset;
 
-    get_args_3(&bufsize, &writeoffset, &writeoffsethi);
+    if (get_args_3(&bufsize, &writeoffset, &writeoffsethi))
+        return (1);
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
@@ -4253,7 +4269,8 @@ test_nscmd_td_write64(struct IOExtTD *tio)
     uint writeoffsethi = 0;
     uint64_t rel_offset;
 
-    get_args_3(&bufsize, &writeoffset, &writeoffsethi);
+    if (get_args_3(&bufsize, &writeoffset, &writeoffsethi))
+        return (1);
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
@@ -4807,7 +4824,7 @@ static const test_cmds_t test_cmds[] = {
                         "TD_READ64 TD64 read from device" },
     { "NSDREAD",     0, TEST_NSCMD_TD_READ64, "size,offset,offsethi",
                         "NSCMD_TD_READ64 NSD Read from device" },
-    { "NSDEREAD",    0, TEST_NSCMD_ETD_READ64, "size,offset",
+    { "NSDEREAD",    0, TEST_NSCMD_ETD_READ64, "size,offset,offsethi",
                         "NSCMD_ETD_READ64 NSD extended read from device" },
     { "SEEK",        0, TEST_TD_SEEK, "offset",
                         "TD_SEEK Seek to offset" },
@@ -5948,6 +5965,26 @@ show_arg_help(const char *str, uint cmd)
         printf("%s(%s)\n", str, arg_help);
 }
 
+/*
+ * max_cmd_args() returns the number of arguments a -c command accepts,
+ * which is the number of comma-separated names in its argument help.
+ * Checking this while parsing the command line catches too many arguments
+ * before the idle task is started (get_args_1/2/3 must not exit()).
+ */
+static uint
+max_cmd_args(uint cmd)
+{
+    const char *str = test_cmds[cmd].args;
+    uint count;
+
+    if (str == NULL)
+        return (0);
+    for (count = 1; *str != '\0'; str++)
+        if (*str == ',')
+            count++;
+    return (count);
+}
+
 static void
 get_cmd_scsi_args(args_t *args, const char *arg)
 {
@@ -6045,7 +6082,10 @@ get_cmd(const char *str, args_t *args)
                     }
                     args->arg[args->arg_count++] = val;
                 }
-                if (args->arg_count == 0) {
+                if ((args->arg_count == 0) ||
+                    (args->arg_count > max_cmd_args(pos))) {
+                    if (args->arg_count != 0)
+                        printf("Too many arguments to %s: ", str);
                     show_arg_help(str, pos);
                     exit(RETURN_ERROR);
                 }
