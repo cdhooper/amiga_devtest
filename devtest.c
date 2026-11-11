@@ -621,6 +621,115 @@ cmd_for_offset(UWORD iocmd, uint64_t abs_end)
     return (iocmd);
 }
 
+/*
+ * User-specified memory address (-m <addr>)
+ * -----------------------------------------
+ * Several buffers may be allocated at once (test buffers, benchmark
+ * buffers, integrity buffers, SCSI command structures). The first buffer
+ * gets the exact user-specified address, and subsequent buffers are
+ * placed at the lowest available address above it, so that buffers never
+ * overlap.
+ *
+ * With -mm, memory is not allocated through the OS, so the regions
+ * handed out are tracked here instead.
+ */
+#define MEM_ALIGN(x) (((x) + MEM_BLOCKMASK) & ~MEM_BLOCKMASK)
+
+typedef struct {
+    uint32_t addr;
+    uint32_t size;  // 0 = entry not in use
+} skip_region_t;
+
+static skip_region_t skip_regions[64];
+
+static APTR
+alloc_skip(ULONG byteSize, uint32_t base)
+{
+    uint32_t cand = base;
+    uint     slot = ARRAY_SIZE(skip_regions);
+    uint     cur;
+    int      moved;
+
+    do {
+        moved = 0;
+        for (cur = 0; cur < ARRAY_SIZE(skip_regions); cur++) {
+            skip_region_t *r = &skip_regions[cur];
+            if (r->size == 0)
+                continue;
+            if ((cand < r->addr + r->size) && (r->addr < cand + byteSize)) {
+                /* Overlaps an existing region; move past it */
+                cand = MEM_ALIGN(r->addr + r->size);
+                moved = 1;
+            }
+        }
+    } while (moved);
+
+    for (cur = 0; cur < ARRAY_SIZE(skip_regions); cur++) {
+        if (skip_regions[cur].size == 0) {
+            slot = cur;
+            break;
+        }
+    }
+    if (slot == ARRAY_SIZE(skip_regions))
+        return (NULL);  // Too many concurrent allocations
+    skip_regions[slot].addr = cand;
+    skip_regions[slot].size = byteSize;
+    return ((APTR) cand);
+}
+
+static void
+free_skip(APTR addr)
+{
+    uint cur;
+    for (cur = 0; cur < ARRAY_SIZE(skip_regions); cur++) {
+        if ((skip_regions[cur].size != 0) &&
+            (skip_regions[cur].addr == (uint32_t) addr)) {
+            skip_regions[cur].size = 0;
+            return;
+        }
+    }
+}
+
+static APTR
+alloc_user_addr(ULONG byteSize, uint32_t base)
+{
+    struct ExecBase  *eb = SysBase;
+    struct MemHeader *mem;
+    struct MemChunk  *chunk;
+    APTR              addr;
+
+    /* Exact address requested by the user, if available */
+    addr = AllocAbs(byteSize, (APTR) base);
+    if (addr != NULL)
+        return (addr);
+
+    /* Otherwise, the lowest free address above it which will fit */
+    Forbid();
+    for (mem = (struct MemHeader *) eb->MemList.lh_Head;
+         mem->mh_Node.ln_Succ != NULL;
+         mem = (struct MemHeader *) mem->mh_Node.ln_Succ) {
+        if ((base < (uint32_t) mem->mh_Lower) ||
+            (base >= (uint32_t) mem->mh_Upper))
+            continue;  // Not the memory region containing base
+        for (chunk = mem->mh_First; chunk != NULL; chunk = chunk->mc_Next) {
+            uint32_t start = (uint32_t) chunk;
+            uint32_t end   = start + chunk->mc_Bytes;
+            if ((start < (uint32_t) mem->mh_Lower) ||
+                (end > (uint32_t) mem->mh_Upper))
+                break;  // Memory list corrupt - quit now!
+            if (start < base)
+                start = MEM_ALIGN(base);
+            if ((start < end) && (end - start >= byteSize)) {
+                addr = AllocAbs(byteSize, (APTR) start);
+                break;  // Free list is sorted by address
+            }
+        }
+        break;
+    }
+    Permit();
+    return (addr);
+}
+
 APTR
 AllocMemType(ULONG byteSize, uint32_t memtype)
 {
@@ -628,7 +737,7 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
 
     /* Don't bother with memory allocate */
     if (mem_skip_alloc)
-        return ((APTR) memtype);
+        return (alloc_skip(byteSize, memtype));
 
     switch (memtype) {
         case 0:
@@ -734,7 +843,7 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
         default:
             /* Allocate user-specified address */
             if (memtype > MEMTYPE_MAX)
-                addr = AllocAbs(byteSize, (APTR) memtype);
+                addr = alloc_user_addr(byteSize, memtype);
             else
                 addr = NULL;
             break;
@@ -747,8 +856,10 @@ AllocMemType(ULONG byteSize, uint32_t memtype)
 void
 FreeMemType(APTR addr, ULONG byteSize)
 {
-    if (mem_skip_alloc)
-        return;  /* Memory was not allocated through the OS */
+    if (mem_skip_alloc) {
+        free_skip(addr);  /* Memory was not allocated through the OS */
+        return;
+    }
     FreeMem(addr, byteSize);
 }
 
@@ -2705,10 +2816,7 @@ drive_benchmark(int do_destructive, uint32_t memtype)
     memset(buf, 0, sizeof (buf));
 try_again:
     for (i = 0; i < num_tio; i++) {
-        uint32_t amemtype = memtype;
-        if (amemtype > 0x10000)
-            amemtype += perf_buf_size * i;
-        buf[i] = (uint8_t *) AllocMemType(perf_buf_size, amemtype);
+        buf[i] = (uint8_t *) AllocMemType(perf_buf_size, memtype);
         if (buf[i] == NULL) {
             if (perf_buf_size > 8192) {
                 /* Restart loop, asking for a smaller buffer */
@@ -3459,11 +3567,18 @@ test_td_seek(struct IOExtTD *tio)
 {
     int rc;
     uint seekoffset = 0;
+    uint64_t abs;
 
     if (get_args_1(&seekoffset))
         return (1);
 
-    seekoffset += g_devstart;
+    abs = g_devstart + seekoffset;
+    if ((abs >> 32) != 0) {
+        print_test_name("TD_SEEK");
+        printf("Skip - offset is beyond 4GB\n");
+        return (0);
+    }
+    seekoffset = (uint) abs;
 
     /* Seek */
     tio->iotd_Req.io_Command = TD_SEEK;
@@ -4357,28 +4472,43 @@ test_nscmd_etd_write64(struct IOExtTD *tio)
 {
     int rc;
     uint8_t **buf = g_tbuf;
+    uint bufsize = BUFSIZE;
+    uint writeoffset = 0;
+    uint writeoffsethi = 0;
+    uint64_t rel_offset;
 
-    memset(buf[0], 0xe5, BUFSIZE);
-    rc = test_etd_command(tio, NSCMD_ETD_WRITE64, "NSCMD_ETD_WRITE64",
-                          BUFSIZE, buf[0], 0);
-    if (rc == -1)
+    if (get_args_3(&bufsize, &writeoffset, &writeoffsethi))
+        return (1);
+    if (bufsize > BUFSIZE)
+        bufsize = BUFSIZE;
+
+    rel_offset = ((uint64_t) writeoffsethi << 32) | writeoffset;
+
+    memset(buf[0], 0xe5, bufsize);
+    print_test_name("NSCMD_ETD_WRITE64");
+    if ((rc = save_target_data(tio, rel_offset, bufsize)) != 0) {
+        printf("\n");
+        return (rc);
+    }
+    rc = test_etd_command(tio, NSCMD_ETD_WRITE64, NULL, bufsize, buf[0],
+                          rel_offset);
+    if (rc == -1) {
+        discard_target_data();
         return (0);  // Skipped
+    }
     if (rc == 0) {
-        if ((rc = check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0)) == 0) {
-            if (HIGH_TEST_OK()) {
-                /* Partition is large enough to test 4GB boundary */
-                printf("  4GB:");
-                memset(buf[0], 0xe6, BUFSIZE);
-                rc = test_etd_command(tio, NSCMD_ETD_WRITE64,
-                                      NULL, BUFSIZE, buf[0], 1ULL << 32);
-                if (rc == -1) {
-                    rc = 0;  // Skipped
-                } else if (rc == 0) {
-                    rc = check_write(tio, buf[0], buf[1], BUFSIZE,
-                                     1ULL << 32, 1);
-                    printf("\n");
-                }
-            } else {
+        rc = check_write(tio, buf[0], buf[1], bufsize, rel_offset, 1);
+        if ((rc == 0) && HIGH_TEST_OK() && (rel_offset == 0)) {
+            /* Partition is large enough to test 4GB boundary */
+            printf("  4GB:");
+            memset(buf[0], 0xe6, bufsize);
+            rc = test_etd_command(tio, NSCMD_ETD_WRITE64, NULL, bufsize,
+                                  buf[0], 1ULL << 32);
+            if (rc == -1) {
+                rc = 0;  // Skipped
+            } else if (rc == 0) {
+                rc = check_write(tio, buf[0], buf[1], bufsize,
+                                 1ULL << 32, 1);
                 printf("\n");
             }
         } else {
@@ -4386,6 +4516,7 @@ test_nscmd_etd_write64(struct IOExtTD *tio)
         }
     }
     restore_overwritten_data(tio, buf, 2);
+    restore_target_data(tio);
 
     return (rc);
 }
@@ -5863,7 +5994,6 @@ test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
         for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++) {
             uint32_t base;
             uint     cur;
-            uint     memtypex = memtype;
             /*
              * g_ibuf is the collection of buffers for integrity testing.
              *     g_ialign is located within the buffer g_ibuf
@@ -5880,9 +6010,9 @@ test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
              */
             if (((bnum == 4) || (bnum == 5)) && (flag_destructive > 1))
                 continue;
-            g_ibuf[bnum] = AllocMemType(bufsize + align, memtypex);
+            g_ibuf[bnum] = AllocMemType(bufsize + align, memtype);
             if (g_ibuf[bnum] == NULL) {
-                report_allocmem_fail(bufsize + align, memtypex);
+                report_allocmem_fail(bufsize + align, memtype);
                 rc = ENOMEM;
                 goto integrity_fail;
             }
@@ -5909,8 +6039,6 @@ test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
             if (g_verbose > 1)
                 printf("Align %p\n", g_align[bnum]);
 
-            if (memtypex > MEMTYPE_MAX)
-                memtypex += bufsize;
             if (bnum == 0) {
                 switch (pattern) {
                     default: {
@@ -6599,7 +6727,13 @@ main(int argc, char *argv[])
 
 got_unit:
     memset(g_tbuf, 0, sizeof (g_tbuf));
-    for (bnum = 0; bnum < ARRAY_SIZE(g_tbuf); bnum++) {
+    /*
+     * The general test buffers are only needed by packet tests (-t, -c).
+     * Not allocating them otherwise leaves a user-specified address
+     * (-m <addr>) for the benchmark or integrity test buffers.
+     */
+    for (bnum = 0; (flag_testpackets || (test_cmd_count > 0)) &&
+                   (bnum < ARRAY_SIZE(g_tbuf)); bnum++) {
         g_tbuf[bnum] = (uint8_t *) AllocMemType(BUFSIZE, memtype);
         if (g_tbuf[bnum] == NULL) {
             report_allocmem_fail(BUFSIZE, memtype);

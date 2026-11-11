@@ -36,7 +36,8 @@ devtest will exit with a non-zero code. Example:
 ## 2. Performance
 You can measure device read and write performance in the system, using
 different Amiga memory types (default is fastmem).
-**WARNING: The -d option enables the write benchmark, which is destructive to any data on the drive!**
+**WARNING: The -d option enables the write benchmark, which is destructive
+           to any data on the drive!**
 Examples:
 ```
     9.OS322:> devtest a4091.device 1 -bd
@@ -335,7 +336,10 @@ The above test ran at about 1 MB/sec.
     if it's an older driver that can't handle the packet standards
     which support larger (4GB+) media. Devtest will test most known
     trackdisk commands and report whether they are supported.
-**WARNING: The -d option enables the write benchmark, which is destructive to any data on the drive!**
+**WARNING: The -d option enables the write and format tests. These save
+           the original data and write it back afterward, but if the test
+           or the restore fails, data on the drive may be lost. With a
+           second -d option, the original data is not restored.**
     Example:
 ```
     9.OS322:> devtest -t a4091.device 1 -d
