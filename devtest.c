@@ -1003,14 +1003,12 @@ do_getgeometry(struct IOExtTD *tio, struct DriveGeometry *dg)
     return (DoIO((struct IORequest *) tio));
 }
 
-#if 0
 static uint32_t
 _2btol(const uint8_t *bytes)
 {
     return ((bytes[0] << 8) |
             bytes[1]);
 }
-#endif
 
 static uint32_t
 _3btol(const uint8_t *bytes)
@@ -1307,6 +1305,9 @@ extio_fail:
     return (rc);
 }
 
+/* True if page bytes [pos + off, pos + off + n) were received */
+#define PAGE_HAS_BYTES(off, n) (((hlen == 2) && ((off) + (n) <= avail)))
+
 static int
 drive_geometry(void)
 {
@@ -1457,41 +1458,72 @@ drive_geometry(void)
         printf("Mode Pages%45s", "");
         print_fail_nl(rc);
     } else {
-        uint pos = 4;
-        uint len = pages[0];
-        for (pos = 4; pos < len; pos += pages[pos + 1] + 2) {
+        /*
+         * MODE SENSE(6) header: byte 0 is the mode data length (not
+         * including byte 0 itself) and byte 3 is the block descriptor
+         * length. Mode pages follow the block descriptors. Pages may
+         * start at odd offsets, so multi-byte fields are assembled a
+         * byte at a time (68000 faults on unaligned word access).
+         */
+        uint pos;
+        uint plen;     // Total page length
+        uint end = pages[0] + 1;
+        if (end > SCSI_MODE_PAGES_BUFSIZE)
+            end = SCSI_MODE_PAGES_BUFSIZE;
+        for (pos = 4 + pages[3]; pos + 2 <= end; pos += plen) {
             uint page = pages[pos] & DISK_PGCODE;
+            uint dlen;     // Page data length (following the header)
+            uint hlen;     // Page header length
+            uint avail;    // Page bytes present in the buffer
+
+            if (pages[pos] & 0x40) {
+                /* Sub-page format: 2-byte page length at bytes 2-3 */
+                if (pos + 4 > end)
+                    break;
+                hlen = 4;
+                dlen = _2btol(&pages[pos + 2]);
+            } else {
+                hlen = 2;
+                dlen = pages[pos + 1];
+            }
+            plen  = hlen + dlen;
+            avail = (pos + plen > end) ? end - pos : plen;
+
             switch (page) {
-                case 0x03: { // Disk Format
-                    uint nsec  = *(uint16_t *)(&pages[pos + 10]);
-                    uint ssize = *(uint16_t *)(&pages[pos + 12]);
+                case 0x03: // Disk Format
+                    if (!PAGE_HAS_BYTES(10, 4))
+                        goto show_default;
                     printf("Mode Page 0x%02x", page);
-                    printf("%8u %30u\n", ssize, nsec);
+                    printf("%8u %30u\n",
+                           _2btol(&pages[pos + 12]),   // Sector size
+                           _2btol(&pages[pos + 10]));  // Sectors / track
                     break;
-                }
-                case 0x04: { // Rigid Geometry
-                    uint ncyl  = _3btol(&pages[pos + 2]);
-                    uint nhead = pages[pos + 5];
+                case 0x04: // Rigid Geometry
+                    if (!PAGE_HAS_BYTES(2, 4))
+                        goto show_default;
                     printf("Mode Page 0x%02x", page);
-                    printf("%28u %4u\n", ncyl, nhead);
+                    printf("%28u %4u\n",
+                           _3btol(&pages[pos + 2]),    // Cylinders
+                           pages[pos + 5]);            // Heads
                     break;
-                }
-                case 0x05: { // Flexible Geometry
-                    uint nhead = pages[pos + 4];
-                    uint nsec  = pages[pos + 5];
-                    uint ssize = *(uint16_t *)(&pages[pos + 6]);
-                    uint ncyl  = *(uint16_t *)(&pages[pos + 8]);
+                case 0x05: // Flexible Geometry
+                    if (!PAGE_HAS_BYTES(4, 6))
+                        goto show_default;
                     printf("Mode Page 0x%02x", page);
-                    printf("%8u %18u %6u %4u\n", ssize, ncyl, nhead, nsec);
+                    printf("%8u %18u %6u %4u\n",
+                           _2btol(&pages[pos + 6]),    // Sector size
+                           _2btol(&pages[pos + 8]),    // Cylinders
+                           pages[pos + 4],             // Heads
+                           pages[pos + 5]);            // Sectors / track
                     break;
-                }
-                case 0x06: { // Reduced Block Commands Parameters
-                    uint     ssize = *(uint16_t *)(&pages[pos + 3]);
-                    uint64_t blks  = _5btol(&pages[pos + 5]);
+                case 0x06: // Reduced Block Commands Parameters
+                    if (!PAGE_HAS_BYTES(3, 7))
+                        goto show_default;
                     printf("Mode Page 0x%02x", page);
-                    printf("%8u %12s\n", ssize, llu_to_str(blks));
+                    printf("%8u %12s\n",
+                           _2btol(&pages[pos + 3]),    // Sector size
+                           llu_to_str(_5btol(&pages[pos + 5])));
                     break;
-                }
                 /* The below pages are commonly seen, but not interesting */
                 case 0x00:  // Vendor-specific
                 case 0x01:  // Error recovery
@@ -1509,15 +1541,19 @@ show_default:
                 case 0x0c:  // Notch and Partition (for variable blk devs)
                 default:
                     printf("Mode Page 0x%02x", page);
-                    printf(" len=%u\n", pages[pos + 1]);
+                    if (hlen == 4)
+                        printf(" subpage 0x%02x", pages[pos + 1]);
+                    printf(" len=%u", dlen);
+                    if (avail < plen)
+                        printf(" (truncated to %u)", avail - hlen);
+                    printf("\n");
                     break;
             }
-            if (g_verbose && (pages[pos + 1] > 0)) {
-                int cur;
-                int len = pages[pos + 1];
+            if (g_verbose && (avail > hlen)) {
+                uint cur;
                 printf("   ");
-                for (cur = 0; cur < len; cur++)
-                    printf(" %02x", pages[pos + 2 + cur]);
+                for (cur = pos + hlen; cur < pos + avail; cur++)
+                    printf(" %02x", pages[cur]);
                 printf("\n");
             }
         }
@@ -5985,6 +6021,14 @@ max_cmd_args(uint cmd)
     return (count);
 }
 
+/*
+ * get_cmd_scsi_args() packs the -c scsi(rlen,cmd,...) arguments into
+ * args->arg[] as bytes: arg[0] holds the opcode, CDB length, and reply
+ * length; the remaining CDB bytes start at byte offset 4 (args->arg[1]).
+ * The CDB bytes following the opcode must fit in scsi_generic_t.bytes.
+ */
+#define SCSI_ARG_MAX_POS (4 + sizeof (((scsi_generic_t *) 0)->bytes))
+
 static void
 get_cmd_scsi_args(args_t *args, const char *arg)
 {
@@ -5992,7 +6036,18 @@ get_cmd_scsi_args(args_t *args, const char *arg)
     uint val;
     uint argpos = 0;
     if (arg == NULL) {
-        printf("SCSI command requires len and cmd args\n");
+        printf("SCSI command requires len + cmd args (rlen,cb0,cb1,cb2...)\n"
+               "   (0,0,0000000000)             - Test Unit Ready\n"
+               "   (200,8,000000,1,0)           - Read(6) a 512 byte sector\n"
+               "   (200,a,000000,1,0)           - Write(6) a 512 byte sector\n"
+               "   (800,28,0,00000000,0,0001,0) - Read(10) a 2048 byte sector\n"
+               "   (200,2a,0,00000000,0,0001,0) - Write(10) a 512 byte sector\n"
+               "   (28,12,000000,28,0)          - Inquiry\n"
+               "   (8,25,00,00000000,00000000)  - Read Capacity(10)\n"
+               "   (8,9e,10,0)                  - Read Capacity(16)\n"
+               "   (ff,1a,8,3f,0,ff,0)          - Mode Sense (all pages)\n"
+               "   (18,1a,8,3,0,18,0)           - Get Mode Page 3\n"
+               "");
         exit(RETURN_ERROR);
     }
     memset(args->arg, 0, sizeof (args->arg));
@@ -6011,39 +6066,42 @@ get_cmd_scsi_args(args_t *args, const char *arg)
                 args->arg[0] |= (val & 0xff) << 24;
                 argpos += 1;
                 break;
-            default:
-                if ((argpos + count / 2) / 4 >= sizeof (args->arg))
-                    break;
-                switch (count) {
-                    case 1:  // One-byte
-                    case 2:
-                        *((uint8_t *) args->arg + argpos) = val;
-                        argpos += 1;
-                        break;
-                    case 3:  // Two-byte
-                    case 4:
-                        *(uint16_t *)((uint8_t *) args->arg + argpos) = val;
-                        argpos += 2;
-                        break;
-                    case 5:  // Three-byte
-                    case 6:
-                        *((uint8_t *) args->arg + argpos) = (val >> 16);
-                        argpos++;
-                        *(uint16_t *)((uint8_t *) args->arg + argpos) = val;
-                        argpos += 2;
-                        break;
-                    case 7:  // Four-byte
-                    case 8:
-                        *(uint32_t *)((uint8_t *) args->arg + argpos) = val;
-                        argpos += 4;
-                        break;
-                    default:  // Eight-byte
-                        *(uint64_t *)((uint8_t *) args->arg + argpos) = val;
-                        argpos += 8;
-                        break;
+            default: {
+                /*
+                 * The number of hex digits determines the field width.
+                 * Bytes are stored one at a time, big-endian, as the
+                 * field may not be aligned (68000 faults on unaligned
+                 * word and long access).
+                 */
+                uint nbytes;
+                uint cur;
+                if (count <= 2)
+                    nbytes = 1;
+                else if (count <= 4)
+                    nbytes = 2;
+                else if (count <= 6)
+                    nbytes = 3;
+                else if (count <= 8)
+                    nbytes = 4;
+                else
+                    nbytes = 8;  // val is only 32 bits; upper bytes are 0
+                if (argpos + nbytes > SCSI_ARG_MAX_POS) {
+                    printf("SCSI command is too long (max %u bytes)\n",
+                           SCSI_ARG_MAX_POS - 3);
+                    exit(RETURN_ERROR);
+                }
+                for (cur = 0; cur < nbytes; cur++) {
+                    uint shift = (nbytes - 1 - cur) * 8;
+                    ((uint8_t *) args->arg)[argpos++] =
+                        (shift < 32) ? (uint8_t) (val >> shift) : 0;
                 }
                 break;
+            }
         }
+    }
+    if (argpos < 4) {
+        printf("SCSI command requires len and cmd args\n");
+        exit(RETURN_ERROR);
     }
     args->arg[0] |= ((argpos - 3) & 0xff) << 16;
     args->arg_count = argpos - 3;
