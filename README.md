@@ -69,10 +69,13 @@ While benchmarking a fast device, that device may consume considerable
 CPU bus bandwidth. This would increase CPU utilization, as the CPU
 needs to wait for access to the bus.
 
-Normally, the destructive test will still attempt to read the data
-beforehand and write it back after completing the test. Adding a
-second `-d` option will skip the read and restore. This will speed
-up the test, but not affect the reported performance.
+The write benchmark does not save or restore the data it overwrites.
+It writes from the start of the device (or partition, if one is
+specified), and any data there is lost. This is different from the
+packet (`-t -d`), integrity (`-i -d`), and individual write command
+(`-c write`) tests, which read the original data beforehand and write it
+back after completing the test. For those tests, adding a second `-d`
+option will skip the read and restore.
 
 Sometimes there is a type of memory which is at a specific range
 of addresses, and you want to run the benchmark soecifically against
@@ -140,6 +143,10 @@ latency of a variety of packets. Example:
     HD_SCSICMD write sequential 5.027 ms
     HD_SCSICMD write parallel   4.084 ms
 ```
+
+With `-d`, the CMD_WRITE and HD_SCSICMD write latency tests also overwrite
+data at the start of the device (or partition) without saving or restoring
+it, the same as the write benchmark.
 
 ## 3. Device Geometry
 On the Amiga, there are multiple methods to acquire a drive's physical

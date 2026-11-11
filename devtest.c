@@ -280,7 +280,7 @@ static int do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len,
 static void report_allocmem_fail(uint bufsize, uint memtype);
 
 #define TEST_MAX_CMDS 32
-#define BUF_COUNT     6   // General test buffers
+#define BUF_COUNT     7   // General test buffers
 #define IBUF_COUNT    6   // Integrity test buffers
 
 BOOL __check_abort_enabled = 0;       // Disable gcc clib2 ^C break handling
@@ -579,6 +579,46 @@ static char *
 llu_sector_to_str(uint64_t value)
 {
     return (llu_to_str(value / g_sector_size));
+}
+
+/*
+ * part_size() returns the size in bytes of the area being tested: the
+ * partition when a DOS device name was given, otherwise the whole device.
+ * Returns 0 if the size is not known.
+ */
+static uint64_t
+part_size(void)
+{
+    if (g_devend != 0)
+        return (g_devend - g_devstart);
+    return (g_devsize);
+}
+
+/*
+ * outside_partition() returns TRUE if a partition-relative access of
+ * the specified length would extend past the end of the partition.
+ * Always FALSE when not operating on a partition.
+ */
+static int
+outside_partition(uint64_t rel_offset, uint len)
+{
+    return ((g_devend != 0) && (g_devstart + rel_offset + len > g_devend));
+}
+
+/*
+ * cmd_for_offset() promotes CMD_READ or CMD_WRITE to the equivalent
+ * 64-bit command if the access ends above the 4GB boundary.
+ */
+static UWORD
+cmd_for_offset(UWORD iocmd, uint64_t abs_end)
+{
+    if ((abs_end >> 32) == 0)
+        return (iocmd);
+    if (iocmd == CMD_READ)
+        return (g_has_nsd ? NSCMD_TD_READ64 : TD_READ64);
+    if (iocmd == CMD_WRITE)
+        return (g_has_nsd ? NSCMD_TD_WRITE64 : TD_WRITE64);
+    return (iocmd);
 }
 
 APTR
@@ -1793,15 +1833,22 @@ latency_cmd_seq(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
     struct EClockVal stime;
     struct EClockVal etime;
 
+    uint64_t offset = 0;
+
     if (iocmd & CMD_FLAG_NOT_QUICK) {
         iocmd &= ~CMD_FLAG_NOT_QUICK;
         flags = 0;
     }
+    if ((iocmd == CMD_READ) || (iocmd == CMD_WRITE)) {
+        /* Data transfers start at the beginning of the partition */
+        offset = g_devstart;
+        iocmd = cmd_for_offset(iocmd, offset + BUFSIZE);
+    }
 
     for (iter = 0; iter < num_iter; iter++) {
         tio[0]->iotd_Req.io_Command = iocmd;
-        tio[0]->iotd_Req.io_Actual  = 0;
-        tio[0]->iotd_Req.io_Offset  = 0;
+        tio[0]->iotd_Req.io_Actual  = offset >> 32;
+        tio[0]->iotd_Req.io_Offset  = (uint32_t) offset;
         tio[0]->iotd_Req.io_Length  = BUFSIZE;
         tio[0]->iotd_Req.io_Data    = buf;
         tio[0]->iotd_Req.io_Flags   = flags;
@@ -1855,11 +1902,18 @@ latency_cmd_par(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
     int failcode;
     struct EClockVal stime;
     struct EClockVal etime;
+    uint64_t offset = 0;
+
+    if ((iocmd == CMD_READ) || (iocmd == CMD_WRITE)) {
+        /* Data transfers start at the beginning of the partition */
+        offset = g_devstart;
+        iocmd = cmd_for_offset(iocmd, offset + BUFSIZE);
+    }
 
     for (iter = 0; iter < num_iter; iter++) {
         tio[iter]->iotd_Req.io_Command = iocmd;
-        tio[iter]->iotd_Req.io_Actual  = 0;
-        tio[iter]->iotd_Req.io_Offset  = 0;
+        tio[iter]->iotd_Req.io_Actual  = offset >> 32;
+        tio[iter]->iotd_Req.io_Offset  = (uint32_t) offset;
         tio[iter]->iotd_Req.io_Length  = BUFSIZE;
         tio[iter]->iotd_Req.io_Data    = buf;
         tio[iter]->iotd_Req.io_Flags   = 0;
@@ -1884,6 +1938,32 @@ latency_cmd_par(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
     return (rc);
 }
 
+/*
+ * setup_rw6_lba() fills in the LBA of a SCSI READ(6) / WRITE(6) command
+ * to address the start of the partition. READ(6) / WRITE(6) can only
+ * address the first 2^21 blocks, so fail if the partition starts beyond
+ * that point.
+ */
+static int
+setup_rw6_lba(scsi_rw_6_t *cmd)
+{
+    uint64_t lba;
+
+    if (g_sector_size == 0) {
+        printf("Skip - unknown sector size\n");
+        return (1);
+    }
+    lba = g_devstart / g_sector_size;
+    if ((lba + BUFSIZE / g_sector_size) > BIT(21)) {
+        printf("Skip - partition start beyond reach of 6-byte CDB\n");
+        return (1);
+    }
+    cmd->addr[0] = (lba >> 16) & 0x1f;  // lun << 5 is not used
+    cmd->addr[1] = (uint8_t) (lba >> 8);
+    cmd->addr[2] = (uint8_t) lba;
+    return (0);
+}
+
 static int
 latency_scsidirect_cmd_seq(uint8_t iocmd, uint8_t *buf, int num_iter,
                            struct IOExtTD **tio)
@@ -1904,7 +1984,10 @@ latency_scsidirect_cmd_seq(uint8_t iocmd, uint8_t *buf, int num_iter,
 
     memset(&cmd, 0, sizeof (cmd));
     cmd.opcode = iocmd;
-    cmd.addr[0] = 0; // lun << 5;
+    if (setup_rw6_lba(&cmd) != 0) {
+        FreeMemType(scmd, sizeof (*scmd) * num_iter);
+        return (1);
+    }
     cmd.length = BUFSIZE / g_sector_size;
 
     for (iter = 0; iter < num_iter; iter++) {
@@ -1954,7 +2037,10 @@ latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
 
     memset(&cmd, 0, sizeof (cmd));
     cmd.opcode = iocmd;
-    cmd.addr[0] = 0; // lun << 5;
+    if (setup_rw6_lba(&cmd) != 0) {
+        FreeMemType(scmd, sizeof (*scmd) * num_iter);
+        return (1);
+    }
     cmd.length = BUFSIZE / g_sector_size;
 
     for (iter = 0; iter < num_iter; iter++) {
@@ -2336,7 +2422,8 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
     int rc = 0;
     uint32_t issued;
     uint cur = 0;
-    uint32_t pos;
+    uint64_t pos;
+    uint64_t limit = part_size();
     struct EClockVal stime;
     struct EClockVal etime;
     uint32_t freq;
@@ -2349,6 +2436,13 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
     for (rep = 0; rep < 10; rep++) {
         pos = 0;
         issued = 0;
+
+        if ((g_devend != 0) && (bufsize > limit)) {
+            printf("Partition is too small for %u byte transfers\n",
+                   U32(bufsize));
+            rc++;
+            break;
+        }
 
         print_perf_type((iocmd == CMD_READ) ? 0 : 1, bufsize);
         ReadEClock(&stime);
@@ -2378,11 +2472,17 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
                 }
             }
 
-            tio[cur]->iotd_Req.io_Command = iocmd;
-            tio[cur]->iotd_Req.io_Actual = 0;
+            if ((limit != 0) && (pos + bufsize > limit))
+                pos = 0;  // Wrap to stay within the partition / device
+            {
+                uint64_t abs = g_devstart + pos;
+                tio[cur]->iotd_Req.io_Command =
+                    cmd_for_offset(iocmd, abs + bufsize);
+                tio[cur]->iotd_Req.io_Actual = abs >> 32;
+                tio[cur]->iotd_Req.io_Offset = (uint32_t) abs;
+            }
             tio[cur]->iotd_Req.io_Data = buf[cur];
             tio[cur]->iotd_Req.io_Length = bufsize;
-            tio[cur]->iotd_Req.io_Offset = pos;
             SendIO((struct IORequest *) tio[cur]);
             issued |= BIT(cur);
             pos += bufsize;
@@ -2669,7 +2769,7 @@ do_write_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
 
-    if ((g_devend != 0) && (offset + len >= g_devend))
+    if ((g_devend != 0) && (offset + len > g_devend))
         return (ERROR_PAST_END);
 
     if (((offset + len) >> 32) > 0) {
@@ -2940,23 +3040,45 @@ get_changenum(struct IOExtTD *tio)
     return (rc);
 }
 
+/*
+ * test_etd_command
+ * ----------------
+ * Issue an extended trackdisk command first with an invalid change count
+ * (which should be rejected) and then with the correct change count.
+ * The offset is relative to the start of the partition (if any). For the
+ * NSCMD_ETD_*64 commands, io_Actual holds the high 32 bits of the offset.
+ * The 32-bit ETD commands can not address beyond 4GB.
+ *
+ * Returns -1 if the command was skipped.
+ */
 static int
 test_etd_command(struct IOExtTD *tio, UWORD cmd, const char *cmd_name,
-                 uint len, void *buf, uint io_actual, uint io_offset)
+                 uint len, void *buf, uint64_t rel_offset)
 {
-    int rc;
+    int      rc;
+    uint64_t abs = g_devstart + rel_offset;
+    int      is64 = ((cmd & 0xfffc) == NSCMD_ETD_READ64);
+    ULONG    io_actual = is64 ? (ULONG) (abs >> 32) : 0;
 
-    io_offset += g_devstart;
+    if (cmd_name != NULL)
+        print_test_name(cmd_name);
+    if (!is64 && (((abs + len) >> 32) != 0)) {
+        printf("Skip - offset is beyond 4GB\n");
+        return (-1);
+    }
+    if (outside_partition(rel_offset, len)) {
+        printf("Skip - beyond end of partition\n");
+        return (-1);
+    }
+
     tio->iotd_Req.io_Command = cmd;
-    tio->iotd_Req.io_Offset  = io_offset;
+    tio->iotd_Req.io_Offset  = (uint32_t) abs;
     tio->iotd_Req.io_Actual  = io_actual;
     tio->iotd_Req.io_Length  = len;
     tio->iotd_Req.io_Data    = buf;
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
     tio->iotd_Count          = 0;  /* Should cause TDERR_DiskChanged */
-    if (cmd_name != NULL)
-        print_test_name(cmd_name);
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
         printf("Fail - command accepted with invalid iotd_Count\n");
@@ -2974,7 +3096,7 @@ test_etd_command(struct IOExtTD *tio, UWORD cmd, const char *cmd_name,
     }
 
     tio->iotd_Req.io_Command = cmd;
-    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Offset  = (uint32_t) abs;
     tio->iotd_Req.io_Actual  = io_actual;
     tio->iotd_Req.io_Length  = len;
     tio->iotd_Req.io_Data    = buf;
@@ -3042,7 +3164,6 @@ get_args_3(uint *arg1, uint *arg2, uint *arg3)
     }
 }
 
-#define BUF_COUNT 6
 static int
 test_cmd_read(struct IOExtTD *tio)
 {
@@ -3092,8 +3213,10 @@ test_etd_read(struct IOExtTD *tio)
         bufsize = BUFSIZE;
 
     memset(buf[1], 0xa5, bufsize);
-    rc = test_etd_command(tio, ETD_READ, "ETD_READ", bufsize, buf[1], 0,
+    rc = test_etd_command(tio, ETD_READ, "ETD_READ", bufsize, buf[1],
                           readoffset);
+    if (rc == -1)
+        return (0);  // Skipped
     if (rc == 0) {
         rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
         if (rc != 0) {
@@ -3119,30 +3242,30 @@ test_td_read64(struct IOExtTD *tio)
     uint bufsize = BUFSIZE;
     uint readoffset = 0;
     uint readoffsethi = 0;
+    uint64_t rel_offset;
     uint64_t io_offset;
 
     get_args_3(&bufsize, &readoffset, &readoffsethi);
 
-    io_offset = ((uint64_t) readoffsethi << 32) | readoffset;
-    io_offset += g_devstart;
-    readoffsethi = io_offset >> 32;
-    readoffset = (uint32_t) io_offset;
-
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
+    rel_offset = ((uint64_t) readoffsethi << 32) | readoffset;
+    io_offset = rel_offset + g_devstart;
+
     memset(buf[1], 0xa5, bufsize);
     tio->iotd_Req.io_Command = TD_READ64;
-    tio->iotd_Req.io_Actual  = readoffsethi;  // High 64 bits
-    tio->iotd_Req.io_Offset  = readoffset;
+    tio->iotd_Req.io_Actual  = io_offset >> 32;  // High 32 bits
+    tio->iotd_Req.io_Offset  = (uint32_t) io_offset;
     tio->iotd_Req.io_Length  = bufsize;
     tio->iotd_Req.io_Data    = buf[1];
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_READ64");
     rc = DoIO((struct IORequest *) tio);
-    if ((rc == 0) && (readoffsethi == 0)) {
-        rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
+    if ((rc == 0) && (((io_offset + bufsize) >> 32) == 0)) {
+        /* Verify with CMD_READ (partition-relative offset) */
+        rc = do_read_cmd(tio, rel_offset, bufsize, buf[0], 0);
         if (rc != 0) {
             print_fail(rc);
             printf(" - read verify operation failed\n");
@@ -3207,30 +3330,30 @@ test_nscmd_td_read64(struct IOExtTD *tio)
     uint bufsize = BUFSIZE;
     uint readoffset = 0;
     uint readoffsethi = 0;
+    uint64_t rel_offset;
     uint64_t io_offset;
 
     get_args_3(&bufsize, &readoffset, &readoffsethi);
 
-    io_offset = ((uint64_t) readoffsethi << 32) | readoffset;
-    io_offset += g_devstart;
-    readoffsethi = io_offset >> 32;
-    readoffset = (uint32_t) io_offset;
-
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
+    rel_offset = ((uint64_t) readoffsethi << 32) | readoffset;
+    io_offset = rel_offset + g_devstart;
+
     memset(buf[1], 0xa5, bufsize);
     tio->iotd_Req.io_Command = NSCMD_TD_READ64;
-    tio->iotd_Req.io_Actual  = readoffsethi;  // High 64 bits
-    tio->iotd_Req.io_Offset  = readoffset;
+    tio->iotd_Req.io_Actual  = io_offset >> 32;  // High 32 bits
+    tio->iotd_Req.io_Offset  = (uint32_t) io_offset;
     tio->iotd_Req.io_Length  = bufsize;
     tio->iotd_Req.io_Data    = buf[1];
     tio->iotd_Req.io_Flags   = 0;
     tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("NSCMD_TD_READ64");
     rc = DoIO((struct IORequest *) tio);
-    if ((rc == 0) && (readoffsethi == 0)) {
-        rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
+    if ((rc == 0) && (((io_offset + bufsize) >> 32) == 0)) {
+        /* Verify with CMD_READ (partition-relative offset) */
+        rc = do_read_cmd(tio, rel_offset, bufsize, buf[0], 0);
         if (rc != 0) {
             print_fail(rc);
             printf(" - read verify operation failed\n");
@@ -3256,17 +3379,22 @@ test_nscmd_etd_read64(struct IOExtTD *tio)
     uint bufsize = BUFSIZE;
     uint readoffset = 0;
     uint readoffsethi = 0;
+    uint64_t rel_offset;
 
     get_args_3(&bufsize, &readoffset, &readoffsethi);
 
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
+    rel_offset = ((uint64_t) readoffsethi << 32) | readoffset;
+
     memset(buf[1], 0xa6, bufsize);
     rc = test_etd_command(tio, NSCMD_ETD_READ64, "NSCMD_ETD_READ64",
-                          bufsize, buf[1], readoffsethi, readoffset);
+                          bufsize, buf[1], rel_offset);
+    if (rc == -1)
+        return (0);  // Skipped
     if (rc == 0) {
-        rc = do_read_cmd(tio, readoffset, bufsize, buf[0], 0);
+        rc = do_read_cmd(tio, rel_offset, bufsize, buf[0], 1);
         if (rc != 0) {
             print_fail(rc);
             printf(" - read verify operation failed\n");
@@ -3332,10 +3460,11 @@ test_etd_seek(struct IOExtTD *tio)
     uint seekoffset = 0;
 
     get_args_1(&seekoffset);
-    seekoffset += g_devstart;
 
     rc = test_etd_command(tio, ETD_SEEK, "ETD_SEEK", BUFSIZE, g_tbuf[1],
-                          0, seekoffset);
+                          seekoffset);
+    if (rc == -1)
+        return (0);  // Skipped
     if (rc == 0)
         printf("Success\n");
     return (rc);
@@ -3409,7 +3538,10 @@ test_nscmd_etd_seek64(struct IOExtTD *tio)
     get_args_2(&seekoffset, &seekoffsethi);
 
     rc = test_etd_command(tio, NSCMD_ETD_SEEK64, "NSCMD_ETD_SEEK64",
-                          BUFSIZE, g_tbuf[1], seekoffsethi, seekoffset);
+                          BUFSIZE, g_tbuf[1],
+                          ((uint64_t) seekoffsethi << 32) | seekoffset);
+    if (rc == -1)
+        return (0);  // Skipped
     if (rc == 0)
         printf("Success\n");
     return (rc);
@@ -3850,6 +3982,14 @@ ar_extio_fail:
     return (rc);
 }
 
+/*
+ * The write and format tests below operate at these partition-relative
+ * offsets, which are saved before and restored after the tests:
+ *     0 to BUFSIZE * 2
+ *     4GB to 4GB + BUFSIZE * 2 (only if the partition is large enough)
+ */
+#define HIGH_TEST_OK() (part_size() >= ((1ULL << 32) + BUFSIZE * 2))
+
 static void
 save_overwritten_data(struct IOExtTD *tio, uint8_t **buf)
 {
@@ -3860,8 +4000,8 @@ save_overwritten_data(struct IOExtTD *tio, uint8_t **buf)
     do_read_cmd(tio, 0, BUFSIZE, buf[2], 0);
     do_read_cmd(tio, BUFSIZE, BUFSIZE, buf[3], 0);
 
-    if (g_devsize >= ((1ULL << 32) + BUFSIZE * 2)) {
-        /* Device is large enough to test 4GB boundary */
+    if (HIGH_TEST_OK()) {
+        /* Partition is large enough to test 4GB boundary */
         do_read_cmd(tio, 1ULL << 32, BUFSIZE, buf[4], g_has_nsd);
         do_read_cmd(tio, (1ULL << 32) + BUFSIZE, BUFSIZE, buf[5], g_has_nsd);
     }
@@ -3878,11 +4018,104 @@ restore_overwritten_data(struct IOExtTD *tio, uint8_t **buf, int high)
     /* Restore overwritten data */
     do_write_cmd(tio, 0, BUFSIZE, buf[2], 0);
     do_write_cmd(tio, BUFSIZE, BUFSIZE, buf[3], 0);
-    if (high && (g_devsize >= ((1ULL << 32) + BUFSIZE * 2))) {
+    if (high && HIGH_TEST_OK()) {
         /* Addresses above 4GB were tested */
         do_write_cmd(tio, 1ULL << 32, BUFSIZE, buf[4], has_nsd);
         do_write_cmd(tio, (1ULL << 32) + BUFSIZE, BUFSIZE, buf[5], has_nsd);
     }
+}
+
+/*
+ * A write test may be given an offset (-c write(size,offset)) which is
+ * outside the areas saved by save_overwritten_data(). The original data
+ * at the target offset is saved in g_tbuf[6] before the write, and written
+ * back by restore_target_data() after the test.
+ */
+static uint64_t g_target_offset;
+static uint     g_target_len;  // 0 = nothing saved
+
+/*
+ * save_target_data() saves the data at a partition-relative offset which
+ * is about to be overwritten. Returns nonzero if the data could not be
+ * saved, in which case the write must not be done.
+ */
+static int
+save_target_data(struct IOExtTD *tio, uint64_t rel_offset, uint len)
+{
+    int rc;
+
+    g_target_len = 0;
+    if (flag_destructive > 1)  // Do not save or restore
+        return (0);
+    if (outside_partition(rel_offset, len))
+        return (0);  // The write will be refused
+
+    memset(g_tbuf[6], 0xa5, len);
+    rc = do_read_cmd(tio, rel_offset, len, g_tbuf[6], g_has_nsd);
+    if (rc != 0) {
+        printf("Fail - could not save original data: ");
+        print_fail(rc);
+        return (rc);
+    }
+    g_target_offset = rel_offset;
+    g_target_len = len;
+    return (0);
+}
+
+/* discard_target_data() forgets saved data when the write was not done. */
+static void
+discard_target_data(void)
+{
+    g_target_len = 0;
+}
+
+static void
+restore_target_data(struct IOExtTD *tio)
+{
+    int rc;
+
+    if (g_target_len == 0)
+        return;
+    rc = do_write_cmd(tio, g_target_offset, g_target_len, g_tbuf[6],
+                      g_has_nsd);
+    if (rc != 0) {
+        printf("  Restore of original data at sector %s failed: ",
+               llu_sector_to_str(g_target_offset));
+        print_fail_nl(rc);
+    }
+    g_target_len = 0;
+}
+
+/*
+ * setup_raw_io() sets up a request for a command at a partition-relative
+ * offset. For 64-bit commands (is64 != 0), io_Actual holds the high 32 bits
+ * of the absolute offset.
+ *
+ * Returns nonzero (after printing why) if the request may not be issued:
+ * a 32-bit command beyond 4GB, or an access past the end of the partition.
+ */
+static int
+setup_raw_io(struct IOExtTD *tio, UWORD cmd, int is64, uint64_t rel_offset,
+             uint len, void *buf)
+{
+    uint64_t abs = g_devstart + rel_offset;
+
+    if (!is64 && (((abs + len) >> 32) != 0)) {
+        printf("Skip - offset is beyond 4GB");
+        return (1);
+    }
+    if (outside_partition(rel_offset, len)) {
+        printf("Skip - beyond end of partition");
+        return (1);
+    }
+    tio->iotd_Req.io_Command = cmd;
+    tio->iotd_Req.io_Actual  = is64 ? (ULONG) (abs >> 32) : 0;
+    tio->iotd_Req.io_Offset  = (uint32_t) abs;
+    tio->iotd_Req.io_Length  = len;
+    tio->iotd_Req.io_Data    = buf;
+    tio->iotd_Req.io_Flags   = 0;
+    tio->iotd_Req.io_Error   = 0xa5;
+    return (0);
 }
 
 static int
@@ -3897,17 +4130,17 @@ test_cmd_write(struct IOExtTD *tio)
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
-    writeoffset += g_devstart;
-
     memset(buf[0], 0xdb, bufsize);
-    tio->iotd_Req.io_Command = CMD_WRITE;
-    tio->iotd_Req.io_Actual  = 0;  // Unused
-    tio->iotd_Req.io_Offset  = writeoffset;
-    tio->iotd_Req.io_Length  = bufsize;
-    tio->iotd_Req.io_Data    = buf[0];
-    tio->iotd_Req.io_Flags   = 0;
-    tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("CMD_WRITE");
+    if ((rc = save_target_data(tio, writeoffset, bufsize)) != 0) {
+        printf("\n");
+        return (rc);
+    }
+    if (setup_raw_io(tio, CMD_WRITE, 0, writeoffset, bufsize, buf[0])) {
+        discard_target_data();
+        printf("\n");
+        return (0);
+    }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
         check_write(tio, buf[0], buf[1], bufsize, writeoffset, 0);
@@ -3916,6 +4149,7 @@ test_cmd_write(struct IOExtTD *tio)
     }
     printf("\n");
     restore_overwritten_data(tio, buf, 0);
+    restore_target_data(tio);
 
     return (rc);
 }
@@ -3933,13 +4167,23 @@ test_etd_write(struct IOExtTD *tio)
         bufsize = BUFSIZE;
 
     memset(buf[0], 0xc9, bufsize);
-    rc = test_etd_command(tio, ETD_WRITE, "ETD_WRITE", bufsize, buf[0], 0,
+    print_test_name("ETD_WRITE");
+    if ((rc = save_target_data(tio, writeoffset, bufsize)) != 0) {
+        printf("\n");
+        return (rc);
+    }
+    rc = test_etd_command(tio, ETD_WRITE, NULL, bufsize, buf[0],
                           writeoffset);
+    if (rc == -1) {
+        discard_target_data();
+        return (0);  // Skipped
+    }
     if (rc == 0) {
         rc = check_write(tio, buf[0], buf[1], bufsize, writeoffset, 0);
         printf("\n");
     }
     restore_overwritten_data(tio, buf, 0);
+    restore_target_data(tio);
 
     return (rc);
 }
@@ -3952,43 +4196,40 @@ test_td_write64(struct IOExtTD *tio)
     uint bufsize = BUFSIZE;
     uint writeoffset = 0;
     uint writeoffsethi = 0;
+    uint64_t rel_offset;
 
     get_args_3(&bufsize, &writeoffset, &writeoffsethi);
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
-    writeoffset += g_devstart;
+    rel_offset = ((uint64_t) writeoffsethi << 32) | writeoffset;
 
     memset(buf[0], 0xd6, bufsize);
-    tio->iotd_Req.io_Command = TD_WRITE64;
-    tio->iotd_Req.io_Actual  = writeoffsethi;  // High 64 bits
-    tio->iotd_Req.io_Offset  = writeoffset;
-    tio->iotd_Req.io_Length  = bufsize;
-    tio->iotd_Req.io_Data    = buf[0];
-    tio->iotd_Req.io_Flags   = 0;
-    tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_WRITE64");
+    if ((rc = save_target_data(tio, rel_offset, bufsize)) != 0) {
+        printf("\n");
+        return (rc);
+    }
+    if (setup_raw_io(tio, TD_WRITE64, 1, rel_offset, bufsize, buf[0])) {
+        discard_target_data();
+        printf("\n");
+        return (0);
+    }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        uint64_t offset64 = ((uint64_t) writeoffsethi << 32) | writeoffset;
-        offset64 += g_devstart;
-        if (check_write(tio, buf[0], buf[1], bufsize, offset64, 0) == 0) {
-            if ((g_devsize >= ((1ULL << 32) + bufsize * 2)) &&
-                (offset64 == 0)) {
+        if (check_write(tio, buf[0], buf[1], bufsize, rel_offset, 0) == 0) {
+            if (HIGH_TEST_OK() && (rel_offset == 0)) {
                 printf("  4GB:");
                 memset(buf[0], 0xd7, bufsize);
-                tio->iotd_Req.io_Command = TD_WRITE64;
-                tio->iotd_Req.io_Actual  = 1;  // High 64 bits
-                tio->iotd_Req.io_Offset  = 0;
-                tio->iotd_Req.io_Length  = bufsize;
-                tio->iotd_Req.io_Data    = buf[0];
-                tio->iotd_Req.io_Flags   = 0;
-                tio->iotd_Req.io_Error   = 0xa5;
-                rc = DoIO((struct IORequest *) tio);
-                if (rc == 0) {
-                    check_write(tio, buf[0], buf[1], bufsize, 1ULL << 32, 0);
-                } else {
-                    print_fail(rc);
+                if (setup_raw_io(tio, TD_WRITE64, 1, 1ULL << 32, bufsize,
+                                 buf[0]) == 0) {
+                    rc = DoIO((struct IORequest *) tio);
+                    if (rc == 0) {
+                        check_write(tio, buf[0], buf[1], bufsize,
+                                    1ULL << 32, 0);
+                    } else {
+                        print_fail(rc);
+                    }
                 }
             }
         }
@@ -3997,6 +4238,7 @@ test_td_write64(struct IOExtTD *tio)
     }
     printf("\n");
     restore_overwritten_data(tio, buf, 1);
+    restore_target_data(tio);
 
     return (rc);
 }
@@ -4009,48 +4251,41 @@ test_nscmd_td_write64(struct IOExtTD *tio)
     uint bufsize = BUFSIZE;
     uint writeoffset = 0;
     uint writeoffsethi = 0;
-    uint64_t io_offset;
+    uint64_t rel_offset;
 
     get_args_3(&bufsize, &writeoffset, &writeoffsethi);
-
-    io_offset = ((uint64_t) writeoffsethi << 32) | writeoffset;
-    io_offset += g_devstart;
-    writeoffsethi = io_offset >> 32;
-    writeoffset = (uint32_t) io_offset;
-
     if (bufsize > BUFSIZE)
         bufsize = BUFSIZE;
 
+    rel_offset = ((uint64_t) writeoffsethi << 32) | writeoffset;
+
     memset(buf[0], 0xe5, bufsize);
-    tio->iotd_Req.io_Command = NSCMD_TD_WRITE64;
-    tio->iotd_Req.io_Actual  = writeoffsethi;  // High 64 bits
-    tio->iotd_Req.io_Offset  = writeoffset;
-    tio->iotd_Req.io_Length  = bufsize;
-    tio->iotd_Req.io_Data    = buf[0];
-    tio->iotd_Req.io_Flags   = 0;
-    tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("NSCMD_TD_WRITE64");
+    if ((rc = save_target_data(tio, rel_offset, bufsize)) != 0) {
+        printf("\n");
+        return (rc);
+    }
+    if (setup_raw_io(tio, NSCMD_TD_WRITE64, 1, rel_offset, bufsize, buf[0])) {
+        discard_target_data();
+        printf("\n");
+        return (0);
+    }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        uint64_t offset64 = ((uint64_t) writeoffsethi << 32) | writeoffset;
-        if (check_write(tio, buf[0], buf[1], bufsize, offset64, 1) == 0) {
-            if ((g_devsize >= ((1ULL << 32) + bufsize * 2)) &&
-                (offset64 == 0)) {
-                /* Device is large enough to test 4GB boundary */
+        if (check_write(tio, buf[0], buf[1], bufsize, rel_offset, 1) == 0) {
+            if (HIGH_TEST_OK() && (rel_offset == 0)) {
+                /* Partition is large enough to test 4GB boundary */
                 printf("  4GB:");
                 memset(buf[0], 0xe6, bufsize);
-                tio->iotd_Req.io_Command = NSCMD_TD_WRITE64;
-                tio->iotd_Req.io_Actual  = 1;  // High 64 bits
-                tio->iotd_Req.io_Offset  = 0;
-                tio->iotd_Req.io_Length  = bufsize;
-                tio->iotd_Req.io_Data    = buf[0];
-                tio->iotd_Req.io_Flags   = 0;
-                tio->iotd_Req.io_Error   = 0xa5;
-                rc = DoIO((struct IORequest *) tio);
-                if (rc == 0) {
-                    check_write(tio, buf[0], buf[1], bufsize, 1ULL << 32, 1);
-                } else {
-                    print_fail(rc);
+                if (setup_raw_io(tio, NSCMD_TD_WRITE64, 1, 1ULL << 32,
+                                 bufsize, buf[0]) == 0) {
+                    rc = DoIO((struct IORequest *) tio);
+                    if (rc == 0) {
+                        check_write(tio, buf[0], buf[1], bufsize,
+                                    1ULL << 32, 1);
+                    } else {
+                        print_fail(rc);
+                    }
                 }
             }
         }
@@ -4059,6 +4294,7 @@ test_nscmd_td_write64(struct IOExtTD *tio)
     }
     printf("\n");
     restore_overwritten_data(tio, buf, 2);
+    restore_target_data(tio);
 
     return (rc);
 }
@@ -4071,16 +4307,20 @@ test_nscmd_etd_write64(struct IOExtTD *tio)
 
     memset(buf[0], 0xe5, BUFSIZE);
     rc = test_etd_command(tio, NSCMD_ETD_WRITE64, "NSCMD_ETD_WRITE64",
-                          BUFSIZE, buf[0], 0, 0);
+                          BUFSIZE, buf[0], 0);
+    if (rc == -1)
+        return (0);  // Skipped
     if (rc == 0) {
         if ((rc = check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0)) == 0) {
-            if (g_devsize >= ((1ULL << 32) + BUFSIZE * 2)) {
-                /* Device is large enough to test 4GB boundary */
+            if (HIGH_TEST_OK()) {
+                /* Partition is large enough to test 4GB boundary */
                 printf("  4GB:");
                 memset(buf[0], 0xe6, BUFSIZE);
                 rc = test_etd_command(tio, NSCMD_ETD_WRITE64,
-                                      NULL, BUFSIZE, buf[0], 1, 0);
-                if (rc == 0) {
+                                      NULL, BUFSIZE, buf[0], 1ULL << 32);
+                if (rc == -1) {
+                    rc = 0;  // Skipped
+                } else if (rc == 0) {
                     rc = check_write(tio, buf[0], buf[1], BUFSIZE,
                                      1ULL << 32, 1);
                     printf("\n");
@@ -4105,14 +4345,11 @@ test_td_format(struct IOExtTD *tio)
 
     /* Format (acts the same same as write) */
     memset(buf[0], 0xdb, BUFSIZE);
-    tio->iotd_Req.io_Command = TD_FORMAT;
-    tio->iotd_Req.io_Actual  = 0;  // Unused
-    tio->iotd_Req.io_Offset  = BUFSIZE;
-    tio->iotd_Req.io_Length  = BUFSIZE;
-    tio->iotd_Req.io_Data    = buf[0];
-    tio->iotd_Req.io_Flags   = 0;
-    tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_FORMAT");
+    if (setup_raw_io(tio, TD_FORMAT, 0, BUFSIZE, BUFSIZE, buf[0])) {
+        printf("\n");
+        return (0);
+    }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
         check_write(tio, buf[0], buf[1], BUFSIZE, BUFSIZE, 0);
@@ -4132,7 +4369,9 @@ test_etd_format(struct IOExtTD *tio)
     uint8_t **buf = g_tbuf;
 
     memset(buf[0], 0xca, BUFSIZE);
-    rc = test_etd_command(tio, ETD_FORMAT, "ETD_FORMAT", BUFSIZE, buf[0], 0, 0);
+    rc = test_etd_command(tio, ETD_FORMAT, "ETD_FORMAT", BUFSIZE, buf[0], 0);
+    if (rc == -1)
+        return (0);  // Skipped
     if (rc == 0) {
         check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0);
         printf("\n");
@@ -4149,34 +4388,27 @@ test_td_format64(struct IOExtTD *tio)
     uint8_t **buf = g_tbuf;
 
     memset(buf[0], 0xf4, BUFSIZE);
-    tio->iotd_Req.io_Command = TD_FORMAT64;
-    tio->iotd_Req.io_Actual  = 0;  // High 64 bits
-    tio->iotd_Req.io_Offset  = BUFSIZE;
-    tio->iotd_Req.io_Length  = BUFSIZE;
-    tio->iotd_Req.io_Data    = buf[0];
-    tio->iotd_Req.io_Flags   = 0;
-    tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_FORMAT64");
+    if (setup_raw_io(tio, TD_FORMAT64, 1, BUFSIZE, BUFSIZE, buf[0])) {
+        printf("\n");
+        return (0);
+    }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
         if (check_write(tio, buf[0], buf[1], BUFSIZE, BUFSIZE, 0) == 0) {
-            if (g_devsize >= ((1ULL << 32) + BUFSIZE * 2)) {
-                /* Device is large enough to test 4GB boundary */
+            if (HIGH_TEST_OK()) {
+                /* Partition is large enough to test 4GB boundary */
                 printf("  4GB:");
                 memset(buf[0], 0xf5, BUFSIZE);
-                tio->iotd_Req.io_Command = TD_FORMAT64;
-                tio->iotd_Req.io_Actual  = 1;  // High 64 bits
-                tio->iotd_Req.io_Offset  = BUFSIZE;
-                tio->iotd_Req.io_Length  = BUFSIZE;
-                tio->iotd_Req.io_Data    = buf[0];
-                tio->iotd_Req.io_Flags   = 0;
-                tio->iotd_Req.io_Error   = 0xa5;
-                rc = DoIO((struct IORequest *) tio);
-                if (rc == 0) {
-                    check_write(tio, buf[0], buf[1], BUFSIZE,
-                                (1ULL << 32) + BUFSIZE, 0);
-                } else {
-                    print_fail(rc);
+                if (setup_raw_io(tio, TD_FORMAT64, 1, (1ULL << 32) + BUFSIZE,
+                                 BUFSIZE, buf[0]) == 0) {
+                    rc = DoIO((struct IORequest *) tio);
+                    if (rc == 0) {
+                        check_write(tio, buf[0], buf[1], BUFSIZE,
+                                    (1ULL << 32) + BUFSIZE, 0);
+                    } else {
+                        print_fail(rc);
+                    }
                 }
 
                 /* Restore overwritten data above 4GB boundary */
@@ -4200,34 +4432,28 @@ test_nscmd_td_format64(struct IOExtTD *tio)
     uint8_t **buf = g_tbuf;
 
     memset(buf[0], 0x1e, BUFSIZE);
-    tio->iotd_Req.io_Command = NSCMD_TD_FORMAT64;
-    tio->iotd_Req.io_Actual  = 0;  // High 64 bits
-    tio->iotd_Req.io_Offset  = BUFSIZE;
-    tio->iotd_Req.io_Length  = BUFSIZE;
-    tio->iotd_Req.io_Data    = buf[0];
-    tio->iotd_Req.io_Flags   = 0;
-    tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("NSCMD_TD_FORMAT64");
+    if (setup_raw_io(tio, NSCMD_TD_FORMAT64, 1, BUFSIZE, BUFSIZE, buf[0])) {
+        printf("\n");
+        return (0);
+    }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
         if (check_write(tio, buf[0], buf[1], BUFSIZE, BUFSIZE, 1) == 0) {
-            if (g_devsize >= ((1ULL << 32) + BUFSIZE * 2)) {
-                /* Device is large enough to test 4GB boundary */
+            if (HIGH_TEST_OK()) {
+                /* Partition is large enough to test 4GB boundary */
                 printf("  4GB:");
                 memset(buf[0], 0x1d, BUFSIZE);
-                tio->iotd_Req.io_Command = NSCMD_TD_FORMAT64;
-                tio->iotd_Req.io_Actual  = 1;  // High 64 bits
-                tio->iotd_Req.io_Offset  = BUFSIZE;
-                tio->iotd_Req.io_Length  = BUFSIZE;
-                tio->iotd_Req.io_Data    = buf[0];
-                tio->iotd_Req.io_Flags   = 0;
-                tio->iotd_Req.io_Error   = 0xa5;
-                rc = DoIO((struct IORequest *) tio);
-                if (rc == 0) {
-                    check_write(tio, buf[0], buf[1], BUFSIZE,
-                                (1ULL << 32) + BUFSIZE, 1);
-                } else {
-                    print_fail(rc);
+                if (setup_raw_io(tio, NSCMD_TD_FORMAT64, 1,
+                                 (1ULL << 32) + BUFSIZE, BUFSIZE,
+                                 buf[0]) == 0) {
+                    rc = DoIO((struct IORequest *) tio);
+                    if (rc == 0) {
+                        check_write(tio, buf[0], buf[1], BUFSIZE,
+                                    (1ULL << 32) + BUFSIZE, 1);
+                    } else {
+                        print_fail(rc);
+                    }
                 }
 
                 /* Restore overwritten data above 4GB boundary */
@@ -4252,16 +4478,20 @@ test_nscmd_etd_format64(struct IOExtTD *tio)
 
     memset(buf[0], 0xe5, BUFSIZE);
     rc = test_etd_command(tio, NSCMD_ETD_FORMAT64, "NSCMD_ETD_FORMAT64",
-                          BUFSIZE, buf[0], 0, 0);
+                          BUFSIZE, buf[0], 0);
+    if (rc == -1)
+        return (0);  // Skipped
     if (rc == 0) {
         if ((rc = check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0)) == 0) {
-            if (g_devsize >= ((1ULL << 32) + BUFSIZE * 2)) {
-                /* Device is large enough to test 4GB boundary */
+            if (HIGH_TEST_OK()) {
+                /* Partition is large enough to test 4GB boundary */
                 printf("  4GB:");
                 memset(buf[0], 0xe6, BUFSIZE);
                 rc = test_etd_command(tio, NSCMD_ETD_FORMAT64,
-                                      NULL, BUFSIZE, buf[0], 1, 0);
-                if (rc == 0) {
+                                      NULL, BUFSIZE, buf[0], 1ULL << 32);
+                if (rc == -1) {
+                    rc = 0;  // Skipped
+                } else if (rc == 0) {
                     rc = check_write(tio, buf[0], buf[1], BUFSIZE,
                                      1ULL << 32, 1);
                     printf("\n");
@@ -4597,7 +4827,7 @@ static const test_cmds_t test_cmds[] = {
                         "TD_WRITE64 TD64 write" },
     { "NSDWRITE",    1, TEST_NSCMD_TD_WRITE64, "size,offset,offsethi",
                         "NSCMD_TD_WRITE64 NSD write" },
-    { "NSDEWRITE",   0, TEST_NSCMD_ETD_WRITE64, "size,offset,offsethi",
+    { "NSDEWRITE",   1, TEST_NSCMD_ETD_WRITE64, "size,offset,offsethi",
                         "NSCMD_ETD_WRITE64 NSD extended write" },
     { "FORMAT",      1, TEST_TD_FORMAT, NULL,
                         "TD_FORMAT format device" },
@@ -4607,11 +4837,11 @@ static const test_cmds_t test_cmds[] = {
                         "TD_FORMAT64 TD64 format device" },
     { "NSDFORMAT",   1, TEST_NSCMD_TD_FORMAT64, NULL,
                         "NSCMD_TD_FORMAT64 NSD format device" },
-    { "NSDEFORMAT",  0, TEST_NSCMD_ETD_FORMAT64, NULL,
+    { "NSDEFORMAT",  1, TEST_NSCMD_ETD_FORMAT64, NULL,
                         "NSCMD_ETD_FORMAT64 NSD extended format" },
     { "UPDATE",      0, TEST_CMD_UPDATE, NULL,
                         "CMD_UPDATE flushes the floppy track buffer" },
-    { "CLEAR",       0, TEST_CMD_CLEAR, NULL,
+    { "CLEAR",       1, TEST_CMD_CLEAR, NULL,
                         "CMD_CLEAR discards the floppy track buffer" },
     { "MOTOROFF",    2, TEST_TD_MOTOR_OFF, NULL,
                         "TD_MOTOR OFF stop motor (spin down)" },
@@ -5075,8 +5305,20 @@ test_integrity_simple(struct IOExtTD *tio, uint bufsize)
         checknum++;
     }
 
-    if (flag_destructive < 2)
+    if (flag_destructive < 2) {
+        /*
+         * Save a copy of the original data. If this read fails, the
+         * original data is unknown, so it must not be overwritten (it
+         * could not be restored).
+         */
         rc = do_read_cmd(tio, pos, bufsize, g_ibuf[4], g_has_nsd);
+        if (rc != 0) {
+            printf("read of original data failed at %s: ",
+                   llu_sector_to_str(pos));
+            print_fail_nl(rc);
+            return (rc);
+        }
+    }
 
     if (g_verbose) {
         uint percent = pos * 1000 / devsize;
@@ -5493,7 +5735,7 @@ fail_cleanup:
             if (rc != 0) {
                 /* Try again */
                 printf("Write failed at %s", llu_sector_to_str(leftoffset));
-                rc = do_write_cmd(tio, rightoffset, bufsize, g_ibuf[5],
+                rc = do_write_cmd(tio, leftoffset, bufsize, g_ibuf[4],
                                   g_has_nsd);
                 if (rc != 0)
                     printf("; data compromised");
@@ -5828,6 +6070,50 @@ get_cmd(const char *str, args_t *args)
     exit(RETURN_ERROR);
 }
 
+/*
+ * destructive_cmd_name() returns the name of a -c command if that command
+ * may modify data on the device (and so requires -d), otherwise NULL.
+ * For the raw SCSI command, the opcode is checked against known
+ * data-modifying SCSI commands.
+ */
+static const char *
+destructive_cmd_name(uint64_t mask, const args_t *args)
+{
+    static const uint8_t scsi_modify_opcodes[] = {
+        0x04,  // FORMAT UNIT
+        0x07,  // REASSIGN BLOCKS
+        0x0a,  // WRITE(6)
+        0x15,  // MODE SELECT(6)
+        0x2a,  // WRITE(10)
+        0x2e,  // WRITE AND VERIFY(10)
+        0x3b,  // WRITE BUFFER (may update firmware)
+        0x3f,  // WRITE LONG(10)
+        0x41,  // WRITE SAME(10)
+        0x55,  // MODE SELECT(10)
+        0x8a,  // WRITE(16)
+        0x8e,  // WRITE AND VERIFY(16)
+        0x93,  // WRITE SAME(16)
+        0xaa,  // WRITE(12)
+        0xae,  // WRITE AND VERIFY(12)
+    };
+    size_t pos;
+
+    for (pos = 0; pos < ARRAY_SIZE(test_cmds); pos++) {
+        if (test_cmds[pos].mask != mask)
+            continue;
+        if (mask == TEST_CMD_SCSI) {
+            uint8_t opcode = (uint8_t) (args->arg[0] >> 24);
+            size_t  op;
+            for (op = 0; op < ARRAY_SIZE(scsi_modify_opcodes); op++)
+                if (scsi_modify_opcodes[op] == opcode)
+                    return (test_cmds[pos].alias);
+            return (NULL);
+        }
+        return ((test_cmds[pos].flags == 1) ? test_cmds[pos].alias : NULL);
+    }
+    return (NULL);
+}
+
 static void
 parse_tsize(const char *arg, uint *tsize, int *pos)
 {
@@ -6158,6 +6444,18 @@ main(int argc, char *argv[])
         printf("You must specify an operation to perform\n");
         usage();
         exit(RETURN_ERROR);
+    }
+    if (flag_destructive == 0) {
+        uint cur;
+        for (cur = 0; cur < test_cmd_count; cur++) {
+            const char *name = destructive_cmd_name(test_cmd_mask[cur],
+                                                    &test_cmd_args[cur]);
+            if (name != NULL) {
+                printf("-c %s can modify data on the device; "
+                       "it requires -d\n", name);
+                exit(RETURN_ERROR);
+            }
+        }
     }
     if (flag_destructive && (force_yes == 0) &&
         (are_you_sure("Destructive test") == FALSE)) {
