@@ -6546,13 +6546,17 @@ idle_task_exit(void)
  * number of EClock ticks which have elapsed during each tun of the
  * idle task. It is up to the caller to determine the percentage of
  * idle time over a given time period.
+ *
+ * The task is created at a priority above the main task, so it starts
+ * immediately. It signals the main task before lowering its own priority:
+ * once at priority -10, it may not run again for a long time if another
+ * task is busy, and the main task must not be left waiting for it.
+ * idle_task_end() similarly raises its priority so that it exits promptly.
  */
 static void
 idle_task_func(void)
 {
-    static struct Task *task_ptr;
-
-    task_ptr = (struct Task *) FindTask((char *)NULL);
+    struct Task *task_ptr = (struct Task *) FindTask((char *)NULL);
 
     Forbid();
     task_ptr->tc_Launch = idle_task_ent;
@@ -6560,19 +6564,92 @@ idle_task_func(void)
     task_ptr->tc_Flags |= TF_SWITCH | TF_LAUNCH;
     Permit();
 
-    SetTaskPri(task_ptr, -10);
     Signal(main_task, 1 << main_signal);  // Let main task resume
+    SetTaskPri(task_ptr, -10);
 
     while (!idle_task_stop) {
         __asm("nop");
     }
 
+    /*
+     * Remain in Forbid() until the task has been removed (which ends the
+     * Forbid), so that the main task can not see idle_task == NULL and
+     * exit (unloading this code) while this task is still executing it.
+     */
     Forbid();
     task_ptr->tc_Launch = NULL;
     task_ptr->tc_Switch = NULL;
     task_ptr->tc_Flags &= ~(TF_SWITCH | TF_LAUNCH);
     idle_task = NULL;
-    Permit();
+}
+
+/*
+ * idle_task_start() starts the idle task which measures CPU utilization.
+ * Returns nonzero if the task could not be started.
+ */
+static int
+idle_task_start(void)
+{
+    BYTE pri;
+    ULONG sigs;
+
+    main_signal = AllocSignal(-1);
+    if (main_signal == -1) {
+        printf("Failed to allocate signal\n");
+        return (1);
+    }
+    main_task = (struct Task *) FindTask((char *)NULL);
+    pri = main_task->tc_Node.ln_Pri;
+    if (pri < 127)
+        pri++;
+    idle_task_stop = 0;
+    idle_task = CreateTask("idle_task", pri, (void *)
+                            (uintptr_t) idle_task_func, 4096);
+    if (idle_task == NULL) {
+        FreeSignal(main_signal);
+        printf("Failed to create idle task\n");
+        return (1);
+    }
+
+    sigs = Wait((1 << main_signal) | SIGBREAKF_CTRL_C);
+    if ((sigs & (1 << main_signal)) == 0) {
+        /* ^C before the idle task signaled; it may not have run yet */
+        Forbid();
+        if ((SetSignal(0, 0) & (1 << main_signal)) == 0) {
+            /* Not started: it's safe to delete it (it holds nothing) */
+            DeleteTask(idle_task);
+            idle_task = NULL;
+            Permit();
+            FreeSignal(main_signal);
+            printf("^C abort\n");
+            return (1);
+        }
+        Permit();
+        Wait(1 << main_signal);  // Signaled after all; consume it
+    }
+    FreeSignal(main_signal);
+    return (0);
+}
+
+/*
+ * idle_task_end() stops the idle task and waits for it to exit.
+ * The task is raised above the main task's priority, so that it runs
+ * (and exits) right away, even if other tasks are keeping the CPU busy.
+ */
+static void
+idle_task_end(void)
+{
+    BYTE pri;
+
+    if (idle_task == NULL)
+        return;
+    pri = main_task->tc_Node.ln_Pri;
+    if (pri < 127)
+        pri++;
+    idle_task_stop = 1;
+    SetTaskPri(idle_task, pri);
+    while (idle_task != NULL)
+        Delay(1);  // Normally already exited, as it has higher priority
 }
 
 int
@@ -6895,23 +6972,8 @@ got_unit:
         }
     }
 
-    if (flag_cpu_utilization) {
-        main_signal = AllocSignal(-1);
-        if (main_signal == -1) {
-            printf("Failed to allocate signal\n");
-            goto idle_fail;
-        }
-        main_task = (struct Task *) FindTask((char *)NULL);
-        idle_task = CreateTask("idle_task", 0, (void *)
-                                (uintptr_t) idle_task_func, 4096);
-        if (idle_task == NULL) {
-            FreeSignal(main_signal);
-            printf("Failed to create idle task\n");
-            goto idle_fail;
-        }
-        Wait(1 << main_signal);
-        FreeSignal(main_signal);
-    }
+    if (flag_cpu_utilization && idle_task_start())
+        goto idle_fail;
 
     for (loop = 0; loop < loops; loop++) {
         uint stop_on_error = (loop != 0) || (loops == 1);
@@ -6987,12 +7049,7 @@ allocmem_fail:
             printf("%u passes completed successfully\n", loops);
     }
 
-    if (idle_task != NULL) {
-        idle_task_stop = 1;
-        SetTaskPri(idle_task, 0);
-        while (idle_task != NULL)
-            Delay(1);  // Allow idle task to exit
-    }
+    idle_task_end();
 
     if (loop < loops)
         exit(RETURN_ERROR);
