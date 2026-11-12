@@ -324,6 +324,14 @@ static uint      g_unitno;            // Device unit and LUN
 static uint      g_e_freq;            // Frequency of eclock (715909 tps)
 static UWORD     g_sense_length;      // Length of returned sense data (if any)
 static UBYTE     g_sense_data[255];   // Sense data buffer
+
+/*
+ * Sense data was returned by the last SCSI direct command. The buffer is
+ * cleared before each command, so a nonzero response code (byte 0) also
+ * shows that sense data was received, even if the driver did not report
+ * scsi_SenseActual.
+ */
+#define SENSE_VALID() ((g_sense_length > 0) || (g_sense_data[0] != 0))
 static uint8_t  *g_tbuf[BUF_COUNT];   // General test buffers for certain tests
 static uint8_t  *g_ibuf[IBUF_COUNT];  // Integrity test buffers
 static uint8_t  *g_align[IBUF_COUNT]; // Integrity test buffers (aligned)
@@ -906,6 +914,13 @@ setup_scsidirect_cmd(struct SCSICmd *scmd, scsi_generic_t *cmd, uint cmdlen,
     // scmd.scsi_Status = 0;
     scmd->scsi_SenseData = g_sense_data;
     scmd->scsi_SenseLength = sizeof (g_sense_data);
+
+    /*
+     * Clear sense data from any previous command, so that a failure
+     * without sense data is not reported with stale sense data.
+     */
+    memset(g_sense_data, 0, sizeof (g_sense_data));
+    g_sense_length = 0;
     // scmd->scsi_SenseActual = 0;
 }
 
@@ -1288,22 +1303,30 @@ get_devsize(struct IOExtTD *tio)
     return (0);
 }
 
+/*
+ * bytes_to_human_str() returns the size of count blocks of blocksize bytes
+ * as a decimal string with a unit suffix (KB, MB, GB, etc).
+ */
 static char *
-bytes_to_human_str(uint64_t bytes, uint blocksize)
+bytes_to_human_str(uint64_t count, uint blocksize)
 {
     static char str[16];
-    uint     bytes_c = 0;  // KMGTPEZY
-    bytes /= 1000;
-    if (bytes > 100000) {
-        bytes /= 1000;
-        bytes_c++;
+    uint     unit = 0;  // KMGTPEZY
+    uint64_t value;
+
+    if (blocksize == 0)
+        blocksize = 1;
+    while (count > UINT64_MAX / blocksize) {
+        /* Scale first to avoid overflow; precision loss is negligible */
+        count /= 1000;
+        unit++;
     }
-    bytes *= blocksize;
-    while (bytes > 9999) {
-        bytes /= 1000;
-        bytes_c++;
+    value = count * blocksize / 1000;  // KB
+    while (value > 9999) {
+        value /= 1000;
+        unit++;
     }
-    sprintf(str, "%u %cB", (uint)bytes, "KMGTPEZY"[bytes_c]);
+    sprintf(str, "%u %cB", (uint) value, "KMGTPEZY"[unit]);
     return (str);
 }
 
@@ -3162,10 +3185,10 @@ test_hd_scsicmd_inquiry(struct IOExtTD *tio)
 {
     /* HD_SCSICMD (SCSI direct) */
     int rc;
-    uint lun = g_lun;
 
+    /* do_scsi_inquiry() takes the unit number; it derives the LUN itself */
     scsi_inquiry_data_t *inq_res;
-    rc = do_scsi_inquiry(tio, lun, &inq_res);
+    rc = do_scsi_inquiry(tio, g_unitno, &inq_res);
     print_test_name("SCSICMD Inquiry");
     if (rc == 0) {
         printf("Success  V='%.*s' P='%.*s' R='%.*s' DT=0x%x",
@@ -3214,7 +3237,7 @@ test_hd_scsicmd_tur(struct IOExtTD *tio)
         printf("Success  Ready\n");
     } else {
         int key = SSD_SENSE_KEY(g_sense_data);
-        if (key == SKEY_NOT_READY) {
+        if (SENSE_VALID() && (key == SKEY_NOT_READY)) {
             printf("Success  ");
             if (SSD_SENSE_ASC(g_sense_data) == 0x3a) {
                 printf("Media not present\n");
@@ -3225,10 +3248,13 @@ test_hd_scsicmd_tur(struct IOExtTD *tio)
             }
         } else {
             print_fail(rc);
-            printf(" Sense Key %x (ASC=%02x ASCQ=%02x)\n",
-                    SSD_SENSE_KEY(g_sense_data),
-                    SSD_SENSE_ASC(g_sense_data),
-                    SSD_SENSE_ASCQ(g_sense_data));
+            if SENSE_VALID() {
+                printf(" Sense Key %x (ASC=%02x ASCQ=%02x)",
+                        SSD_SENSE_KEY(g_sense_data),
+                        SSD_SENSE_ASC(g_sense_data),
+                        SSD_SENSE_ASCQ(g_sense_data));
+            }
+            printf("\n");
         }
     }
 
@@ -4980,7 +5006,7 @@ test_cmd_scsi(struct IOExtTD *tio)
         printf("\n");
     } else {
         int key = SSD_SENSE_KEY(g_sense_data);
-        if (key == SKEY_NOT_READY) {
+        if (SENSE_VALID() && (key == SKEY_NOT_READY)) {
             printf("Success  ");
             if (SSD_SENSE_ASC(g_sense_data) == 0x3a) {
                 printf("Media not present\n");
@@ -4991,7 +5017,7 @@ test_cmd_scsi(struct IOExtTD *tio)
             }
         } else {
             print_fail(rc);
-            if (rc != ERROR_SENSE_CODE) {
+            if ((rc != ERROR_SENSE_CODE) && SENSE_VALID()) {
                 printf("  SENSE %x/%02x/%02x",
                        SSD_SENSE_KEY(g_sense_data),
                        SSD_SENSE_ASC(g_sense_data),
@@ -5447,8 +5473,13 @@ valid_startup(struct FileSysStartupMsg *fssm)
         ((uintptr_t) envec < 0x400) || (TypeOfMem(envec) == 0))
         return (0);
 
-    /* Device name is a BSTR which is also NIL-terminated */
-    if ((devname[0] == 0) || (devname[devname[0] + 1] != '\0'))
+    /*
+     * Device name is a BSTR which is also NIL-terminated, so it can be
+     * used as a C string. Some (such as DF0:) include the NIL in the BSTR
+     * length; others have it just past the end of the BSTR.
+     */
+    if ((devname[0] == 0) ||
+        (memchr(devname + 1, '\0', devname[0] + 1) == NULL))
         return (0);
 
     /* Environment must include geometry up to the high cylinder */
@@ -5711,7 +5742,9 @@ test_integrity_simple(struct IOExtTD *tio, uint bufsize)
                    (memcmp(g_align[curbuf], g_align[3], bufsize) == 0)) {
             printf("Re-read of data matches what was written "
                    "(read failure?)\n");
-        } else if (memcmp(g_ibuf[4], g_align[3], bufsize) == 0) {
+        } else if ((flag_destructive < 2) &&
+                   (memcmp(g_ibuf[4], g_align[3], bufsize) == 0)) {
+            /* g_ibuf[4] (original data) is not allocated with -dd */
             printf("Re-read of data matches what was originally on disk\n");
         } else {
             printf("Re-read of data differs (floating data?)\n");
@@ -5818,7 +5851,14 @@ test_integrity_butterfly(struct IOExtTD *tio, uint bufsize)
 #define ZONES 31  // Must be a prime number to avoid duplicates
 
     devblocks = devsize / g_sector_size;
-    bytes_per_zone = (devsize / ZONES) & ~(uint64_t)(bufsize - 1);
+    /* Zone size is a whole number of transfers (bufsize need not be 2^n) */
+    bytes_per_zone = (devsize / ZONES) / bufsize * bufsize;
+    if (bytes_per_zone == 0) {
+        printf("Device is not large enough for butterfly test with block "
+               "size %u (needs at least %s bytes)\n",
+               bufsize, llu_to_str((uint64_t) bufsize * ZONES));
+        return (1);
+    }
 
     if (g_verbose > 1) {
         printf("devsize=%s ", llu_to_str(devsize));
