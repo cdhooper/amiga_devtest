@@ -3941,13 +3941,19 @@ get_changestate(struct IOExtTD *tio)
     return (tio->iotd_Req.io_Actual);  // 0=Present, 1=Removed
 }
 
+/*
+ * The change interrupt structures are given to the driver, which keeps
+ * them until they are removed. They are static rather than on the stack
+ * so that they remain valid for as long as the program is running.
+ */
+static struct Interrupt  int_addrem;
+static struct Interrupt  int_remove;
+static volatile uint32_t int_count_addrem;
+static volatile uint32_t int_count_remove;
+
 static int
 test_addremchangeint(struct IOExtTD *tio)
 {
-    struct Interrupt int_addrem;
-    struct Interrupt int_remove;
-    volatile uint32_t int_count_addrem = 0;
-    volatile uint32_t int_count_remove = 0;
     struct MsgPort *mp;
     struct IOExtTD *itio;
     int rc;
@@ -3955,7 +3961,11 @@ test_addremchangeint(struct IOExtTD *tio)
     int changestate;
     int have_td_remove = 0;
     int have_td_addrem = 0;
+    int addrem_pending = 0;  // Driver may still hold the TD_ADDCHANGEINT
     uint tick;
+
+    int_count_addrem = 0;
+    int_count_remove = 0;
 
     mp = CreatePort(0, 0);
     if (mp == NULL) {
@@ -4025,6 +4035,8 @@ test_addremchangeint(struct IOExtTD *tio)
 
     if (rc2 == 127) {
         printf("Fail - handler did not clear io_Error\n");
+        /* The request may still be queued in the driver */
+        addrem_pending = 1;
     } else {
         print_fail_nl(rc2);
     }
@@ -4177,15 +4189,32 @@ test_addremchangeint(struct IOExtTD *tio)
     }
 
 test_early_end:
-    if (have_td_addrem) {
+    if (have_td_addrem || addrem_pending) {
+        /*
+         * TD_REMCHANGEINT must use the same I/O request as was used for
+         * TD_ADDCHANGEINT. DoIO() waits for completion, so the request
+         * is not still in use when it is freed below.
+         */
         itio->iotd_Req.io_Command = TD_REMCHANGEINT;
-        itio->iotd_Req.io_Flags |= IOF_QUICK;
+        itio->iotd_Req.io_Length  = sizeof (int_addrem);
+        itio->iotd_Req.io_Data    = &int_addrem;
+        itio->iotd_Req.io_Flags   = 0;
         print_test_name("TD_REMCHANGEINT");
-        BeginIO((struct IORequest *) itio);
-        rc2 = itio->iotd_Req.io_Error;
+        rc2 = DoIO((struct IORequest *) itio);
         print_fail_nl(rc2);
         if (rc == 0)
             rc = rc2;
+        if (rc2 != 0) {
+            /*
+             * The driver may still hold the change interrupt request.
+             * Freeing the request or its reply port could crash the
+             * system on the next disk change, so leave them allocated.
+             */
+            printf("Warning: %s did not remove the change interrupt; "
+                   "rebooting is advised\n", g_devname);
+            itio = NULL;
+            mp = NULL;
+        }
     }
 
     if (have_td_remove) {
@@ -4210,7 +4239,8 @@ ar_opendev_fail:
     if (itio != NULL)
         DeleteExtIO((struct IORequest *) itio);
 ar_extio_fail:
-    DeletePort(mp);
+    if (mp != NULL)
+        DeletePort(mp);
 
     return (rc);
 }
@@ -5397,66 +5427,117 @@ extio_fail:
     return (rc);
 }
 
-static struct FileSysStartupMsg *
-find_startup(char *name)
+/*
+ * valid_startup() returns nonzero if a DOS device's startup value is a real
+ * FileSysStartupMsg. Handlers which are not disk filesystems (RAM:, CON:,
+ * PIPE:, etc) store a small integer or a string pointer there instead.
+ */
+static int
+valid_startup(struct FileSysStartupMsg *fssm)
 {
-    struct FileSysStartupMsg *startup;
+    struct DosEnvec *envec;
+    uint8_t         *devname;
+
+    if (((uintptr_t) fssm < 0x400) || (TypeOfMem(fssm) == 0))
+        return (0);
+
+    devname = (uint8_t *) BTOC(fssm->fssm_Device);
+    envec   = (struct DosEnvec *) BTOC(fssm->fssm_Environ);
+    if (((uintptr_t) devname < 0x400) || (TypeOfMem(devname) == 0) ||
+        ((uintptr_t) envec < 0x400) || (TypeOfMem(envec) == 0))
+        return (0);
+
+    /* Device name is a BSTR which is also NIL-terminated */
+    if ((devname[0] == 0) || (devname[devname[0] + 1] != '\0'))
+        return (0);
+
+    /* Environment must include geometry up to the high cylinder */
+    if (envec->de_TableSize < DE_UPPERCYL)
+        return (0);
+
+    return (1);
+}
+
+/*
+ * find_startup() finds the FileSysStartupMsg of the DOS device named
+ * (for example "DH1:"). If the name is a volume or assign, the DOS device
+ * which is handling it is used. Returns NULL (after reporting why) if no
+ * disk device can be found.
+ */
+static struct FileSysStartupMsg *
+find_startup(const char *name)
+{
+    struct FileSysStartupMsg *startup = NULL;
     struct DosLibrary        *DosBase;
     struct RootNode          *rootnode;
     struct DosInfo           *dosinfo;
     struct DevInfo           *devinfo;
-    char                     *devname;
-    char                     *pos;
-    int                       found = 0;
-    int                       namelen = strlen(name);
+    struct DevInfo           *found = NULL;
+    const char               *pos;
+    const char               *why = "not found";
+    size_t                    namelen;
 
-    if ((pos = strchr(name, ':')) != NULL)
-        *pos = '\0';
+    pos = strchr(name, ':');
+    namelen = (pos != NULL) ? (size_t) (pos - name) : strlen(name);
 
-    DosBase  = (struct DosLibrary *) OpenLibrary("dos.library", 0L);
+    DosBase = (struct DosLibrary *) OpenLibrary("dos.library", 0L);
+    if (DosBase == NULL)
+        return (NULL);
 
     rootnode = DosBase->dl_Root;
     dosinfo  = (struct DosInfo *) BTOC(rootnode->rn_Info);
-    devinfo  = (struct DevInfo *) BTOC(dosinfo->di_DevInfo);
 
-    while (devinfo != NULL) {
-        devname = (char *) BTOC(devinfo->dvi_Name);
-        if (strncasecmp(devname + 1, name, namelen) == 0) {
-            found = 1;
+    Forbid();
+    for (devinfo = (struct DevInfo *) BTOC(dosinfo->di_DevInfo);
+         devinfo != NULL;
+         devinfo = (struct DevInfo *) BTOC(devinfo->dvi_Next)) {
+        /* Compare against the BSTR name, including its length */
+        uint8_t *devname = (uint8_t *) BTOC(devinfo->dvi_Name);
+        if ((devname != NULL) && (devname[0] == namelen) &&
+            (strncasecmp((char *) devname + 1, name, namelen) == 0)) {
+            found = devinfo;
             break;
         }
-        devinfo = (struct DevInfo *) BTOC(devinfo->dvi_Next);
     }
 
-    if (found) {
-        if (devinfo->dvi_Type == DLT_DEVICE) {
-            startup = (struct FileSysStartupMsg *) BTOC(devinfo->dvi_Startup);
-        } else {
+    if (found == NULL) {
+        /* why = "not found" */
+    } else if (found->dvi_Type == DLT_DEVICE) {
+        startup = (struct FileSysStartupMsg *) BTOC(found->dvi_Startup);
+        if (!valid_startup(startup)) {
             startup = NULL;
+            why = "is not a disk device";
         }
-        if (startup == NULL) {
-            /* Try searching for a device which matches the task pointer */
-            APTR task = devinfo->dvi_Task;
-            devinfo  = (struct DevInfo *) BTOC(dosinfo->di_DevInfo);
-            while (devinfo != NULL) {
-                if ((devinfo->dvi_Task == task) &&
-                    (devinfo->dvi_Type == DLT_DEVICE)) {
-                    startup = (struct FileSysStartupMsg *)
-                        BTOC(devinfo->dvi_Startup);
-                    break;
-                }
-                devinfo = (struct DevInfo *) BTOC(devinfo->dvi_Next);
+    } else if (found->dvi_Task == NULL) {
+        /*
+         * A volume which is not mounted (or an assign with no handler).
+         * Searching for a NULL handler task would match any DOS device
+         * whose handler has not been started, which is the wrong device.
+         */
+        why = "is not mounted";
+    } else {
+        /* Volume or assign: find the DOS device with the same handler */
+        APTR task = found->dvi_Task;
+        why = "is not on a disk device";
+        for (devinfo = (struct DevInfo *) BTOC(dosinfo->di_DevInfo);
+             devinfo != NULL;
+             devinfo = (struct DevInfo *) BTOC(devinfo->dvi_Next)) {
+            if ((devinfo->dvi_Task == task) &&
+                (devinfo->dvi_Type == DLT_DEVICE)) {
+                startup = (struct FileSysStartupMsg *)
+                          BTOC(devinfo->dvi_Startup);
+                if (!valid_startup(startup))
+                    startup = NULL;
+                break;
             }
         }
-    } else {
-        startup = NULL;
     }
+    Permit();
 
-    CloseLibrary((struct Library *)DosBase);
+    CloseLibrary((struct Library *) DosBase);
 
-    if (pos != NULL)
-        *pos = ':';
-
+    if (startup == NULL)
+        printf("%.*s: %s\n", (int) namelen, name, why);
     return (startup);
 }
 
@@ -6595,15 +6676,21 @@ main(int argc, char *argv[])
                                     printf("Invalid alignment %s\n", str);
                                     exit(RETURN_ERROR);
                                 }
-                                if (talign & (talign - 1)) {
+                                /*
+                                 * An alignment of 0 would place the test
+                                 * buffers at address 0 (see test_integrity).
+                                 */
+                                if ((talign == 0) || (talign > 0x10000) ||
+                                    (talign & (talign - 1))) {
                                     printf("Invalid alignment %s; must be a "
-                                           "power of 2\n", str);
+                                           "power of 2 from 1 to 65536\n",
+                                           str);
                                     exit(RETURN_ERROR);
                                 }
                             }
-                            if (tsize & 511) {
-                                printf("transfer size must be a multiple "
-                                       "of 512 bytes\n");
+                            if ((tsize == 0) || (tsize & 511)) {
+                                printf("transfer size must be a non-zero "
+                                       "multiple of 512 bytes\n");
                                 exit(RETURN_ERROR);
                             }
                         } else {
@@ -6759,10 +6846,8 @@ main(int argc, char *argv[])
     if ((g_devname != NULL) && (strchr(g_devname, ':') != 0)) {
         struct FileSysStartupMsg *startup = find_startup(g_devname);
         static char unitbuf[10];
-        if (startup == NULL) {
-            printf("Error opening %s\n", g_devname);
-            exit(RETURN_ERROR);
-        }
+        if (startup == NULL)
+            exit(RETURN_ERROR);  // find_startup() reported why
         g_devname     = ((char *) BTOC(startup->fssm_Device)) + 1;
         g_unitno      = startup->fssm_Unit;
         g_envec       = (struct DosEnvec *) BTOC(startup->fssm_Environ);
