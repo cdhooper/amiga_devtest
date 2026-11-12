@@ -206,6 +206,8 @@ typedef struct scsi_generic {
 
 #define SCSI_READ_6_COMMAND             0x08
 #define SCSI_WRITE_6_COMMAND            0x0a
+#define SCSI_READ_10_COMMAND            0x28
+#define SCSI_READ_16_COMMAND            0x88
 #define SCSI_WRITE_10_COMMAND           0x2a
 #define SCSI_WRITE_12_COMMAND           0xaa
 #define SCSI_WRITE_16_COMMAND           0x8a
@@ -215,6 +217,24 @@ typedef struct scsi_rw_6 {
     uint8_t length;
     uint8_t control;
 } __packed scsi_rw_6_t;
+
+typedef struct scsi_rw_10 {
+    uint8_t opcode;
+    uint8_t flags;
+    uint8_t addr[4];
+    uint8_t group;
+    uint8_t length[2];
+    uint8_t control;
+} __packed scsi_rw_10_t;
+
+typedef struct scsi_rw_16 {
+    uint8_t opcode;
+    uint8_t flags;
+    uint8_t addr[8];
+    uint8_t length[4];
+    uint8_t group;
+    uint8_t control;
+} __packed scsi_rw_16_t;
 
 #define MODE_SENSE_6            0x1a
 #define SCSI_MODE_PAGES_BUFSIZE 255
@@ -2096,29 +2116,71 @@ latency_cmd_par(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
 }
 
 /*
- * setup_rw6_lba() fills in the LBA of a SCSI READ(6) / WRITE(6) command
- * to address the start of the partition. READ(6) / WRITE(6) can only
- * address the first 2^21 blocks, so fail if the partition starts beyond
- * that point.
+ * setup_rw_cdb() builds a SCSI read or write CDB which transfers BUFSIZE
+ * bytes at the start of the partition. A 6-byte CDB (READ(6) / WRITE(6))
+ * is used when possible, since this is the common case being measured.
+ * READ(6) / WRITE(6) can only address the first 2^21 blocks, so if the
+ * partition starts beyond that point, a 10-byte CDB (READ(10) / WRITE(10))
+ * is used instead. That can address the first 2^32 blocks; beyond that,
+ * a 16-byte CDB (READ(16) / WRITE(16)) is used. The rw6_opcode argument
+ * is SCSI_READ_6_COMMAND or SCSI_WRITE_6_COMMAND.
+ *
+ * Returns the CDB length (6, 10, or 16), or 0 if the test must be skipped.
  */
-static int
-setup_rw6_lba(scsi_rw_6_t *cmd)
+static uint
+setup_rw_cdb(scsi_generic_t *cdb, uint8_t rw6_opcode)
 {
     uint64_t lba;
+    uint     blocks;
+    int      is_write = (rw6_opcode == SCSI_WRITE_6_COMMAND);
 
+    memset(cdb, 0, sizeof (*cdb));
     if (g_sector_size == 0) {
         printf("Skip - unknown sector size\n");
-        return (1);
+        return (0);
     }
-    lba = g_devstart / g_sector_size;
-    if ((lba + BUFSIZE / g_sector_size) > BIT(21)) {
-        printf("Skip - partition start beyond reach of 6-byte CDB\n");
-        return (1);
+    lba    = g_devstart / g_sector_size;
+    blocks = BUFSIZE / g_sector_size;
+    if (blocks == 0) {
+        printf("Skip - sector size %u is larger than buffer\n",
+               g_sector_size);
+        return (0);
     }
-    cmd->addr[0] = (lba >> 16) & 0x1f;  // lun << 5 is not used
-    cmd->addr[1] = (uint8_t) (lba >> 8);
-    cmd->addr[2] = (uint8_t) lba;
-    return (0);
+
+    if ((lba + blocks <= BIT(21)) && (blocks <= 256)) {
+        scsi_rw_6_t *cmd = (scsi_rw_6_t *) cdb;
+        cmd->opcode  = rw6_opcode;
+        cmd->addr[0] = (lba >> 16) & 0x1f;  // lun << 5 is not used
+        cmd->addr[1] = (uint8_t) (lba >> 8);
+        cmd->addr[2] = (uint8_t) lba;
+        cmd->length  = (uint8_t) blocks;    // 0 means 256 blocks
+        return (sizeof (*cmd));
+    }
+
+    if (lba + blocks <= (1ULL << 32)) {
+        scsi_rw_10_t *cmd = (scsi_rw_10_t *) cdb;
+        cmd->opcode    = is_write ? SCSI_WRITE_10_COMMAND :
+                                    SCSI_READ_10_COMMAND;
+        cmd->addr[0]   = (uint8_t) (lba >> 24);
+        cmd->addr[1]   = (uint8_t) (lba >> 16);
+        cmd->addr[2]   = (uint8_t) (lba >> 8);
+        cmd->addr[3]   = (uint8_t) lba;
+        cmd->length[0] = (uint8_t) (blocks >> 8);
+        cmd->length[1] = (uint8_t) blocks;
+        return (sizeof (*cmd));
+    } else {
+        scsi_rw_16_t *cmd = (scsi_rw_16_t *) cdb;
+        uint pos;
+        cmd->opcode = is_write ? SCSI_WRITE_16_COMMAND :
+                                 SCSI_READ_16_COMMAND;
+        for (pos = 0; pos < 8; pos++)
+            cmd->addr[pos] = (uint8_t) (lba >> ((7 - pos) * 8));
+        cmd->length[0] = (uint8_t) (blocks >> 24);
+        cmd->length[1] = (uint8_t) (blocks >> 16);
+        cmd->length[2] = (uint8_t) (blocks >> 8);
+        cmd->length[3] = (uint8_t) blocks;
+        return (sizeof (*cmd));
+    }
 }
 
 static int
@@ -2128,7 +2190,8 @@ latency_scsidirect_cmd_seq(uint8_t iocmd, uint8_t *buf, int num_iter,
     int iter;
     int rc = 0;
     int failcode;
-    scsi_rw_6_t cmd;
+    scsi_generic_t cmd;
+    uint cmdlen;
     struct SCSICmd *scmd;
     struct EClockVal stime;
     struct EClockVal etime;
@@ -2139,36 +2202,34 @@ latency_scsidirect_cmd_seq(uint8_t iocmd, uint8_t *buf, int num_iter,
         return (1);
     }
 
-    memset(&cmd, 0, sizeof (cmd));
-    cmd.opcode = iocmd;
-    if (setup_rw6_lba(&cmd) != 0) {
+    cmdlen = setup_rw_cdb(&cmd, iocmd);
+    if (cmdlen == 0) {
         FreeMemType(scmd, sizeof (*scmd) * num_iter);
         return (1);
     }
-    cmd.length = BUFSIZE / g_sector_size;
 
     for (iter = 0; iter < num_iter; iter++) {
-        setup_scsidirect_cmd(scmd + iter, (scsi_generic_t *) &cmd, sizeof (cmd),
-                             buf, BUFSIZE);
+        setup_scsidirect_cmd(scmd + iter, &cmd, cmdlen, buf, BUFSIZE);
         tio[iter]->iotd_Req.io_Command = HD_SCSICMD;
         tio[iter]->iotd_Req.io_Length  = sizeof (*scmd);
         tio[iter]->iotd_Req.io_Data    = scmd + iter;
     }
 
+    failcode = 0;
     ReadEClock(&stime);
     for (iter = 0; iter < num_iter; iter++) {
         failcode = DoIO((struct IORequest *) tio[iter]);
         if (failcode != 0) {
-            rc += failcode;
-            if (++rc < 10) {
-                printf("  ");
-                print_fail(failcode);
-            }
+            rc++;
             break;
         }
     }
     ReadEClock(&etime);
-    print_latency(diff_e_clock(&stime, &etime), iter, '\n');
+    if (failcode != 0) {
+        print_fail_nl(failcode);
+    } else {
+        print_latency(diff_e_clock(&stime, &etime), iter, '\n');
+    }
 
     FreeMemType(scmd, sizeof (*scmd) * num_iter);
 
@@ -2183,7 +2244,8 @@ latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
     int rc = 0;
     struct EClockVal stime;
     struct EClockVal etime;
-    scsi_rw_6_t cmd;
+    scsi_generic_t cmd;
+    uint cmdlen;
     struct SCSICmd *scmd;
 
     scmd = AllocMemType(sizeof (*scmd) * num_iter, memtype);
@@ -2192,17 +2254,14 @@ latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
         return (1);
     }
 
-    memset(&cmd, 0, sizeof (cmd));
-    cmd.opcode = iocmd;
-    if (setup_rw6_lba(&cmd) != 0) {
+    cmdlen = setup_rw_cdb(&cmd, iocmd);
+    if (cmdlen == 0) {
         FreeMemType(scmd, sizeof (*scmd) * num_iter);
         return (1);
     }
-    cmd.length = BUFSIZE / g_sector_size;
 
     for (iter = 0; iter < num_iter; iter++) {
-        setup_scsidirect_cmd(scmd + iter, (scsi_generic_t *) &cmd, sizeof (cmd),
-                             buf, BUFSIZE);
+        setup_scsidirect_cmd(scmd + iter, &cmd, cmdlen, buf, BUFSIZE);
         tio[iter]->iotd_Req.io_Command = HD_SCSICMD;
         tio[iter]->iotd_Req.io_Length  = sizeof (*scmd);
         tio[iter]->iotd_Req.io_Data    = scmd + iter;
