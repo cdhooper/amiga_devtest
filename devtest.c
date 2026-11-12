@@ -1059,7 +1059,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
 
     *sectors = 0;
 
-    offset &= ~(g_sector_size - 1);
+    offset &= ~((uint64_t) g_sector_size - 1);
     while (incdec >= g_sector_size / 2) {
         rc = do_read_cmd(tio, offset, g_sector_size, buf, g_has_nsd);
         if (g_verbose)
@@ -1073,7 +1073,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
             } else {
                 while (offset + incdec >= max_offset) {
                     incdec /= 2;
-                    incdec &= ~(g_sector_size - 1);
+                    incdec &= ~((uint64_t) g_sector_size - 1);
                     if (incdec == 0)
                         break;
                 }
@@ -1084,7 +1084,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
             max_offset = offset;
             while ((int64_t) (offset - incdec) <= (int64_t) min_offset) {
                 incdec /= 2;
-                incdec &= ~(g_sector_size - 1);
+                incdec &= ~((uint64_t) g_sector_size - 1);
                 if (incdec == 0)
                     break;
             }
@@ -1749,11 +1749,12 @@ print_latency(uint ttime, uint iters, char endch)
     uint tmsec;
     if (iters == 0)
         iters = 1;
-    tusec = (uint64_t) ttime * 1000000 / g_e_freq / iters;
+    tusec = ((uint64_t) ttime * 1000000 + (uint64_t) g_e_freq * iters / 2) /
+            ((uint64_t) g_e_freq * iters);  // Rounded to nearest usec
     tmsec = tusec / 1000;
     tusec %= 1000;
 
-    printf("%u.%03u ms%c", tmsec, (tusec + 5) / 10, endch);
+    printf("%u.%03u ms%c", tmsec, tusec, endch);
 }
 
 static int
@@ -1766,9 +1767,10 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
     int num_iter = max_iter;
     struct EClockVal stime;
     struct EClockVal etime;
-    unsigned int ttime;
+    unsigned int ttime = 0;
     struct DriveGeometry dg;
 
+    memset(&dg, 0, sizeof (dg));
     for (iters = 0; iters < max_iter; iters++) {
         if ((rc = open_device(tio[iters])) != 0) {
             printf("Open %s Unit %u: ", g_devname, g_unitno);
@@ -1860,8 +1862,11 @@ finish_fail:
     for (iter = 0; iter < num_iter; iter++)
         close_device(tio[iter]);
 
-    g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
-    g_sector_size = dg.dg_SectorSize;
+    /* dg is only valid if at least one TD_GETGEOMETRY succeeded */
+    if ((dg.dg_SectorSize != 0) && (dg.dg_TotalSectors != 0)) {
+        g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
+        g_sector_size = dg.dg_SectorSize;
+    }
 
     return (rc);
 }
@@ -1888,64 +1893,37 @@ latency_butterfly(UWORD iocmd, uint8_t *buf, int num_iter,
     int iter;
     int rc = 0;
     int failcode = 0;
-    unsigned int step;
     struct EClockVal stime;
     struct EClockVal etime;
-    uint64_t start = g_devstart;
-    uint64_t end   = g_devend;
-    uint64_t pos   = start;
-    if (end == 0)
-        end = g_devsize;
+    uint64_t size;   // Partition (or device) size in bytes
+    uint64_t nsec;   // Partition size in sectors
+    uint64_t step;   // Step between positions, in sectors
+    uint64_t half;   // Half of partition, in sectors
 
     if (g_sector_size == 0)
         g_sector_size = 512;
 
-    if (end == 0)
-        end = 720 << 10;  // At least 720K
-
-    if ((end >> 32) != 0) {
-        if (iocmd == CMD_READ) {
-            iocmd = g_has_nsd ? NSCMD_TD_READ64 : TD_READ64;
-        } else if (iocmd == CMD_WRITE) {
-            iocmd = g_has_nsd ? NSCMD_TD_WRITE64 : TD_WRITE64;
-        } else {
-            printf("Unknown iocmd %d\n", iocmd);
-            return (1);
-        }
+    size = part_size();
+    if (size == 0)
+        size = 720 << 10;  // At least 720K
+    nsec = size / g_sector_size;
+    if (nsec < 2) {
+        printf("Device is too small\n");
+        return (1);
     }
-    step = (end - start) / num_iter;
+
+    iocmd = cmd_for_offset(iocmd, g_devstart + size);
+
+    step = nsec / num_iter;
     if (mode == BUTTERFLY_MODE_FAR)
         step /= 4;
-
-    if (step < g_sector_size) {
-        step = g_sector_size;
+    if (step == 0) {
+        step = 1;
         num_iter /= 4;
+        if (num_iter == 0)
+            num_iter = 1;
     }
-
-    for (iter = 0; iter < num_iter; iter++) {
-        tio[0]->iotd_Req.io_Command = iocmd;
-        tio[0]->iotd_Req.io_Actual  = pos >> 32;
-        tio[0]->iotd_Req.io_Offset  = (uint32_t) pos;
-        tio[0]->iotd_Req.io_Length  = g_sector_size;
-        tio[0]->iotd_Req.io_Data    = buf;
-        tio[0]->iotd_Req.io_Flags   = 0;
-        tio[0]->iotd_Req.io_Error   = 0xa5;
-        switch (mode) {
-            case BUTTERFLY_MODE_AVG:
-            case BUTTERFLY_MODE_FAR:
-                if ((iter & 1) == 0)
-                    pos = step * iter / 2;                  // left --> right
-                else
-                    pos = (end - start) - step * iter / 2;  // left <-- right
-                break;
-            case BUTTERFLY_MODE_CONST:
-                if ((iter & 1) == 0)
-                    pos += (end - start) / 2;               // left --> right
-                else
-                    pos -= ((end - start) / 2 - step);      // left <-- right
-                break;
-        }
-    }
+    half = nsec / 2;
 
     ReadEClock(&stime);
     /*
@@ -1954,8 +1932,40 @@ latency_butterfly(UWORD iocmd, uint8_t *buf, int num_iter,
      * quick I/O or not.
      */
     for (iter = 0; iter < num_iter; iter++) {
+        uint64_t k = iter / 2;
+        uint64_t sec;
+        uint64_t pos;
+
+        switch (mode) {
+            default:
+            case BUTTERFLY_MODE_AVG:
+            case BUTTERFLY_MODE_FAR:
+                if ((iter & 1) == 0)
+                    sec = step * k;                 // left --> right
+                else
+                    sec = nsec - 1 - step * k;      // left <-- right
+                break;
+            case BUTTERFLY_MODE_CONST:
+                sec = step * k;                     // left --> right
+                if (iter & 1)
+                    sec += half;                    // left <-- right
+                break;
+        }
+        if (sec >= nsec)
+            sec = nsec - 1;
+        pos = g_devstart + sec * g_sector_size;
+        if (g_verbose > 1)
+            printf("%s ", llu_sector_to_str(pos));
+
+        tio[0]->iotd_Req.io_Command = iocmd;
+        tio[0]->iotd_Req.io_Actual  = pos >> 32;
+        tio[0]->iotd_Req.io_Offset  = (uint32_t) pos;
+        tio[0]->iotd_Req.io_Length  = g_sector_size;
+        tio[0]->iotd_Req.io_Data    = buf;
+        tio[0]->iotd_Req.io_Flags   = 0;
+        tio[0]->iotd_Req.io_Error   = 0xa5;
         failcode = DoIO((struct IORequest *) tio[0]);
-        if ((failcode != 0) && (iocmd != CMD_INVALID)) {
+        if (failcode != 0) {
             rc++;
             break;
         }
@@ -2420,7 +2430,7 @@ drive_latency(int do_destructive)
         if ((iters & 7) == 0) {
             ReadEClock(&etime);
             ttime = diff_e_clock(&stime, &etime);
-            if (ttime > TICKS_PER_SECOND * 2) {
+            if (ttime > g_e_freq * 2) {
                 iters++;
                 break;
             }
@@ -2470,7 +2480,7 @@ drive_latency(int do_destructive)
         if ((iters & 7) == 0) {
             ReadEClock(&etime);
             ttime = diff_e_clock(&stime, &etime);
-            if ((ttime > TICKS_PER_SECOND * 2) ||
+            if ((ttime > g_e_freq * 2) ||
                 (iters > NUM_MTIO - 7)) {
                 iters++;
                 break;
