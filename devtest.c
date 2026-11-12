@@ -107,7 +107,7 @@ struct Device   *TimerBase;
 #define CTOB(x) ((x)>>2)
 
 #define BUFSIZE    8192
-#define RAWBUFSIZE 16384
+#define RAWBUFSIZE 32766  // Maximum disk DMA length (16383 words)
 
 #define MEMTYPE_ANY    0
 #define MEMTYPE_CHIP   1
@@ -298,6 +298,8 @@ typedef struct {
 static int do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len,
                        void *buf, int nsd);
 static void report_allocmem_fail(uint bufsize, uint memtype);
+static void show_diffs(void *expected, void *data, uint len,
+                       const char *type);
 
 #define TEST_MAX_CMDS 32
 #define BUF_COUNT     7   // General test buffers
@@ -1168,7 +1170,6 @@ _3btol(const uint8_t *bytes)
             bytes[2]);
 }
 
-#if 0
 static uint32_t
 _4btol(const uint8_t *bytes)
 {
@@ -1177,7 +1178,6 @@ _4btol(const uint8_t *bytes)
             ((uint32_t)bytes[2] << 8) |
             (uint32_t)bytes[3]);
 }
-#endif
 
 static uint64_t
 _5btol(const uint8_t *bytes)
@@ -1807,6 +1807,22 @@ print_latency(uint ttime, uint iters, char endch)
     printf("%u.%03u ms%c", tmsec, tusec, endch);
 }
 
+/*
+ * print_par_result() reports the result of a parallel latency test: the
+ * average latency if all requests succeeded, otherwise how many failed
+ * and the first failure (a latency figure would not be meaningful).
+ */
+static void
+print_par_result(uint ttime, uint num_iter, uint failed, int failcode)
+{
+    if (failed == 0) {
+        print_latency(ttime, num_iter, '\n');
+    } else {
+        printf("%u of %u failed: ", failed, num_iter);
+        print_fail_nl(failcode);
+    }
+}
+
 static int
 latency_getgeometry(struct IOExtTD **tio, int max_iter)
 {
@@ -1892,21 +1908,21 @@ latency_getgeometry(struct IOExtTD **tio, int max_iter)
     for (iter = 0; iter < iters; iter++) {
         SendIO((struct IORequest *) tio[iter]);
     }
-    for (iter = 0; iter < iters; iter++) {
-        failcode = WaitIO((struct IORequest *) tio[iter]);
-        if (failcode != 0) {
-            if (++rc < 5) {
-                printf(" ");
-                print_fail(failcode);
-                printf(" ");
-            } else if (rc == 6) {
-                printf(" ... ");
+    {
+        uint failed = 0;
+        int  first = 0;
+        for (iter = 0; iter < iters; iter++) {
+            failcode = WaitIO((struct IORequest *) tio[iter]);
+            if (failcode != 0) {
+                if (failed++ == 0)
+                    first = failcode;  // Report the first failure
             }
         }
+        ReadEClock(&etime);
+        ttime = diff_e_clock(&stime, &etime);
+        print_par_result(ttime, iters, failed, first);
+        rc += failed;
     }
-    ReadEClock(&etime);
-    ttime = diff_e_clock(&stime, &etime);
-    print_latency(ttime, iter, '\n');
 
 finish_fail:
     for (iter = 0; iter < num_iter; iter++)
@@ -2106,7 +2122,7 @@ latency_cmd_par(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
 {
     int iter;
     int rc = 0;
-    int failcode;
+    int failcode = 0;
     struct EClockVal stime;
     struct EClockVal etime;
     uint64_t offset = 0;
@@ -2132,16 +2148,14 @@ latency_cmd_par(UWORD iocmd, uint8_t *buf, int num_iter, struct IOExtTD **tio)
         SendIO((struct IORequest *) tio[iter]);
     }
     for (iter = 0; iter < num_iter; iter++) {
-        failcode = WaitIO((struct IORequest *) tio[iter]);
-        if (failcode != 0) {
-            if (++rc < 10) {
-                printf("  ");
-                print_fail(failcode);
-            }
+        int code = WaitIO((struct IORequest *) tio[iter]);
+        if (code != 0) {
+            if (rc++ == 0)
+                failcode = code;  // Report the first failure
         }
     }
     ReadEClock(&etime);
-    print_latency(diff_e_clock(&stime, &etime), iter, '\n');
+    print_par_result(diff_e_clock(&stime, &etime), num_iter, rc, failcode);
     return (rc);
 }
 
@@ -2272,6 +2286,7 @@ latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
 {
     int iter;
     int rc = 0;
+    int failcode = 0;
     struct EClockVal stime;
     struct EClockVal etime;
     scsi_generic_t cmd;
@@ -2302,16 +2317,14 @@ latency_scsidirect_cmd_par(uint8_t iocmd, uint8_t *buf, int num_iter,
         SendIO((struct IORequest *) tio[iter]);
     }
     for (iter = 0; iter < num_iter; iter++) {
-        int failcode = WaitIO((struct IORequest *) tio[iter]);
-        if (failcode != 0) {
-            if (++rc < 10) {
-                printf("  ");
-                print_fail(failcode);
-            }
+        int code = WaitIO((struct IORequest *) tio[iter]);
+        if (code != 0) {
+            if (rc++ == 0)
+                failcode = code;  // Report the first failure
         }
     }
     ReadEClock(&etime);
-    print_latency(diff_e_clock(&stime, &etime), iter, '\n');
+    print_par_result(diff_e_clock(&stime, &etime), num_iter, rc, failcode);
 
     FreeMemType(scmd, sizeof (*scmd) * num_iter);
 
@@ -2996,7 +3009,7 @@ do_read_cmd(struct IOExtTD *tio, uint64_t offset, uint len, void *buf, int nsd)
     tio->iotd_Req.io_Error   = 0xa5;
 
     /* Ensure read does not go past end of partition (only in partition mode */
-    if ((g_devend > g_sector_size) && (offset + len > g_devend))
+    if ((g_devend != 0) && (offset + len > g_devend))
         return (ERROR_PAST_END);
 
     if (((offset + len) >> 32) > 0) {
@@ -3265,16 +3278,18 @@ test_hd_scsicmd_tur(struct IOExtTD *tio)
             }
         } else {
             print_fail(rc);
-            if SENSE_VALID() {
+            if (SENSE_VALID()) {
                 printf(" Sense Key %x (ASC=%02x ASCQ=%02x)",
                         SSD_SENSE_KEY(g_sense_data),
                         SSD_SENSE_ASC(g_sense_data),
                         SSD_SENSE_ASCQ(g_sense_data));
             }
             printf("\n");
+            return (rc);
         }
     }
 
+    /* Ready, or a valid "not ready" (such as no media) response */
     return (0);
 }
 
@@ -4834,93 +4849,664 @@ test_nscmd_etd_format64(struct IOExtTD *tio)
     return (rc);
 }
 
+/*
+ * AmigaDOS MFM track format
+ * -------------------------
+ * Each sector on an AmigaDOS floppy track is encoded as:
+ *     0xAAAA 0xAAAA         MFM-encoded zeros (preamble)
+ *     0x4489 0x4489         Sync words
+ *     4 + 4 bytes           Info: format (0xff), track, sector, to-gap
+ *     16 + 16 bytes         Sector label (OS recovery info)
+ *     4 + 4 bytes           Header checksum
+ *     4 + 4 bytes           Data checksum
+ *     512 + 512 bytes       Data
+ * Each field is stored as its odd bits followed by its even bits. A value
+ * is decoded with ((odd & 0x55555555) << 1) | (even & 0x55555555). The
+ * checksums are the XOR of the encoded longwords, masked with 0x55555555.
+ */
+#define MFM_SYNC        0x4489
+#define MFM_MASK        0x55555555
+#define MFM_SECTOR_LEN  1080  // Encoded sector following the sync words
+#define MFM_SECTOR_RAW  1088  // Encoded sector including preamble and sync
+#define MFM_HDR_OFF     0     // Info and label (40 encoded bytes)
+#define MFM_HDRSUM_OFF  40
+#define MFM_DATASUM_OFF 48
+#define MFM_DATA_OFF    56    // 512 odd bytes then 512 even bytes
+
+static uint32_t
+mfm_decode32(const uint8_t *odd, const uint8_t *even)
+{
+    return (((_4btol(odd) & MFM_MASK) << 1) | (_4btol(even) & MFM_MASK));
+}
+
+static uint32_t
+mfm_checksum(const uint8_t *raw, uint len)
+{
+    uint32_t sum = 0;
+    uint     pos;
+    for (pos = 0; pos < len; pos += 4)
+        sum ^= _4btol(raw + pos);
+    return (sum & MFM_MASK);
+}
+
+typedef struct {
+    uint     sectors;      // AmigaDOS sectors found (including duplicates)
+    uint     errors;       // Sectors with errors
+    uint32_t found;        // Bitmap of good sectors decoded
+    char     first_error[64];
+} mfm_result_t;
+
+static void
+mfm_error(mfm_result_t *res, const char *fmt, uint val)
+{
+    if (res->errors++ == 0)
+        sprintf(res->first_error, fmt, val);
+}
+
+/*
+ * mfm_align() finds the first pair of sync words (0x4489 0x4489) at any bit
+ * position in the raw track buffer, and shifts the buffer contents in place
+ * so that the sync words are on 16-bit boundaries. TD_RAWREAD does not
+ * necessarily return word-aligned data, even with IOTDF_WORDSYNC.
+ * Returns the new length of valid data, or 0 if no sync was found.
+ */
+static uint
+mfm_align(uint8_t *raw, uint len, uint *shift)
+{
+    uint pos;
+    uint bit;
+    uint bitoff = 0;
+    uint byteoff;
+    int  found = 0;
+
+    for (pos = 0; (pos + 5 <= len) && !found; pos++) {
+        uint32_t hi = _4btol(raw + pos);
+        uint32_t lo = raw[pos + 4];
+        for (bit = 0; bit < 8; bit++) {
+            uint32_t win = (hi << bit) | (lo >> (8 - bit));
+            if (bit == 0)
+                win = hi;
+            if (win == ((MFM_SYNC << 16) | MFM_SYNC)) {
+                bitoff = pos * 8 + bit;
+                found = 1;
+                break;
+            }
+        }
+    }
+    if (!found)
+        return (0);
+
+    /* Shift so the stream starts on the same 16-bit phase as the sync */
+    bitoff %= 16;
+    *shift = bitoff;
+    byteoff = bitoff / 8;
+    bit     = bitoff % 8;
+    if (bitoff == 0)
+        return (len);
+    len -= byteoff + 1;
+    for (pos = 0; pos < len; pos++) {
+        raw[pos] = (uint8_t) ((raw[pos + byteoff] << bit) |
+                              (bit ? (raw[pos + byteoff + 1] >> (8 - bit)) :
+                                     0));
+    }
+    return (len & ~1);
+}
+
+/*
+ * mfm_verify_track() decodes the AmigaDOS sectors in a raw track buffer,
+ * verifies their headers and checksums, and stores the data of each good
+ * sector at decoded + sector * 512. A sector may appear more than once if
+ * the buffer covers more than one revolution; the first good copy is used.
+ * Partial sectors at the start and end of the buffer are ignored. The
+ * buffer is modified (realigned to the sync words).
+ */
+static void
+mfm_verify_track(uint8_t *raw, uint len, uint track, uint nsec,
+                 uint8_t *decoded, mfm_result_t *res)
+{
+    uint pos = 0;
+    uint shift = 0;
+
+    memset(res, 0, sizeof (*res));
+    /*
+     * With IOTDF_WORDSYNC, the hardware consumes the first sync word, so
+     * the buffer starts with the second one: already aligned.
+     */
+    if ((len < 2) || (((raw[0] << 8) | raw[1]) != MFM_SYNC))
+        len = mfm_align(raw, len, &shift);
+    if (g_verbose > 1)
+        printf("  [sync bit offset %u]", shift);
+    while (pos + 2 <= len) {
+        const uint8_t *sec;
+        uint32_t info;
+        uint     fmt;
+        uint     trk;
+        uint     snum;
+        uint     word;
+
+        if (((raw[pos] << 8) | raw[pos + 1]) != MFM_SYNC) {
+            pos += 2;
+            continue;
+        }
+        /* Skip any additional sync words */
+        while ((pos + 2 <= len) &&
+               (((raw[pos] << 8) | raw[pos + 1]) == MFM_SYNC))
+            pos += 2;
+        if (pos + MFM_SECTOR_LEN > len)
+            break;  // Partial sector at end of buffer
+
+        sec  = raw + pos;
+        info = mfm_decode32(sec + MFM_HDR_OFF, sec + MFM_HDR_OFF + 4);
+        fmt  = info >> 24;
+        trk  = (info >> 16) & 0xff;
+        snum = (info >> 8) & 0xff;
+        if (fmt != 0xff)
+            continue;  // Not an AmigaDOS sector header; keep searching
+        res->sectors++;
+
+        if (mfm_checksum(sec + MFM_HDR_OFF, 40) !=
+            mfm_decode32(sec + MFM_HDRSUM_OFF, sec + MFM_HDRSUM_OFF + 4)) {
+            mfm_error(res, "header checksum error (header says sector %u)",
+                      snum);
+        } else if (trk != track) {
+            mfm_error(res, "sector header has wrong track %u", trk);
+        } else if (snum >= nsec) {
+            mfm_error(res, "sector header has invalid sector %u", snum);
+        } else if (mfm_checksum(sec + MFM_DATA_OFF, 1024) !=
+                   mfm_decode32(sec + MFM_DATASUM_OFF,
+                                sec + MFM_DATASUM_OFF + 4)) {
+            mfm_error(res, "sector %u data checksum error", snum);
+        } else if ((res->found & BIT(snum)) == 0) {
+            uint8_t *out = decoded + snum * 512;
+            for (word = 0; word < 128; word++) {
+                uint32_t val = mfm_decode32(sec + MFM_DATA_OFF + word * 4,
+                                            sec + MFM_DATA_OFF + 512 +
+                                            word * 4);
+                out[word * 4]     = (uint8_t) (val >> 24);
+                out[word * 4 + 1] = (uint8_t) (val >> 16);
+                out[word * 4 + 2] = (uint8_t) (val >> 8);
+                out[word * 4 + 3] = (uint8_t) val;
+            }
+            res->found |= BIT(snum);
+        }
+        if (g_verbose > 1)
+            printf("  [%u: trk=%u sec=%u gap=%u]", pos, trk, snum,
+                   (uint) (info & 0xff));
+        pos += MFM_SECTOR_LEN;
+    }
+}
+
+/*
+ * mfm_add_clocks() adds MFM clock bits to a buffer which holds only data
+ * bits (0x55 positions). A clock bit is 1 only when the data bits on both
+ * sides of it are 0. prevbit is the last bit written before the buffer.
+ */
+static void
+mfm_add_clocks(uint8_t *p, uint len, uint prevbit)
+{
+    uint pos;
+    for (pos = 0; pos < len; pos++) {
+        uint data  = p[pos] & 0x55;
+        uint clock = ~((data << 1) | (data >> 1) | (prevbit << 7)) & 0xaa;
+        p[pos] = (uint8_t) (data | clock);
+        prevbit = p[pos] & 1;
+    }
+}
+
+static void
+mfm_put_data32(uint8_t *odd, uint8_t *even, uint32_t val)
+{
+    uint32_t o = (val >> 1) & MFM_MASK;
+    uint32_t e = val & MFM_MASK;
+    odd[0]  = (uint8_t) (o >> 24);
+    odd[1]  = (uint8_t) (o >> 16);
+    odd[2]  = (uint8_t) (o >> 8);
+    odd[3]  = (uint8_t) o;
+    even[0] = (uint8_t) (e >> 24);
+    even[1] = (uint8_t) (e >> 16);
+    even[2] = (uint8_t) (e >> 8);
+    even[3] = (uint8_t) e;
+}
+
+/*
+ * mfm_encode_track() builds a raw AmigaDOS track for TD_RAWWRITE from
+ * nsec sectors of 512 bytes, in order from sector 0. A gap of MFM zeros
+ * precedes the sectors: the write covers more than a revolution, so the
+ * end of the write wraps around over the start of the gap rather than over
+ * sector data. A short gap also follows the last sector: a floppy emulator
+ * (seen with amiga3's) did not store the last sector of a write which
+ * ended right after its data. Returns the length of the raw track in bytes.
+ */
+#define MFM_TRACK_GAP(nsec) ((nsec) * 100 - MFM_TRACK_TRAIL)  // For wrap
+#define MFM_TRACK_TRAIL     64  // Gap after the last sector
+
+static uint
+mfm_encode_track(uint8_t *raw, const uint8_t *data, uint nsec, uint track)
+{
+    uint gap = MFM_TRACK_GAP(nsec);
+    uint len = gap + nsec * MFM_SECTOR_RAW + MFM_TRACK_TRAIL;
+    uint pos;
+    uint i;
+
+    memset(raw, 0, len);  // Data bits all zero: gap and preambles
+    for (i = 0; i < nsec; i++) {
+        uint     snum = i;
+        uint8_t *sec  = raw + gap + i * MFM_SECTOR_RAW;
+        uint8_t *body = sec + 8;  // After preamble and sync words
+        uint32_t info = (0xffU << 24) | (track << 16) | (snum << 8) |
+                        (nsec - i);
+        const uint8_t *src = data + snum * 512;
+
+        sec[4] = 0x44;  // Sync words (preamble data bits are already 0)
+        sec[5] = 0x89;
+        sec[6] = 0x44;
+        sec[7] = 0x89;
+        mfm_put_data32(body + MFM_HDR_OFF, body + MFM_HDR_OFF + 4, info);
+        /* Sector label (16 + 16 bytes) is left zero */
+        for (pos = 0; pos < 128; pos++) {
+            mfm_put_data32(body + MFM_DATA_OFF + pos * 4,
+                           body + MFM_DATA_OFF + 512 + pos * 4,
+                           _4btol(src + pos * 4));
+        }
+        mfm_put_data32(body + MFM_HDRSUM_OFF, body + MFM_HDRSUM_OFF + 4,
+                       mfm_checksum(body + MFM_HDR_OFF, 40));
+        mfm_put_data32(body + MFM_DATASUM_OFF, body + MFM_DATASUM_OFF + 4,
+                       mfm_checksum(body + MFM_DATA_OFF, 1024));
+    }
+
+    /* Add clock bits everywhere except the sync words */
+    mfm_add_clocks(raw, gap + 4, 0);
+    for (i = 0; i < nsec; i++) {
+        uint8_t *sec  = raw + gap + i * MFM_SECTOR_RAW;
+        uint     next = (i + 1 < nsec) ? 4 : MFM_TRACK_TRAIL;  // Preamble
+        mfm_add_clocks(sec + 8, MFM_SECTOR_LEN + next, 1);  // 0x89 ends in 1
+    }
+    return (len);
+}
+
+/*
+ * do_rawread() / do_rawwrite() issue TD_RAWREAD / TD_RAWWRITE on a track.
+ * DoIO() replaces io_Flags with IOF_QUICK, which would discard the sync
+ * flags, so BeginIO() is used, which passes io_Flags to the driver.
+ */
+static int
+do_rawio(struct IOExtTD *tio, UWORD cmd, uint track, uint8_t *buf, uint len,
+         UBYTE flags)
+{
+    tio->iotd_Req.io_Command = cmd;
+    tio->iotd_Req.io_Actual  = 0;
+    tio->iotd_Req.io_Offset  = track;
+    tio->iotd_Req.io_Length  = len;
+    tio->iotd_Req.io_Data    = buf;
+    tio->iotd_Req.io_Flags   = flags;
+    tio->iotd_Req.io_Error   = 0xa5;
+    BeginIO((struct IORequest *) tio);
+    return (WaitIO((struct IORequest *) tio));
+}
+
+static int
+do_rawread(struct IOExtTD *tio, uint track, uint8_t *buf, uint len)
+{
+    memset(buf, 0x1e, len);
+    return (do_rawio(tio, TD_RAWREAD, track, buf, len, IOTDF_WORDSYNC));
+}
+
+static int
+do_rawwrite(struct IOExtTD *tio, uint track, uint8_t *buf, uint len)
+{
+    return (do_rawio(tio, TD_RAWWRITE, track, buf, len, IOTDF_INDEXSYNC));
+}
+
+/*
+ * rawread_len() returns the TD_RAWREAD length for a track of nsec sectors.
+ * With IOTDF_WORDSYNC, the read starts at a sector, so one revolution
+ * (all sectors plus the track gap) is enough to see every sector.
+ * trackdisk.device fails a much longer sync read (TDERR_NoSecHdr was
+ * seen with 32766 bytes), so do not read more than needed.
+ */
+static uint
+rawread_len(uint nsec)
+{
+    uint len = (nsec + 2) * MFM_SECTOR_RAW;
+    return ((len > RAWBUFSIZE) ? RAWBUFSIZE : len);
+}
+
+/*
+ * test_td_rawread() reads track 0 with TD_RAWREAD. If the track is in
+ * AmigaDOS format, the MFM data is decoded and verified (sector headers and
+ * checksums), and then compared against the same track read with CMD_READ.
+ */
 static int
 test_td_rawread(struct IOExtTD *tio)
 {
     int      rc;
+    uint     nsec = 0;
+    uint     sec;
+    uint     tracklen;
+    uint     rawlen = 16384;
     uint8_t *buf;
+    uint8_t *decoded = NULL;
+    uint8_t *cmpbuf = NULL;
+    struct DriveGeometry dg;
+    mfm_result_t res;
+
+    /* Sectors per track, to know which sectors to expect */
+    if ((do_getgeometry(tio, &dg) == 0) && (dg.dg_SectorSize == 512) &&
+        (dg.dg_TrackSectors > 0) && (dg.dg_TrackSectors <= 32))
+        nsec = dg.dg_TrackSectors;
+    tracklen = nsec * 512;
+    if (nsec != 0)
+        rawlen = rawread_len(nsec);
 
     /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
     buf = (uint8_t *) AllocMem(RAWBUFSIZE, MEMF_PUBLIC | MEMF_CHIP);
     if (buf == NULL) {
-        printf("Unable to allocate %d byte\n", RAWBUFSIZE);
+        printf("Unable to allocate %d bytes\n", RAWBUFSIZE);
         return (1);
     }
 
-    memset(buf, 0x1e, RAWBUFSIZE);
-    tio->iotd_Req.io_Command = TD_RAWREAD;
-    tio->iotd_Req.io_Actual  = 0;
-    tio->iotd_Req.io_Offset  = 0;
-    tio->iotd_Req.io_Length  = RAWBUFSIZE;
-    tio->iotd_Req.io_Data    = buf;
-    tio->iotd_Req.io_Flags   = IOTDF_WORDSYNC;   // Sync to 0x4489 pattern
-//    tio->iotd_Req.io_Flags   = IOTDF_INDEXSYNC;  // Sync to index pulse
-    tio->iotd_Req.io_Error   = 0xa5;
     print_test_name("TD_RAWREAD");
-    rc = DoIO((struct IORequest *) tio);
-    print_fail_nl(rc);
-#if 0
-    if (rc == 0) {
-        int i;
-        printf("0: ");
-        for (i = 0; i < 16384; i++) {
-            if ((i & 15) == 0)
-                printf("\n");
-            printf(" %02x", buf[i]);
-        }
-        printf("\n");
+    rc = do_rawread(tio, 0, buf, rawlen);  // Track 0 (cylinder 0, head 0)
+    if (rc != 0) {
+        print_fail_nl(rc);
+        goto rawread_done;
     }
-#endif
+    g_turn_motor_off = 1;
 
+    if (nsec == 0) {
+        printf("Success  (track geometry unknown; data not verified)\n");
+        goto rawread_done;
+    }
+    decoded = AllocMemType(tracklen, memtype);
+    cmpbuf  = AllocMemType(tracklen, memtype);
+    if ((decoded == NULL) || (cmpbuf == NULL)) {
+        printf("Success  (no memory to verify data)\n");
+        goto rawread_done;
+    }
+
+    mfm_verify_track(buf, rawlen, 0, nsec, decoded, &res);
+    if (g_verbose > 1)
+        printf("\n%-19s", "");
+    if (res.sectors == 0) {
+        printf("Success  (not an AmigaDOS track; data not verified)\n");
+        goto rawread_done;
+    }
+    if (res.errors != 0) {
+        printf("Fail - %s", res.first_error);
+        if (res.errors > 1)
+            printf(" (+%u more)", res.errors - 1);
+        printf("\n");
+        rc = 1;
+        goto rawread_done;
+    }
+    for (sec = 0; sec < nsec; sec++) {
+        if ((res.found & BIT(sec)) == 0) {
+            printf("Fail - sector %u not found in raw track\n", sec);
+            rc = 1;
+            goto rawread_done;
+        }
+    }
+
+    /* Compare against the same track read through the normal path */
+    memset(cmpbuf, 0xa5, tracklen);
+    tio->iotd_Req.io_Command = CMD_READ;
+    tio->iotd_Req.io_Actual  = 0;
+    tio->iotd_Req.io_Offset  = 0;  // Track 0 (not partition-relative)
+    tio->iotd_Req.io_Length  = tracklen;
+    tio->iotd_Req.io_Data    = cmpbuf;
+    tio->iotd_Req.io_Flags   = 0;
+    tio->iotd_Req.io_Error   = 0xa5;
+    rc = DoIO((struct IORequest *) tio);
+    if (rc != 0) {
+        printf("Success  %u sectors decoded; CMD_READ ", nsec);
+        print_fail_nl(rc);
+        goto rawread_done;
+    }
+    for (sec = 0; sec < nsec; sec++) {
+        if (memcmp(decoded + sec * 512, cmpbuf + sec * 512, 512) != 0) {
+            printf("Fail - sector %u data differs from CMD_READ\n", sec);
+            if (g_verbose)
+                show_diffs(cmpbuf + sec * 512, decoded + sec * 512, 512,
+                           "CMD_READ");
+            rc = 1;
+            goto rawread_done;
+        }
+    }
+    printf("Success  %u sectors decoded, match CMD_READ\n", nsec);
+
+rawread_done:
+    if (decoded != NULL)
+        FreeMemType(decoded, tracklen);
+    if (cmpbuf != NULL)
+        FreeMemType(cmpbuf, tracklen);
     /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
     FreeMem(buf, RAWBUFSIZE);
     return (rc);
 }
 
+/*
+ * cmd_read_track() reads a track with CMD_READ, after discarding the
+ * driver's track buffer (CMD_CLEAR) so that the media is actually read.
+ * len is the size of a track in bytes.
+ */
 static int
-test_td_rawwrite(struct IOExtTD *tio)
+cmd_read_track(struct IOExtTD *tio, uint track, uint8_t *buf, uint len)
 {
-    int rc;
-    size_t i;
-    uint8_t *buf[3];
+    tio->iotd_Req.io_Command = CMD_CLEAR;
+    tio->iotd_Req.io_Actual  = 0;
+    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Length  = 0;
+    tio->iotd_Req.io_Data    = NULL;
+    tio->iotd_Req.io_Flags   = 0;
+    (void) DoIO((struct IORequest *) tio);
 
-    /*
-     * Three buffers:
-     *   [0] = Original data
-     *   [1] = Replacement data -- does it need to be MFM?
-     *   [2] = Read buffer to verify write was successful
-     */
-    memset(buf, 0, sizeof (buf));
-    for (i = 0; i < ARRAY_SIZE(buf); i++) {
-        /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
-        buf[i] = (uint8_t *) AllocMem(RAWBUFSIZE, MEMF_PUBLIC | MEMF_CHIP);
-        if (buf[i] == NULL) {
-            printf("Unable to allocate %d bytes\n", RAWBUFSIZE);
-            goto buf_alloc_failed;
+    memset(buf, 0xa5, len);
+    tio->iotd_Req.io_Command = CMD_READ;
+    tio->iotd_Req.io_Actual  = 0;
+    tio->iotd_Req.io_Offset  = track * len;
+    tio->iotd_Req.io_Length  = len;
+    tio->iotd_Req.io_Data    = buf;
+    tio->iotd_Req.io_Flags   = 0;
+    tio->iotd_Req.io_Error   = 0xa5;
+    return (DoIO((struct IORequest *) tio));
+}
+
+/*
+ * verify_track() reads a track with TD_RAWREAD and CMD_READ, and checks
+ * that every sector decodes correctly, that the data matches expect (if
+ * not NULL), and that CMD_READ returns the same data. The data read is
+ * returned in got. Returns 0 if the track is good; otherwise prints
+ * "Fail - ..." (no newline) and returns nonzero.
+ */
+static int
+verify_track(struct IOExtTD *tio, uint track, uint8_t *raw, uint nsec,
+             const uint8_t *expect, uint8_t *got, uint8_t *cmpbuf)
+{
+    uint tracklen = nsec * 512;
+    uint sec;
+    int  rc;
+    mfm_result_t res;
+
+    rc = do_rawread(tio, track, raw, rawread_len(nsec));
+    if (rc != 0) {
+        printf("Fail - TD_RAWREAD ");
+        print_fail(rc);
+        return (rc);
+    }
+    mfm_verify_track(raw, rawread_len(nsec), track, nsec, got, &res);
+    if (res.sectors == 0) {
+        printf("Fail - not an AmigaDOS track");
+        return (1);
+    }
+    if (res.errors != 0) {
+        printf("Fail - %s", res.first_error);
+        return (1);
+    }
+    for (sec = 0; sec < nsec; sec++) {
+        if ((res.found & BIT(sec)) == 0) {
+            printf("Fail - sector %u not found", sec);
+            return (1);
+        }
+        if ((expect != NULL) &&
+            (memcmp(got + sec * 512, expect + sec * 512, 512) != 0)) {
+            printf("Fail - sector %u data differs from what was written",
+                   sec);
+            return (1);
         }
     }
 
-    tio->iotd_Req.io_Command = TD_RAWREAD;
-    tio->iotd_Req.io_Actual  = 0;
-    tio->iotd_Req.io_Offset  = 0;
-    tio->iotd_Req.io_Length  = RAWBUFSIZE;
-    tio->iotd_Req.io_Data    = buf[0];
-    tio->iotd_Req.io_Flags   = IOTDF_WORDSYNC;   // Sync to 0x4489 pattern
-//    tio->iotd_Req.io_Flags   = IOTDF_INDEXSYNC;  // Sync to index pulse
-    tio->iotd_Req.io_Error   = 0xa5;
+    rc = cmd_read_track(tio, track, cmpbuf, tracklen);
     if (rc != 0) {
-        print_test_name("TD_RAWREAD");
-        rc = DoIO((struct IORequest *) tio);
+        printf("Fail - CMD_READ ");
+        print_fail(rc);
+        return (rc);
     }
-    print_test_name("TD_RAWWRITE");
-    printf("not implemented yet\n");
-
-buf_alloc_failed:
-    for (i = 0; i < ARRAY_SIZE(buf); i++) {
-        /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
-        FreeMem(buf[i], RAWBUFSIZE);
+    for (sec = 0; sec < nsec; sec++) {
+        if (memcmp(got + sec * 512, cmpbuf + sec * 512, 512) != 0) {
+            printf("Fail - sector %u data differs from CMD_READ", sec);
+            return (1);
+        }
     }
     return (0);
+}
+
+/*
+ * test_td_rawwrite() tests TD_RAWWRITE on track RAWWRITE_TRACK, and leaves
+ * the data stored there as it was:
+ *   1. The track is read and verified (TD_RAWREAD decode and CMD_READ).
+ *   2. The sector data, inverted, is MFM-encoded and written with
+ *      TD_RAWWRITE, and the track is verified to hold the inverted data.
+ *      Changed data proves that the write took place. (Writing the same
+ *      data in a different sector order would not: a floppy emulator
+ *      stores only the sector data, and regenerates the track layout.)
+ *   3. The original data is written back with TD_RAWWRITE, and verified.
+ * If the track does not verify after a write, the original data is written
+ * back with TD_FORMAT, which writes a whole track without reading it.
+ */
+#define RAWWRITE_TRACK 2  // Cylinder 1, head 0: not the boot block
+
+static int
+test_td_rawwrite(struct IOExtTD *tio)
+{
+    const uint track = RAWWRITE_TRACK;
+    int      rc;
+    uint     nsec = 0;
+    uint     tracklen = 0;
+    uint     len;
+    uint     pos;
+    uint8_t *raw = NULL;
+    uint8_t *orig = NULL;
+    uint8_t *inv = NULL;
+    uint8_t *got = NULL;
+    uint8_t *cmpbuf = NULL;
+    struct DriveGeometry dg;
+    const char *step;
+
+    print_test_name("TD_RAWWRITE");
+    if ((do_getgeometry(tio, &dg) == 0) && (dg.dg_SectorSize == 512) &&
+        (dg.dg_TrackSectors > 0) && (dg.dg_TrackSectors <= 32) &&
+        (dg.dg_Cylinders * dg.dg_Heads > track))
+        nsec = dg.dg_TrackSectors;
+    if (nsec == 0) {
+        printf("Skip - track geometry unknown\n");
+        return (0);
+    }
+    tracklen = nsec * 512;
+
+    tio->iotd_Req.io_Command = TD_PROTSTATUS;
+    tio->iotd_Req.io_Actual  = 0;
+    tio->iotd_Req.io_Flags   = 0;
+    if ((DoIO((struct IORequest *) tio) == 0) &&
+        (tio->iotd_Req.io_Actual != 0)) {
+        printf("Skip - disk is write protected\n");
+        return (0);
+    }
+
+    /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
+    raw    = (uint8_t *) AllocMem(RAWBUFSIZE, MEMF_PUBLIC | MEMF_CHIP);
+    orig   = AllocMemType(tracklen, memtype);
+    inv    = AllocMemType(tracklen, memtype);
+    got    = AllocMemType(tracklen, memtype);
+    cmpbuf = AllocMemType(tracklen, memtype);
+    if ((raw == NULL) || (orig == NULL) || (inv == NULL) || (got == NULL) ||
+        (cmpbuf == NULL)) {
+        printf("Fail - unable to allocate buffers\n");
+        rc = ENOMEM;
+        goto rawwrite_done;
+    }
+    g_turn_motor_off = 1;
+
+    /* 1. Original data must be fully verified before anything is written */
+    if (verify_track(tio, track, raw, nsec, NULL, orig, cmpbuf) != 0) {
+        printf("; not writing\n");
+        rc = 0;  // Nothing tested
+        goto rawwrite_done;
+    }
+
+    /* 2. Write the inverted data, and verify it */
+    for (pos = 0; pos < tracklen; pos++)
+        inv[pos] = (uint8_t) ~orig[pos];
+    step = "inverted data";
+    len = mfm_encode_track(raw, inv, nsec, track);
+    rc = do_rawwrite(tio, track, raw, len);
+    if (rc != 0) {
+        printf("Fail - write ");
+        print_fail(rc);
+        goto rawwrite_restore;
+    }
+    if ((rc = verify_track(tio, track, raw, nsec, inv, got, cmpbuf)) != 0)
+        goto rawwrite_restore;
+
+    /* 3. Write the original data back, and verify it */
+    step = "original data";
+    len = mfm_encode_track(raw, orig, nsec, track);
+    rc = do_rawwrite(tio, track, raw, len);
+    if (rc != 0) {
+        printf("Fail - rewrite ");
+        print_fail(rc);
+        goto rawwrite_restore;
+    }
+    if ((rc = verify_track(tio, track, raw, nsec, orig, got, cmpbuf)) != 0)
+        goto rawwrite_restore;
+
+    printf("Success  %u sectors written changed and restored, verified\n",
+           nsec);
+    goto rawwrite_done;
+
+rawwrite_restore:
+    /* The track did not verify: write back the original data */
+    printf(" (%s write)\n", step);
+    tio->iotd_Req.io_Command = TD_FORMAT;
+    tio->iotd_Req.io_Actual  = 0;
+    tio->iotd_Req.io_Offset  = track * tracklen;
+    tio->iotd_Req.io_Length  = tracklen;
+    tio->iotd_Req.io_Data    = orig;
+    tio->iotd_Req.io_Flags   = 0;
+    tio->iotd_Req.io_Error   = 0xa5;
+    print_test_name("  Restore track");
+    if (DoIO((struct IORequest *) tio) != 0) {
+        printf("Fail - TD_FORMAT ");
+        print_fail_nl(tio->iotd_Req.io_Error);
+    } else if (verify_track(tio, track, raw, nsec, orig, got, cmpbuf) != 0) {
+        printf("\n");
+    } else {
+        printf("Success  original data rewritten\n");
+    }
+    if (rc == 0)
+        rc = 1;
+
+rawwrite_done:
+    if (cmpbuf != NULL)
+        FreeMemType(cmpbuf, tracklen);
+    if (got != NULL)
+        FreeMemType(got, tracklen);
+    if (inv != NULL)
+        FreeMemType(inv, tracklen);
+    if (orig != NULL)
+        FreeMemType(orig, tracklen);
+    if (raw != NULL)
+        FreeMem(raw, RAWBUFSIZE);
+    return (rc);
 }
 
 static int
@@ -5041,9 +5627,11 @@ test_cmd_scsi(struct IOExtTD *tio)
                        SSD_SENSE_ASCQ(g_sense_data));
             }
             printf("\n");
+            return (rc);
         }
     }
 
+    /* Success, or a valid "not ready" (such as no media) response */
     return (0);
 }
 
@@ -5116,10 +5704,10 @@ static const test_cmds_t test_cmds[] = {
                         "HD_SCSICMD_TUR SCSI Test Unit Ready command" },
     { "RAWREAD",     0, TEST_TD_RAWREAD, NULL,
                         "TD_RAWREAD read raw track from (floppy) device" },
+    { "RAWWRITE",    1, TEST_TD_RAWWRITE, NULL,
+                        "TD_RAWWRITE write raw track 2 (floppy) and restore" },
 #if 0
     /* These are not implemented yet */
-    { "RAWWRITE",    0, TEST_TD_RAWWRITE, NULL,
-                        "TD_RAWWRITE write raw track to (floppy) device" },
     { "ERAWREAD",    0, TEST_ETD_RAWREAD, NULL,
                         "ETD_RAWREAD read raw track from (floppy) device" },
     { "ERAWWRITE",   0, TEST_ETD_RAWWRITE, NULL,
@@ -5219,7 +5807,7 @@ test_packets_ll(uint64_t test_mask, struct IOExtTD *tio)
     if ((test_mask & TEST_CMD_SCSI) && test_cmd_scsi(tio))
         rc++;
 
-    if (0 && (test_mask & TEST_TD_RAWWRITE) && test_td_rawwrite(tio))
+    if ((test_mask & TEST_TD_RAWWRITE) && test_td_rawwrite(tio))
         rc++;
     if ((test_mask & TEST_HD_SCSICMD_INQ) && test_hd_scsicmd_inquiry(tio))
         rc++;
@@ -6865,7 +7453,13 @@ main(int argc, char *argv[])
                     case 'l':
                         /* Loop count */
                         if (++arg < argc) {
-                            loops = atoi(argv[arg]);
+                            int count = atoi(argv[arg]);
+                            if (count < 1) {
+                                printf("Invalid loop count %s; must be at "
+                                       "least 1\n", argv[arg]);
+                                exit(RETURN_ERROR);
+                            }
+                            loops = count;
                         } else {
                             printf("-%s requires an argument\n", ptr);
                             printf("    The number of loop iterations\n");
@@ -6913,6 +7507,16 @@ main(int argc, char *argv[])
                                 if (sscanf(argv[arg], "%x", &memtype_arg) != 1) {
                                     printf("invalid argument %s for %s\n",
                                            argv[arg], ptr);
+                                    exit(RETURN_ERROR);
+                                }
+                                /*
+                                 * Values up to MEMTYPE_MAX are memory type
+                                 * codes, not addresses (and are not usable
+                                 * addresses anyway).
+                                 */
+                                if (memtype_arg <= MEMTYPE_MAX) {
+                                    printf("invalid memory address %s for "
+                                           "%s\n", argv[arg], ptr);
                                     exit(RETURN_ERROR);
                                 }
                                 memtype = (uint32_t) memtype_arg;
