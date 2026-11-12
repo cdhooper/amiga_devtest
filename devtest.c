@@ -2629,16 +2629,24 @@ need_delete_port:
 #define NUM_TIO       4
 #define MAX_NUM_TIO   32
 
+/*
+ * print_perf() reports the transfer rate of bytes transferred in ttime
+ * EClock ticks (freq ticks per second). Rates are in units of 1000 bytes
+ * (KB/sec), or 1000000 bytes (MB/sec) at 100 MB/sec or more. The rate is
+ * calculated from the byte count before it is scaled for display, so
+ * that a small transfer total does not lose precision.
+ */
 static void
-print_perf(uint ttime, uint itime, uint freq, uint xfer_kb, int is_write,
+print_perf(uint ttime, uint itime, uint freq, uint64_t bytes, int is_write,
            uint xfer_size)
 {
     uint tsec;
     uint trem;
-    uint rep = xfer_kb;
+    uint rep = (uint) (bytes / 1000);
     char c1 = 'K';
     char c2 = 'K';
     uint cpu_load;
+    uint64_t rate;
 
     if (rep >= 10000) {
         rep /= 1000;
@@ -2652,19 +2660,21 @@ print_perf(uint ttime, uint itime, uint freq, uint xfer_kb, int is_write,
     tsec = ttime / freq;
     trem = ttime % freq;
 
-    if ((xfer_kb * (freq / 1000) / ttime) >= 100) {
-        /* Transfer rate > about 100 MB/sec */
-        xfer_kb /= 1000;
+    rate = bytes * freq / ttime;  // Bytes per second
+    if (rate >= 100000000) {
+        /* Transfer rate >= 100 MB/sec */
+        rate /= 1000000;
         c2 = 'M';
+    } else {
+        rate /= 1000;
     }
-    xfer_kb = (uint64_t) xfer_kb * (uint64_t) freq / (uint64_t) ttime;
 
     if (g_verbose) {
         printf("%4u %cB %s in %2u.%02u sec: %3u KB xfer: ",
                rep, c1, is_write ? "write" : "read ",
                tsec, trem * 100 / freq, xfer_size / 1024);
     }
-    printf("%13u %cB/sec", xfer_kb, c2);
+    printf("%13u %cB/sec", (uint) rate, c2);
     if (flag_cpu_utilization)
         printf(" (%u%% CPU)", cpu_load);
     printf("\n");
@@ -2673,14 +2683,43 @@ print_perf(uint ttime, uint itime, uint freq, uint xfer_kb, int is_write,
 static uint32_t user_perf_size = 0;
 static uint     user_num_tio   = 0;
 
+/*
+ * bandwidth_wait() waits for a benchmark request to complete, and adds the
+ * bytes it transferred (io_Actual) to *bytes. Returns 0 if the full length
+ * was transferred; otherwise reports the error or short transfer, and
+ * returns nonzero.
+ */
+static int
+bandwidth_wait(UWORD iocmd, struct IOExtTD *tio, uint64_t *bytes)
+{
+    int failcode = WaitIO((struct IORequest *) tio);
+    uint32_t len = tio->iotd_Req.io_Length;
+    uint32_t actual = tio->iotd_Req.io_Actual;
+
+    if (failcode == 0)
+        failcode = tio->iotd_Req.io_Error;
+    if (failcode == 0) {
+        *bytes += (actual < len) ? actual : len;
+        if (actual >= len)
+            return (0);
+    }
+    printf("  %s ", (iocmd == CMD_READ) ? "Read" : "Write");
+    if (failcode == 0)
+        printf("short transfer (%u of %u bytes)", U32(actual), U32(len));
+    else
+        print_fail(failcode);
+    printf(" at 0x%x\n", U32(tio->iotd_Req.io_Offset));
+    return (1);
+}
+
 static int
 run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
               uint32_t bufsize, uint num_tio)
 {
     int xfer;
-    int xfer_good;
     uint i;
     int rc = 0;
+    int aborted = 0;
     uint32_t issued;
     uint cur = 0;
     uint64_t pos;
@@ -2689,7 +2728,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
     struct EClockVal etime;
     uint32_t freq;
     uint32_t diff_ticks;
-    uint64_t xfer_total;
+    uint64_t xfer_bytes;
     uint32_t idle_ticks;
 
     int rep;
@@ -2708,20 +2747,16 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
         print_perf_type((iocmd == CMD_READ) ? 0 : 1, bufsize);
         ReadEClock(&stime);
         idle_time = 0;
-        xfer_good = 0;
+        xfer_bytes = 0;
         for (xfer = 0; xfer < 50; xfer++) {
             if (issued & BIT(cur)) {
-                int failcode = WaitIO((struct IORequest *) tio[cur]);
-                if (failcode == 0)
-                    failcode = tio[cur]->iotd_Req.io_Error;
                 issued &= ~BIT(cur);
-                if (failcode == 0) {
-                    xfer_good++;
-                } else {
-                    printf("  %s ", (iocmd == CMD_READ) ? "Read" : "Write");
-                    print_fail(failcode);
-                    printf(" at 0x%x\n", U32(tio[cur]->iotd_Req.io_Offset));
+                if (bandwidth_wait(iocmd, tio[cur], &xfer_bytes) != 0) {
                     rc++;
+                    break;
+                }
+                if (is_user_abort()) {
+                    aborted = 1;
                     break;
                 }
                 if ((xfer & 0x7) == 0) {
@@ -2750,31 +2785,39 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
             if (++cur >= num_tio)
                 cur = 0;
         }
+        /*
+         * Wait for all outstanding requests (also after error or ^C).
+         * After ^C, they are aborted first: a slow device (floppy) could
+         * otherwise take minutes to finish them. Drivers which do not
+         * support AbortIO() just complete them normally.
+         */
+        if (aborted) {
+            for (i = 0; i < num_tio; i++)
+                if (issued & BIT(i))
+                    AbortIO((struct IORequest *) tio[i]);
+        }
         for (i = 0; i < num_tio; i++) {
             if (issued & BIT(cur)) {
-                int failcode = WaitIO((struct IORequest *) tio[cur]);
-                if (failcode == 0)
-                    failcode = tio[cur]->iotd_Req.io_Error;
                 issued &= ~BIT(cur);
-                if (failcode == 0) {
-                    xfer_good++;
-                } else {
-                    printf("  %s ", (iocmd == CMD_READ) ? "Read" : "Write");
-                    print_fail(failcode);
-                    printf(" at 0x%x\n", U32(tio[cur]->iotd_Req.io_Offset));
+                if (aborted)
+                    (void) WaitIO((struct IORequest *) tio[cur]);
+                else if (bandwidth_wait(iocmd, tio[cur], &xfer_bytes) != 0)
                     rc++;
-                }
             }
             if (++cur >= num_tio)
                 cur = 0;
+        }
+        if (aborted) {
+            printf("^C abort\n");
+            rc++;
+            break;
         }
 
         idle_ticks = idle_time;
         freq = ReadEClock(&etime);
         diff_ticks = diff_e_clock(&stime, &etime);
 
-        xfer_total = (uint64_t) bufsize * (uint64_t) xfer_good / 1000;
-        print_perf(diff_ticks, idle_ticks, freq, (uint) xfer_total,
+        print_perf(diff_ticks, idle_ticks, freq, xfer_bytes,
                    (iocmd == CMD_READ) ? 0 : 1, bufsize);
         bufsize >>= 2;
         if (bufsize < 16384)

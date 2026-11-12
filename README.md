@@ -70,6 +70,15 @@ While benchmarking a fast device, that device may consume considerable
 CPU bus bandwidth. This would increase CPU utilization, as the CPU
 needs to wait for access to the bus.
 
+CPU utilization is measured with a spin-loop task at priority -10,
+which counts the time it gets to run. Any other task running at a
+higher priority during the test (not just the device driver and its
+interrupts) therefore also counts as CPU utilization.
+
+Transfer sizes ("512 KB xfers") are in units of 1024 bytes, while
+transfer rates are in units of 1000 bytes (KB/sec), or 1000000 bytes
+(MB/sec) for rates of 100 MB/sec or more.
+
 The write benchmark does not save or restore the data it overwrites.
 It writes from the start of the device (or partition, if one is
 specified), and any data there is lost. This is different from the
