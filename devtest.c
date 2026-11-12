@@ -338,7 +338,7 @@ static uint8_t  *g_align[IBUF_COUNT]; // Integrity test buffers (aligned)
 struct DosEnvec *g_envec;             // Filesystem environment vector
 static UBYTE     mem_skip_alloc = 0;  // Skip memory allocate
 static uint32_t  memtype = MEMTYPE_ANY; // Memory type
-static uint64_t  test_cmd_mask[32];
+static uint64_t  test_cmd_mask[TEST_MAX_CMDS];
 static args_t    test_cmd_args[TEST_MAX_CMDS];
 static args_t   *cur_test_args = NULL;
 static UWORD     flag_destructive = 0;
@@ -967,6 +967,10 @@ do_scsidirect_cmd(struct IOExtTD *tio, scsi_generic_t *cmd, uint cmdlen,
     void          *res;
     struct SCSICmd *scmd;
 
+    /* Callers test the result pointer, so set it on every failure path */
+    if (resp != NULL)
+        *resp = NULL;
+
     if (reslen > 0) {
         res = AllocMemType(reslen, memtype);
         if (res == NULL) {
@@ -1341,8 +1345,11 @@ scsi_probe_unit(uint unit, struct IOExtTD *tio)
     if (rc == 0) {
         printf("%3d", unit);
         erc = do_scsi_inquiry(tio, unit, &inq_res);
-        if (erc == ENOMEM)
+        if (erc == ENOMEM) {
+            printf("\n");
+            close_device(tio);
             return (erc);
+        }
         if (erc == 0) {
             printf(" %-*.*s %-*.*s %-*.*s %-7s",
                (int) sizeof (inq_res->vendor),
@@ -2449,8 +2456,10 @@ latency_write(struct IOExtTD **tio, int max_iter)
             break;
         }
     }
-    if (num_iter == 0)
+    if (num_iter == 0) {
+        FreeMemType(buf, BUFSIZE);
         return (1);
+    }
 
     print_ltest_name("CMD_WRITE sequential");
     rc += latency_cmd_seq(CMD_WRITE, buf, num_iter, tio);
@@ -2676,9 +2685,9 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
         pos = 0;
         issued = 0;
 
-        if ((g_devend != 0) && (bufsize > limit)) {
-            printf("Partition is too small for %u byte transfers\n",
-                   U32(bufsize));
+        if ((limit != 0) && (bufsize > limit)) {
+            printf("%s is too small for %u byte transfers\n",
+                   (g_devend != 0) ? "Partition" : "Device", U32(bufsize));
             rc++;
             break;
         }
@@ -2904,6 +2913,14 @@ drive_benchmark(int do_destructive, uint32_t memtype)
         }
         opened |= BIT(i);
     }
+
+    /*
+     * The device size is needed so that transfers stay within the device
+     * (run_bandwidth() wraps at the end). If it can not be determined, the
+     * benchmark still runs, but transfers are not bounded.
+     */
+    if (g_devsize == 0)
+        (void) get_devsize(tio[0]);
 
     memset(buf, 0, sizeof (buf));
 try_again:
@@ -6746,6 +6763,11 @@ main(int argc, char *argv[])
                             exit(RETURN_ERROR);
                         }
                         parse_tsize(argv[arg], (uint *)&user_perf_size, &pos);
+                        if ((user_perf_size == 0) || (user_perf_size & 511)) {
+                            printf("transfer size must be a non-zero "
+                                   "multiple of 512 bytes\n");
+                            exit(RETURN_ERROR);
+                        }
                         if (argv[arg][pos] == ',') {
                             char *str = argv[arg] + pos + 1;
                             if ((sscanf(str, "%i%n", (int *) &user_num_tio,
@@ -6759,11 +6781,15 @@ main(int argc, char *argv[])
                         break;
                     case 'c':
                         if (++arg < argc) {
+                            if (test_cmd_count >= ARRAY_SIZE(test_cmd_mask)) {
+                                printf("Too many -c commands (maximum %u)\n",
+                                       (uint) ARRAY_SIZE(test_cmd_mask));
+                                exit(RETURN_ERROR);
+                            }
                             test_cmd_mask[test_cmd_count] |=
                                 get_cmd(argv[arg],
                                         &test_cmd_args[test_cmd_count]);
-                            if (++test_cmd_count >= ARRAY_SIZE(test_cmd_mask))
-                                test_cmd_count--;
+                            test_cmd_count++;
                         } else {
                             usage_cmd();
                             exit(RETURN_ERROR);
