@@ -2712,11 +2712,12 @@ bandwidth_wait(UWORD iocmd, struct IOExtTD *tio, uint64_t *bytes)
     return (1);
 }
 
+#define BW_STEP_SECS 1  // Time to run each transfer size
+
 static int
 run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
               uint32_t bufsize, uint num_tio)
 {
-    int xfer;
     uint i;
     int rc = 0;
     int aborted = 0;
@@ -2748,7 +2749,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
         ReadEClock(&stime);
         idle_time = 0;
         xfer_bytes = 0;
-        for (xfer = 0; xfer < 50; xfer++) {
+        for (;;) {
             if (issued & BIT(cur)) {
                 issued &= ~BIT(cur);
                 if (bandwidth_wait(iocmd, tio[cur], &xfer_bytes) != 0) {
@@ -2759,13 +2760,15 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
                     aborted = 1;
                     break;
                 }
-                if ((xfer & 0x7) == 0) {
-                    /* Cut out early if device is slow (> 1 second) */
-                    ReadEClock(&etime);
-                    if (diff_e_clock(&stime, &etime) > g_e_freq) {
-                        break;
-                    }
-                }
+                /*
+                 * Each transfer size runs for a fixed time, rather than a
+                 * fixed number of transfers, so that the fixed costs (the
+                 * first request's latency and filling and draining the
+                 * queue) are a similar small part of every measurement.
+                 */
+                ReadEClock(&etime);
+                if (diff_e_clock(&stime, &etime) >= g_e_freq * BW_STEP_SECS)
+                    break;
             }
 
             if ((limit != 0) && (pos + bufsize > limit))
@@ -2924,9 +2927,48 @@ show_memlist(void)
     Permit();
 }
 
+/*
+ * drive_is_slow() reads 4 KB from the device to determine whether it is
+ * slow, such as a floppy drive, where the 512 KB and 128 KB transfer
+ * benchmarks would take minutes. The first read is not timed, as it may
+ * include starting the motor (floppy) or spinning up from standby. The
+ * timed read is at a different offset: a floppy driver reads whole
+ * tracks, so reading the same data again would come from its buffer.
+ * A floppy takes at least a revolution (200 ms) plus a seek, while a hard
+ * drive or SSD takes a few ms. Errors are not reported here (the
+ * benchmark will report them); the device is then considered not slow.
+ */
+#define SLOW_PROBE_LEN    4096
+#define SLOW_PROBE_OFFSET (64 << 10)
+#define SLOW_PROBE_MS     100
+
+static int
+drive_is_slow(struct IOExtTD *tio, uint8_t *buf)
+{
+    struct EClockVal stime;
+    struct EClockVal etime;
+    uint64_t limit = part_size();
+    uint64_t offset = SLOW_PROBE_OFFSET;
+
+    if (limit != 0) {
+        if (limit < 2 * SLOW_PROBE_LEN)
+            return (0);  // Too small to matter
+        if (offset + SLOW_PROBE_LEN > limit)
+            offset = limit - SLOW_PROBE_LEN;
+    }
+    if (do_read_cmd(tio, 0, SLOW_PROBE_LEN, buf, g_has_nsd) != 0)
+        return (0);
+    ReadEClock(&stime);
+    if (do_read_cmd(tio, offset, SLOW_PROBE_LEN, buf, g_has_nsd) != 0)
+        return (0);
+    ReadEClock(&etime);
+    return (diff_e_clock(&stime, &etime) > g_e_freq / 1000 * SLOW_PROBE_MS);
+}
+
 static int
 drive_benchmark(int do_destructive, uint32_t memtype)
 {
+    uint32_t bench_size;
     struct IOExtTD *tio[MAX_NUM_TIO];
     uint8_t *buf[MAX_NUM_TIO];
     uint32_t opened;
@@ -3012,10 +3054,19 @@ try_again:
     }
     printf("\n");
 
-    rc += run_bandwidth(CMD_READ, tio, buf, perf_buf_size, num_tio);
+    /* On a slow device (floppy), skip the 512 KB and 128 KB transfers */
+    bench_size = perf_buf_size;
+    if ((user_perf_size == 0) && (bench_size > (32 << 10)) &&
+        drive_is_slow(tio[0], buf[0])) {
+        bench_size = 32 << 10;
+        if (g_verbose)
+            printf("Slow device: only 32 KB transfers are tested\n");
+    }
+
+    rc += run_bandwidth(CMD_READ, tio, buf, bench_size, num_tio);
 
     if (do_destructive && (rc == 0))
-        rc += run_bandwidth(CMD_WRITE, tio, buf, perf_buf_size, num_tio);
+        rc += run_bandwidth(CMD_WRITE, tio, buf, bench_size, num_tio);
 
     g_turn_motor_off = 1;
 
