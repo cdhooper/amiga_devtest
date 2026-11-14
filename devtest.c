@@ -2970,12 +2970,16 @@ drive_is_slow(struct IOExtTD *tio, uint8_t *buf)
     return (diff_e_clock(&stime, &etime) > g_e_freq / 1000 * SLOW_PROBE_MS);
 }
 
+#define BENCH_ALIGN 16  // Benchmark buffer alignment (cache line)
+
 static int
 drive_benchmark(int do_destructive, uint32_t memtype)
 {
     uint32_t bench_size;
     struct IOExtTD *tio[MAX_NUM_TIO];
     uint8_t *buf[MAX_NUM_TIO];
+    uint8_t *alloc[MAX_NUM_TIO];  // Allocations which hold buf[]
+    uint32_t align;
     uint32_t opened;
     uint32_t perf_buf_size = PERF_BUF_SIZE;
     struct MsgPort *mp;
@@ -3026,15 +3030,26 @@ drive_benchmark(int do_destructive, uint32_t memtype)
         (void) get_devsize(tio[0]);
 
     memset(buf, 0, sizeof (buf));
+    /*
+     * Buffers start on a 16-byte (cache line) boundary, as AllocMem()
+     * only guarantees 8 bytes, unless the user asked for memory at a
+     * specific address. Measured on amiga5, scsi.device reads were up to
+     * 5.7% faster than with 8-byte aligned buffers. 4 KB alignment read
+     * the same as 16 bytes, but 32 KB writes were 4% slower.
+     */
+    align = ((memtype > MEMTYPE_MAX) || mem_skip_alloc) ? 0 : BENCH_ALIGN;
 try_again:
     for (i = 0; i < num_tio; i++) {
-        buf[i] = (uint8_t *) AllocMemType(perf_buf_size, memtype);
-        if (buf[i] == NULL) {
+        alloc[i] = (uint8_t *) AllocMemType(perf_buf_size + align, memtype);
+        buf[i] = (uint8_t *) (((uintptr_t) alloc[i] + align) & ~
+                              (uintptr_t) (align ? align - 1 : 0));
+        if (alloc[i] == NULL) {
+            buf[i] = NULL;
             if (perf_buf_size > 8192) {
                 /* Restart loop, asking for a smaller buffer */
                 size_t j;
                 for (j = 0; j < i; j++) {
-                    FreeMemType(buf[j], perf_buf_size);
+                    FreeMemType(alloc[j], perf_buf_size + align);
                     buf[j] = NULL;
                 }
                 perf_buf_size /= 2;
@@ -3078,7 +3093,7 @@ try_again:
 allocmem_fail:
     for (i = 0; i < num_tio; i++)
         if (buf[i] != NULL)
-            FreeMemType(buf[i], perf_buf_size);
+            FreeMemType(alloc[i], perf_buf_size + align);
 
 opendevice_fail:
     for (i = 0; i < num_tio; i++)
