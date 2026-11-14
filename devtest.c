@@ -2721,6 +2721,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
     uint i;
     int rc = 0;
     int aborted = 0;
+    int rc_step;
     uint32_t issued;
     uint cur = 0;
     uint64_t pos;
@@ -2745,6 +2746,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
             break;
         }
 
+        rc_step = rc;
         print_perf_type((iocmd == CMD_READ) ? 0 : 1, bufsize);
         ReadEClock(&stime);
         idle_time = 0;
@@ -2820,8 +2822,11 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
         freq = ReadEClock(&etime);
         diff_ticks = diff_e_clock(&stime, &etime);
 
-        print_perf(diff_ticks, idle_ticks, freq, xfer_bytes,
-                   (iocmd == CMD_READ) ? 0 : 1, bufsize);
+        /* After an I/O error, a rate would be misleading: only the error */
+        if (rc == rc_step) {
+            print_perf(diff_ticks, idle_ticks, freq, xfer_bytes,
+                       (iocmd == CMD_READ) ? 0 : 1, bufsize);
+        }
         bufsize >>= 2;
         if (bufsize < 16384)
             break;
