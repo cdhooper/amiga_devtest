@@ -4553,6 +4553,231 @@ setup_raw_io(struct IOExtTD *tio, UWORD cmd, int is64, uint64_t rel_offset,
     return (0);
 }
 
+static const uint64_t standard_sector_limits[] = {
+    9ULL,                    // MFM floppy track
+    11ULL,                   // Amiga floppy track
+    18ULL,                   // MFM HD floppy track
+    22ULL,                   // Amiga HD floppy track
+    1760ULL,                 // Amiga floppy limit
+    3520ULL,                 // Amiga HD floppy limit
+    65536ULL,                // Classic two-byte block address limit (32 MB)
+    1032192ULL,              // Classic BIOS CHS (1024 x 16 x 63)
+    2097152ULL,              // SCSI-1 / early READ(6) SCSI 21-bit LBA (1 GB)
+    4194304ULL,              // Early Amiga SCSI controller ROM limit (2 GB)
+    8388608ULL,              // Amiga CMD_READ/CMD_WRITE byte offset (4 GB)
+    16450560ULL,             // BIOS ECHS / LBA-assist (1024 x 255 x 63)
+    267386880ULL,            // ATA-1 ... ATA-5 CHS (65536 x 16 x 255)
+    268435456ULL,            // ATA-1 ... ATA-5 28-bit LBA
+    4294967296ULL,           // SCSI-2 / later 32-bit READ(10) 32-bit LBA
+    281474976710656ULL,      // ATA/ATAPI-6 and later 48-bit LBA
+    18446744073709551615ULL  // Modern SCSI / SBC 64-bit LBA
+};
+
+/*
+ * Wrap-to-zero test
+ * -----------------
+ * A driver or device which truncates the block address (for example to 21
+ * bits in a SCSI READ(6) / WRITE(6) command, or to 28 bits in an ATA
+ * command) writes to the wrong block: the address wraps around, usually
+ * to block 0, which holds the RDB. wrap_walk() writes one sector at each
+ * absolute LBA L-1, L and L+1 for every L in standard_sector_limits[],
+ * and verifies that it reads back, and that sectors 0 and 1 (where L and
+ * L+1 would wrap to) are unchanged. Only addresses within the device or
+ * partition being tested are written. The original data at each address
+ * is saved and restored (not with -dd). If sector 0 or 1 is overwritten,
+ * its original data is always written back.
+ */
+#define WRAP_CMD    0  // CMD_READ / CMD_WRITE (32-bit byte offset)
+#define WRAP_TD64   1  // TD_READ64 / TD_WRITE64
+#define WRAP_NSD    2  // NSCMD_TD_READ64 / NSCMD_TD_WRITE64
+#define WRAP_BUF_SECS 7  // wbuf, rbuf, orig, orig01 (2), chk01 (2)
+
+static int
+wrap_io(struct IOExtTD *tio, int is_write, int mode, uint64_t abs,
+        uint len, void *buf)
+{
+    static const UWORD cmds[3][2] = {
+        { CMD_READ,        CMD_WRITE },
+        { TD_READ64,       TD_WRITE64 },
+        { NSCMD_TD_READ64, NSCMD_TD_WRITE64 },
+    };
+    tio->iotd_Req.io_Command = cmds[mode][is_write];
+    tio->iotd_Req.io_Actual  = (mode == WRAP_CMD) ? 0 : (uint32_t) (abs >> 32);
+    tio->iotd_Req.io_Offset  = (uint32_t) abs;
+    tio->iotd_Req.io_Length  = len;
+    tio->iotd_Req.io_Data    = buf;
+    tio->iotd_Req.io_Flags   = 0;
+    tio->iotd_Req.io_Error   = 0xa5;
+    return (DoIO((struct IORequest *) tio));
+}
+
+static void
+print_lba(uint64_t lba)
+{
+    if (lba >> 32)
+        printf("0x%x%08x", U32(lba >> 32), U32(lba));
+    else
+        printf("0x%x", U32(lba));
+}
+
+/*
+ * test_offset_given() returns nonzero if the user specified a write offset
+ * for the current command (its second argument).
+ */
+static int
+test_offset_given(void)
+{
+    return ((cur_test_args != NULL) && (cur_test_args->arg_count > 1));
+}
+
+static int
+wrap_walk(struct IOExtTD *tio, int mode)
+{
+    uint     ssize;
+    uint64_t part_hi;
+    uint64_t lo_lba;
+    uint64_t hi_lba;
+    uint64_t last = 0;
+    uint8_t *mem;
+    uint8_t *wbuf;
+    uint8_t *rbuf;
+    uint8_t *orig;   // Original data at the tested LBA
+    uint8_t *orig01; // Original data of sectors 0 and 1
+    uint8_t *chk01;  // Sectors 0 and 1 after a write
+    uint     tested = 0;
+    uint     failed = 0;
+    uint     i;
+    int      d;
+    int      rc;
+
+    if ((g_devend == 0) && (g_devsize == 0))
+        (void) get_devsize(tio);  // Sends READ CAPACITY(16) only if >= 2 TB
+    ssize   = (g_sector_size != 0) ? g_sector_size : 512;
+    part_hi = (g_devend != 0) ? g_devend : g_devsize;
+    lo_lba  = (g_devstart + ssize - 1) / ssize;
+    hi_lba  = part_hi / ssize;  // First LBA past the end
+
+    if (part_hi == 0) {
+        printf("Wrap test device size unknown");
+        return (0);
+    }
+    mem = AllocMemType(WRAP_BUF_SECS * ssize, memtype);
+    if (mem == NULL) {
+        printf("Wrap test unable to allocate buffers: Fail");
+        return (ENOMEM);
+    }
+    wbuf   = mem;
+    rbuf   = mem + ssize;
+    orig   = mem + ssize * 2;
+    orig01 = mem + ssize * 3;  // Two sectors
+    chk01  = mem + ssize * 5;  // Two sectors
+
+    rc = wrap_io(tio, 0, WRAP_CMD, 0, ssize * 2, orig01);
+    if (rc != 0) {
+        printf("Wrap test read of sectors 0-1 ");
+        print_fail(rc);
+        FreeMemType(mem, WRAP_BUF_SECS * ssize);
+        return (rc);
+    }
+
+    for (i = 0; i < ARRAY_SIZE(standard_sector_limits); i++) {
+        uint64_t lim = standard_sector_limits[i];
+        for (d = -1; d <= 1; d++) {
+            uint64_t lba;
+            uint64_t abs;
+            uint     pos;
+            int      bad = 0;
+
+            if ((d > 0) && (lim == ~0ULL))
+                continue;  // L + 1 would overflow
+            lba = lim + d;
+            if ((lba < 2) || (lba < lo_lba) || (lba >= hi_lba) ||
+                ((tested != 0) && (lba <= last)))
+                continue;  // Outside device / partition, or done already
+            if (lba > ~0ULL / ssize)
+                continue;
+            abs = lba * ssize;
+            if ((mode == WRAP_CMD) && ((abs + ssize - 1) >> 32))
+                continue;  // CMD_WRITE can not address this
+            last = lba;
+            tested++;
+
+            if (flag_destructive < 2) {
+                rc = wrap_io(tio, 0, mode, abs, ssize, orig);
+                if (rc != 0) {
+                    printf("\n    LBA ");
+                    print_lba(lba);
+                    printf(" read of original data ");
+                    print_fail(rc);
+                    failed++;
+                    continue;  // Do not write what can not be restored
+                }
+            }
+
+            /* Unique pattern: LBA followed by a fill byte */
+            memset(wbuf, 0x5a ^ (uint8_t) i ^ (uint8_t) (d << 4), ssize);
+            for (pos = 0; pos < 8; pos++)
+                wbuf[pos] = (uint8_t) (lba >> (56 - pos * 8));
+
+            rc = wrap_io(tio, 1, mode, abs, ssize, wbuf);
+            if (rc != 0) {
+                printf("\n    LBA ");
+                print_lba(lba);
+                printf(" write ");
+                print_fail(rc);
+                bad = 1;
+            } else {
+                memset(rbuf, 0xa5, ssize);
+                rc = wrap_io(tio, 0, mode, abs, ssize, rbuf);
+                if ((rc != 0) || (memcmp(wbuf, rbuf, ssize) != 0)) {
+                    printf("\n    LBA ");
+                    print_lba(lba);
+                    if (rc != 0) {
+                        printf(" read back ");
+                        print_fail(rc);
+                    } else {
+                        printf(" miscompare");
+                    }
+                    bad = 1;
+                }
+            }
+
+            /*
+             * Restore the original data before checking sectors 0 and 1,
+             * so that a restore which also wraps is caught and repaired.
+             */
+            if (flag_destructive < 2)
+                (void) wrap_io(tio, 1, mode, abs, ssize, orig);
+
+            /* Did a write land on sector 0 or 1? */
+            rc = wrap_io(tio, 0, WRAP_CMD, 0, ssize * 2, chk01);
+            if (rc != 0) {
+                printf("\n    LBA ");
+                print_lba(lba);
+                printf(" check of sectors 0-1 ");
+                print_fail(rc);
+                bad = 1;
+            } else if (memcmp(chk01, orig01, ssize * 2) != 0) {
+                uint s = (memcmp(chk01, orig01, ssize) != 0) ? 0 : 1;
+                printf("\n    LBA ");
+                print_lba(lba);
+                printf(" wrapped: sector %u was overwritten", s);
+                (void) wrap_io(tio, 1, WRAP_CMD, 0, ssize * 2, orig01);
+                bad = 1;
+            }
+
+            failed += bad;
+        }
+    }
+    FreeMemType(mem, WRAP_BUF_SECS * ssize);
+
+    if (failed != 0) {
+        printf("\n    Fail - %u of %u boundaries", failed, tested);
+        return (1);
+    }
+    return (0);
+}
+
 static int
 test_cmd_write(struct IOExtTD *tio)
 {
@@ -4579,7 +4804,9 @@ test_cmd_write(struct IOExtTD *tio)
     }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        check_write(tio, buf[0], buf[1], bufsize, writeoffset, 0);
+        rc = check_write(tio, buf[0], buf[1], bufsize, writeoffset, 0);
+        if ((rc == 0) && !test_offset_given())
+            rc = wrap_walk(tio, WRAP_CMD);
     } else {
         print_fail(rc);
     }
@@ -4655,27 +4882,14 @@ test_td_write64(struct IOExtTD *tio)
     }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        if (check_write(tio, buf[0], buf[1], bufsize, rel_offset, 0) == 0) {
-            if (HIGH_TEST_OK() && (rel_offset == 0)) {
-                printf("  4GB:");
-                memset(buf[0], 0xd7, bufsize);
-                if (setup_raw_io(tio, TD_WRITE64, 1, 1ULL << 32, bufsize,
-                                 buf[0]) == 0) {
-                    rc = DoIO((struct IORequest *) tio);
-                    if (rc == 0) {
-                        check_write(tio, buf[0], buf[1], bufsize,
-                                    1ULL << 32, 0);
-                    } else {
-                        print_fail(rc);
-                    }
-                }
-            }
-        }
+        rc = check_write(tio, buf[0], buf[1], bufsize, rel_offset, 0);
+        if ((rc == 0) && !test_offset_given())
+            rc = wrap_walk(tio, WRAP_TD64);
     } else {
         print_fail(rc);
     }
     printf("\n");
-    restore_overwritten_data(tio, buf, 1);
+    restore_overwritten_data(tio, buf, 0);
     restore_target_data(tio);
 
     return (rc);
@@ -4711,28 +4925,14 @@ test_nscmd_td_write64(struct IOExtTD *tio)
     }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        if (check_write(tio, buf[0], buf[1], bufsize, rel_offset, 1) == 0) {
-            if (HIGH_TEST_OK() && (rel_offset == 0)) {
-                /* Partition is large enough to test 4GB boundary */
-                printf("  4GB:");
-                memset(buf[0], 0xe6, bufsize);
-                if (setup_raw_io(tio, NSCMD_TD_WRITE64, 1, 1ULL << 32,
-                                 bufsize, buf[0]) == 0) {
-                    rc = DoIO((struct IORequest *) tio);
-                    if (rc == 0) {
-                        check_write(tio, buf[0], buf[1], bufsize,
-                                    1ULL << 32, 1);
-                    } else {
-                        print_fail(rc);
-                    }
-                }
-            }
-        }
+        rc = check_write(tio, buf[0], buf[1], bufsize, rel_offset, 1);
+        if ((rc == 0) && !test_offset_given())
+            rc = wrap_walk(tio, WRAP_NSD);
     } else {
         print_fail(rc);
     }
     printf("\n");
-    restore_overwritten_data(tio, buf, 2);
+    restore_overwritten_data(tio, buf, 0);
     restore_target_data(tio);
 
     return (rc);

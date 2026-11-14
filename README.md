@@ -372,10 +372,10 @@ The above test ran at about 1 MB/sec.
     TD_SEEK64          Success
     NSCMD_TD_SEEK64    Success
     NSCMD_ETD_SEEK64   Success
-    CMD_WRITE          Success
+    CMD_WRITE          Success  Wrap:Success  27 boundaries
     ETD_WRITE          Success
-    TD_WRITE64         Success
-    NSCMD_TD_WRITE64   Success
+    TD_WRITE64         Success  Wrap:Success  27 boundaries
+    NSCMD_TD_WRITE64   Success  Wrap:Success  27 boundaries
     NSCMD_ETD_WRITE64  Success
     TD_FORMAT          Success
     ETD_FORMAT         Success
@@ -385,6 +385,32 @@ The above test ran at about 1 MB/sec.
     TD_MOTOR ON        Success
     TD_MOTOR OFF       Success
 ```
+
+The CMD_WRITE, TD_WRITE64, and NSCMD_TD_WRITE64 tests also check
+whether the driver truncates large sector numbers, which would cause a
+write intended for a high address to wrap around and land near the
+start of the drive (overwriting the RDB or boot block). For each
+standard media size L (from 9 sectors up to 2^64-1 sectors, including
+floppy, 4 GB, 128 GB, and 2 TB limits), devtest writes one sector at
+absolute LBA L-1, L, and L+1, reads it back, and then restores the
+original contents. After each write, sectors 0 and 1 are compared
+against their original contents. If either has changed, devtest
+reports the boundary which wrapped and repairs the sector. Addresses
+beyond the end of the partition or device are skipped, as are those
+CMD_WRITE cannot reach (byte offsets of 4 GB and above). Failures are
+reported per address:
+```
+    TD_WRITE64         Success  Wrap:
+        LBA 0x10000 miscompare
+        LBA 0x10000 wrapped: sector 0 was overwritten
+        Fail - 1 of 27 boundaries
+```
+The boundary test is skipped if you specify an offset for the write
+command (for example, `-c write(512,4096)`). A wrap which lands on a
+sector other than 0 or 1 is not detected. As with the other write
+tests, a second `-d` option skips saving and restoring the original
+data at each boundary address, although sectors 0 and 1 are always
+repaired if a wrap overwrote them.
 
 Adding a second `-t` option will cause devtest to test additional
 packet types. Some packets may cause your media to eject or trigger
