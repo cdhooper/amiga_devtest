@@ -2732,10 +2732,12 @@ static uint     user_num_tio   = 0;
  * bandwidth_wait() waits for a benchmark request to complete, and adds the
  * bytes it transferred (io_Actual) to *bytes. Returns 0 if the full length
  * was transferred; otherwise reports the error or short transfer, and
- * returns nonzero.
+ * returns nonzero. offset is the absolute byte offset the request was
+ * issued at (for the error message).
  */
 static int
-bandwidth_wait(UWORD iocmd, struct IOExtTD *tio, uint64_t *bytes)
+bandwidth_wait(UWORD iocmd, struct IOExtTD *tio, uint64_t offset,
+               uint64_t *bytes)
 {
     int failcode = WaitIO((struct IORequest *) tio);
     uint32_t len = tio->iotd_Req.io_Length;
@@ -2753,7 +2755,11 @@ bandwidth_wait(UWORD iocmd, struct IOExtTD *tio, uint64_t *bytes)
         printf("short transfer (%u of %u bytes)", U32(actual), U32(len));
     else
         print_fail(failcode);
-    printf(" at 0x%x\n", U32(tio->iotd_Req.io_Offset));
+    /* io_Actual no longer holds the high offset bits after completion */
+    if (offset >> 32)
+        printf(" at 0x%x%08x\n", U32(offset >> 32), U32(offset));
+    else
+        printf(" at 0x%x\n", U32(offset));
     return (1);
 }
 
@@ -2770,6 +2776,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
     uint32_t issued;
     uint cur = 0;
     uint64_t pos;
+    uint64_t offs[MAX_NUM_TIO];  // Absolute offset of each issued request
     uint64_t limit = part_size();
     struct EClockVal stime;
     struct EClockVal etime;
@@ -2799,7 +2806,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
         for (;;) {
             if (issued & BIT(cur)) {
                 issued &= ~BIT(cur);
-                if (bandwidth_wait(iocmd, tio[cur], &xfer_bytes) != 0) {
+                if (bandwidth_wait(iocmd, tio[cur], offs[cur], &xfer_bytes) != 0) {
                     rc++;
                     break;
                 }
@@ -2826,6 +2833,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
                     cmd_for_offset(iocmd, abs + bufsize);
                 tio[cur]->iotd_Req.io_Actual = abs >> 32;
                 tio[cur]->iotd_Req.io_Offset = (uint32_t) abs;
+                offs[cur] = abs;
             }
             tio[cur]->iotd_Req.io_Data = buf[cur];
             tio[cur]->iotd_Req.io_Length = bufsize;
@@ -2851,7 +2859,7 @@ run_bandwidth(UWORD iocmd, struct IOExtTD **tio, uint8_t **buf,
                 issued &= ~BIT(cur);
                 if (aborted)
                     (void) WaitIO((struct IORequest *) tio[cur]);
-                else if (bandwidth_wait(iocmd, tio[cur], &xfer_bytes) != 0)
+                else if (bandwidth_wait(iocmd, tio[cur], offs[cur], &xfer_bytes) != 0)
                     rc++;
             }
             if (++cur >= num_tio)
@@ -7831,7 +7839,7 @@ main(int argc, char *argv[])
                         if (++arg >= argc) {
                             printf("-%s requires an argument\n", ptr);
                             printf("    Transfer size: 512 1M 64k etc\n"
-                                   "    optional alignment: ,1 ,2 ,3 etc\n");
+                                   "    concurrent requests: ,1 ,2 ,3 etc\n");
                             exit(RETURN_ERROR);
                         }
                         parse_tsize(argv[arg], (uint *)&user_perf_size, &pos);
