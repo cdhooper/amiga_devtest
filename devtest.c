@@ -1089,8 +1089,14 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
     if (g_sector_size == 0)
         g_sector_size = 512;
 
-    if (incdec == 0)
-        incdec = 1;
+    if (offset < g_sector_size) {
+        /*
+         * Device size is unknown (or tiny). Start at the second sector;
+         * the doubling search below will find the end.
+         */
+        offset = g_sector_size;
+        incdec = g_sector_size;
+    }
 
     buf = (uint8_t *) AllocMemType(g_sector_size, memtype);
     if (buf == NULL) {
@@ -1137,7 +1143,7 @@ do_seek_capacity(struct IOExtTD *tio, uint64_t *sectors)
     *sectors = min_offset / g_sector_size;
     g_turn_motor_off = 1;
     if (min_offset == -1)  // Nothing could be read
-        return (rc);
+        return ((rc != 0) ? rc : 1);
     return (0);
 }
 
@@ -1671,7 +1677,7 @@ drive_geometry(void)
                     if (!PAGE_HAS_BYTES(4, 6))
                         goto show_default;
                     printf("Mode Page 0x%02x", page);
-                    printf("%8u %18u %6u %4u\n",
+                    printf("%8u %19u %4u %5u\n",
                            _2btol(&pages[pos + 6]),    // Sector size
                            _2btol(&pages[pos + 8]),    // Cylinders
                            pages[pos + 4],             // Heads
@@ -3028,6 +3034,15 @@ drive_benchmark(int do_destructive, uint32_t memtype)
      */
     if (g_devsize == 0)
         (void) get_devsize(tio[0]);
+
+    /* -B was only checked against 512; the device may have larger sectors */
+    if ((user_perf_size != 0) && (g_sector_size > 512) &&
+        (user_perf_size % g_sector_size != 0)) {
+        printf("Transfer size %u is not a multiple of the %u byte sector "
+               "size\n", U32(user_perf_size), U32(g_sector_size));
+        rc = 1;
+        goto opendevice_fail;
+    }
 
     memset(buf, 0, sizeof (buf));
     /*
@@ -4425,21 +4440,37 @@ ar_extio_fail:
  */
 #define HIGH_TEST_OK() (part_size() >= ((1ULL << 32) + BUFSIZE * 2))
 
-static void
+/*
+ * save_overwritten_data() saves the data which the write and format tests
+ * overwrite, so that restore_overwritten_data() can put it back. Returns
+ * nonzero (after reporting why) if any of it could not be read, in which
+ * case the tests must not be run: the restore would write stale buffer
+ * contents over the start of the partition (on a whole drive, the RDB).
+ */
+static int
 save_overwritten_data(struct IOExtTD *tio, uint8_t **buf)
 {
+    int rc;
+
     if (flag_destructive > 1)  // Do not save or restore
-        return;
+        return (0);
 
     /* Save data which might be overwritten into a RAM buffer */
-    do_read_cmd(tio, 0, BUFSIZE, buf[2], 0);
-    do_read_cmd(tio, BUFSIZE, BUFSIZE, buf[3], 0);
-
-    if (HIGH_TEST_OK()) {
+    if (((rc = do_read_cmd(tio, 0, BUFSIZE, buf[2], 0)) == 0) &&
+        ((rc = do_read_cmd(tio, BUFSIZE, BUFSIZE, buf[3], 0)) == 0) &&
+        HIGH_TEST_OK()) {
         /* Partition is large enough to test 4GB boundary */
-        do_read_cmd(tio, 1ULL << 32, BUFSIZE, buf[4], g_has_nsd);
-        do_read_cmd(tio, (1ULL << 32) + BUFSIZE, BUFSIZE, buf[5], g_has_nsd);
+        if ((rc = do_read_cmd(tio, 1ULL << 32, BUFSIZE, buf[4],
+                              g_has_nsd)) == 0) {
+            rc = do_read_cmd(tio, (1ULL << 32) + BUFSIZE, BUFSIZE, buf[5],
+                             g_has_nsd);
+        }
     }
+    if (rc != 0) {
+        printf("Write tests skipped: could not save original data: ");
+        print_fail_nl(rc);
+    }
+    return (rc);
 }
 
 static void
@@ -5868,7 +5899,6 @@ test_cmd_scsi(struct IOExtTD *tio)
 {
     int rc;
     scsi_generic_t cmd;
-    uint maxreplylen = 16384;  // maximum
     uint replylen;
     uint cmdlen;
     uint8_t *replybuf;
@@ -5890,8 +5920,6 @@ test_cmd_scsi(struct IOExtTD *tio)
         printf("Command length 0x%x is too long\n", cmdlen);
         return (EINVAL);
     }
-    if (replylen > maxreplylen)
-        replylen = maxreplylen;
 
     memset(&cmd, 0, sizeof (cmd));
     cmd.opcode = (uint8_t) (cur_test_args->arg[0] >> 24);
@@ -6210,7 +6238,15 @@ test_packets_ll(uint64_t test_mask, struct IOExtTD *tio)
          * Capture data before it is overwritten by any of the
          * destructive commands.
          */
-        save_overwritten_data(tio, g_tbuf);
+        if (save_overwritten_data(tio, g_tbuf) != 0) {
+            test_mask &= ~(TEST_CMD_WRITE | TEST_ETD_WRITE |
+                           TEST_TD_WRITE64 |
+                           TEST_NSCMD_TD_WRITE64 | TEST_NSCMD_ETD_WRITE64 |
+                           TEST_TD_FORMAT | TEST_ETD_FORMAT |
+                           TEST_TD_FORMAT64 |
+                           TEST_NSCMD_TD_FORMAT64 | TEST_NSCMD_ETD_FORMAT64);
+            rc++;
+        }
 
         if ((test_mask & TEST_CMD_WRITE) && test_cmd_write(tio)) {
             test_mask &= ~(TEST_ETD_WRITE | TEST_TD_WRITE64 |
@@ -6766,6 +6802,14 @@ test_integrity_butterfly(struct IOExtTD *tio, uint bufsize)
     else
         devend = g_devsize;
     devsize = devend - g_devstart;
+    /*
+     * Right-side offsets are measured back from the end of the device.
+     * Use a whole number of transfers, so that they are aligned to the
+     * transfer size like the left side. Otherwise, a device with an odd
+     * sector count gets odd (unaligned) right-side offsets, which many
+     * devices (such as SD-card based ones) write much more slowly.
+     */
+    devsize -= devsize % bufsize;
 
 #define ZONES 31  // Must be a prime number to avoid duplicates
 
@@ -7185,6 +7229,14 @@ test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
         goto integrity_fail;
     }
 
+    /* -i was only checked against 512; the device may have larger sectors */
+    if ((g_sector_size > 512) && (bufsize % g_sector_size != 0)) {
+        printf("Transfer size %u is not a multiple of the %u byte sector "
+               "size\n", bufsize, U32(g_sector_size));
+        rc = 1;
+        goto integrity_fail;
+    }
+
     switch (mode) {
         case 0:  // Mode not specified with -k
         case 1:  // -k simple
@@ -7264,6 +7316,17 @@ max_cmd_args(uint cmd)
  * length; the remaining CDB bytes start at byte offset 4 (args->arg[1]).
  * The CDB bytes following the opcode must fit in scsi_generic_t.bytes.
  */
+/* hexval() returns the value of a hexadecimal digit character */
+static uint
+hexval(char ch)
+{
+    if ((ch >= '0') && (ch <= '9'))
+        return (ch - '0');
+    if ((ch >= 'a') && (ch <= 'f'))
+        return (ch - 'a' + 10);
+    return (ch - 'A' + 10);
+}
+
 #define SCSI_ARG_MAX_POS (4 + sizeof (((scsi_generic_t *) 0)->bytes))
 
 static void
@@ -7281,7 +7344,8 @@ get_cmd_scsi_args(args_t *args, const char *arg)
                "   (200,2a,0,00000000,0,0001,0) - Write(10) a 512 byte sector\n"
                "   (28,12,000000,28,0)          - Inquiry\n"
                "   (8,25,00,00000000,00000000)  - Read Capacity(10)\n"
-               "   (8,9e,10,0)                  - Read Capacity(16)\n"
+               "   (20,9e,10,0000000000000000,\n"
+               "    00000020,0,0)               - Read Capacity(16)\n"
                "   (ff,1a,8,3f,0,ff,0)          - Mode Sense (all pages)\n"
                "   (18,1a,8,3,0,18,0)           - Get Mode Page 3\n"
                "");
@@ -7289,6 +7353,7 @@ get_cmd_scsi_args(args_t *args, const char *arg)
     }
     memset(args->arg, 0, sizeof (args->arg));
     while (sscanf(arg, "%x%n", &val, &count) == 1) {
+        const char *field = arg;
         if (count != 0) {
             arg += count;
             if (*arg == ',')
@@ -7296,6 +7361,16 @@ get_cmd_scsi_args(args_t *args, const char *arg)
         }
         switch (argpos) {
             case 0:  // reply length
+                /*
+                 * Only 16 bits are stored. Truncating a larger length
+                 * would let the target transfer past the end of the
+                 * reply buffer.
+                 */
+                if (val > 0xffff) {
+                    printf("SCSI reply length 0x%x is too large "
+                           "(max ffff)\n", val);
+                    exit(RETURN_ERROR);
+                }
                 args->arg[0] = (uint16_t) val;
                 argpos += 3;
                 break;
@@ -7305,33 +7380,47 @@ get_cmd_scsi_args(args_t *args, const char *arg)
                 break;
             default: {
                 /*
-                 * The number of hex digits determines the field width.
-                 * Bytes are stored one at a time, big-endian, as the
-                 * field may not be aligned (68000 faults on unaligned
-                 * word and long access).
+                 * The number of hex digits determines the field width:
+                 * two digits per byte, rounded up (so "0000000000" is
+                 * 5 bytes). Bytes are taken from the digit string itself,
+                 * as a field may be wider than 32 bits. They are stored
+                 * one at a time, as the field may not be aligned (68000
+                 * faults on unaligned word and long access).
                  */
+                const char *digits;
+                const char *dend;
+                uint ndigits;
                 uint nbytes;
                 uint cur;
-                if (count <= 2)
-                    nbytes = 1;
-                else if (count <= 4)
-                    nbytes = 2;
-                else if (count <= 6)
-                    nbytes = 3;
-                else if (count <= 8)
-                    nbytes = 4;
-                else
-                    nbytes = 8;  // val is only 32 bits; upper bytes are 0
+
+                while ((*field == ' ') || (*field == '\t'))
+                    field++;
+                if ((field[0] == '0') &&
+                    ((field[1] == 'x') || (field[1] == 'X')) &&
+                    isxdigit((unsigned char) field[2]))
+                    field += 2;
+                digits = field;
+                for (dend = digits; isxdigit((unsigned char) *dend); dend++)
+                    ;
+                ndigits = dend - digits;
+                nbytes = (ndigits + 1) / 2;
                 if (argpos + nbytes > SCSI_ARG_MAX_POS) {
                     printf("SCSI command is too long (max %u bytes)\n",
                            SCSI_ARG_MAX_POS - 3);
                     exit(RETURN_ERROR);
                 }
                 for (cur = 0; cur < nbytes; cur++) {
-                    uint shift = (nbytes - 1 - cur) * 8;
-                    ((uint8_t *) args->arg)[argpos++] =
-                        (shift < 32) ? (uint8_t) (val >> shift) : 0;
+                    /* Byte cur holds digits ending at this position */
+                    int  last = ndigits - 1 - (nbytes - 1 - cur) * 2;
+                    uint byte = hexval(digits[last]);
+                    if (last > 0)
+                        byte |= hexval(digits[last - 1]) << 4;
+                    ((uint8_t *) args->arg)[argpos++] = (uint8_t) byte;
                 }
+                /* Resume after the digits, however many %x consumed */
+                arg = dend;
+                if (*arg == ',')
+                    arg++;
                 break;
             }
         }
@@ -7419,15 +7508,20 @@ destructive_cmd_name(uint64_t mask, const args_t *args)
         0x07,  // REASSIGN BLOCKS
         0x0a,  // WRITE(6)
         0x15,  // MODE SELECT(6)
+        0x19,  // ERASE(6) (tape)
+        0x2c,  // ERASE(10)
         0x2a,  // WRITE(10)
         0x2e,  // WRITE AND VERIFY(10)
         0x3b,  // WRITE BUFFER (may update firmware)
         0x3f,  // WRITE LONG(10)
         0x41,  // WRITE SAME(10)
+        0x42,  // UNMAP
+        0x48,  // SANITIZE
         0x55,  // MODE SELECT(10)
         0x8a,  // WRITE(16)
         0x8e,  // WRITE AND VERIFY(16)
         0x93,  // WRITE SAME(16)
+        0x9c,  // WRITE ATOMIC(16)
         0xaa,  // WRITE(12)
         0xae,  // WRITE AND VERIFY(12)
     };

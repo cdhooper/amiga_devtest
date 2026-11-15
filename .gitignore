@@ -1,4 +1,8 @@
 *.uaem
-objs
-devtest
 *.zip
+*.lha
+devtest
+objs/
+img/
+rawflop/
+release/

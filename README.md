@@ -372,10 +372,10 @@ The above test ran at about 1 MB/sec.
     TD_SEEK64          Success
     NSCMD_TD_SEEK64    Success
     NSCMD_ETD_SEEK64   Success
-    CMD_WRITE          Success  Wrap:Success  27 boundaries
+    CMD_WRITE          Success
     ETD_WRITE          Success
-    TD_WRITE64         Success  Wrap:Success  27 boundaries
-    NSCMD_TD_WRITE64   Success  Wrap:Success  27 boundaries
+    TD_WRITE64         Success
+    NSCMD_TD_WRITE64   Success
     NSCMD_ETD_WRITE64  Success
     TD_FORMAT          Success
     ETD_FORMAT         Success
@@ -460,38 +460,41 @@ SCSICMD 88         Fail 52  SENSE 5/20/00 Sense Key 5 (ASC=20 ASCQ=00)
 
 The SCSI command arguments are always specified in hexadecimal.
 The first argument is the expected response length. This length must be
-at least the length that the SCSI target needs to send. Typically,
+at least the length that the SCSI target needs to send, and at most
+ffff (65535 bytes). Typically,
 drives like SCSI hard disk use 512-byte sectors (200). CD-ROM drives
 typically 2048-byte sectors (800), so you should use `800` if following
 the SCSI read examples above. The next byte is the SCSI command. Refer
 to a SCSI command reference for the hexadecimal code and expected
-response length. A few typical SCSI commands are:
+response length. Common SCSI commands are:
 | Code  | Command           | Additional Bytes                               |
 | :---: | :---------------: | :--------------------------------------------: |
 | 0     | Test Unit Ready   | [7:5=LUN]                                      |
-| 8     | Read(6)           | addr2...addr0 len ctrl                         |
-| a     | Write(6)          | addr2...addr0 len ctrl                         |
+| 8     | Read(6)           | addr210 len ctrl                               |
+| a     | Write(6)          | addr210 len ctrl                               |
 | 12    | Inquiry           | [7:5=LUN,1=CMMD,0=EVPD] Page 00 len ctrl       |
 | 1a    | Mode Sense(6)     | [3=DBD] page 00 len 00                         |
-| 28    | Read(10)          | 00 addr3...addr0 00 len1 len0 ctrl             |
-| a8    | Read(12)          | byte2 addr3...addr0 00 len3...len0 rsvd ctrl   |
-| 88    | Read(16)          | 00 addr7...addr0 len3...len0 00 ctrl           |
-| 2a    | Write(10)         | 00 addr3 addr2 addr1 addr0 00 len1 len0 ctrl   |
-| aa    | Write(12)         | byte2 addr3...addr0 00 len3...len0 rsvd ctrl   |
-| 8a    | Write(16)         | 00 addr7...addr0 len3...len0 00 ctrl           |
-| 25    | Read Capacity(10) | byte2 addr3...addr0 rsvd2...rsvd0 ctrl         |
-| 9e10  | Read Capacity(16) | addr7...addr0 len3...len0 byte15 ctrl          |
+| 28    | Read(10)          | 00 addr3210 00 len1 len0 ctrl                  |
+| a8    | Read(12)          | byte2 addr3210 00 len3210 rsvd ctrl            |
+| 88    | Read(16)          | 00 addr7..0 len3210 00 ctrl                    |
+| 2a    | Write(10)         | 00 addr3210 00 len1 len0 ctrl                  |
+| aa    | Write(12)         | byte2 addr3210 00 len3210 rsvd ctrl            |
+| 8a    | Write(16)         | 00 addr7..0 len3210 00 ctrl                    |
+| 25    | Read Capacity(10) | byte2 addr3210 rsvd210 ctrl                    |
+| 9e10  | Read Capacity(16) | addr7..0 len3210 byte15 ctrl                   |
 
 Values which follow the command are command option bytes.
 You may specify the values as a mix of individual bytes or longer values.
-The number of bytes is determined by the number of digits specified.
+The number of bytes is determined by the number of digits specified:
+two digits per byte, rounded up (up to 16 digits per value).
 |  Digits   |  Byte count  | Example 1 | Example 2  |
 | :------:  | :----------: | :-------: | :--------: |
 | 1 or 2    | 1            | 9         | 98         |
 | 3 or 4    | 2            | 987       | 9876       |
 | 5 or 6    | 3            | 98765     | 987654     |
 | 7 or 8    | 4            | 9876543   | 98765432   |
-| 9 or more | 8            | 987654321 | 9876543210 |
+| 9 or 10   | 5            | 987654321 | 9876543210 |
+| 11 to 16  | 6 to 8       | 98765432100 | 0000000000001234 |
 
 Example:
 ```
