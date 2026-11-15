@@ -1272,6 +1272,24 @@ devtype_str(uint dtype)
     return ("Unknown");
 }
 
+/*
+ * sector_size_ok() returns non-zero if ssize is a plausible block device
+ * sector size: a power of two from 512 bytes to 64 KB. A driver which
+ * reports anything else (for example, a malformed READ CAPACITY reply)
+ * would otherwise cause devtest to compute misaligned device offsets.
+ */
+static int
+sector_size_ok(uint ssize)
+{
+    return ((ssize >= 512) && (ssize <= 65536) && ((ssize & (ssize - 1)) == 0));
+}
+
+static void
+warn_sector_size(const char *source, uint ssize)
+{
+    printf("Ignoring invalid sector size %u reported by %s\n", ssize, source);
+}
+
 static int
 get_devsize(struct IOExtTD *tio)
 {
@@ -1279,11 +1297,22 @@ get_devsize(struct IOExtTD *tio)
     uint64_t capacity = 0;
     scsi_read_capacity_10_data_t *cap10;
     rc = do_scsi_read_capacity_10(tio, &cap10);
+    if ((rc == 0) && (cap10 != NULL) &&
+        !sector_size_ok(*(uint32_t *) &cap10->length)) {
+        warn_sector_size("READ CAPACITY", *(uint32_t *) &cap10->length);
+        FreeMemType(cap10, sizeof (*cap10));
+        cap10 = NULL;
+        rc = 1;
+    }
     if (rc != 0) {
         /* Try TD_GETGEOMETRY */
         struct DriveGeometry dg;
         rc = do_getgeometry(tio, &dg);
         if (rc == 0) {
+            if (!sector_size_ok(dg.dg_SectorSize)) {
+                warn_sector_size("TD_GETGEOMETRY", dg.dg_SectorSize);
+                return (1);
+            }
             g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
             g_sector_size = dg.dg_SectorSize;
         }
@@ -1548,8 +1577,12 @@ drive_geometry(void)
         printf("%5u  0x%02x %s\n",
                U32(dg.dg_TrackSectors), dg.dg_DeviceType,
                (dg.dg_Flags & DGF_REMOVABLE) ? "Yes" : "No");
-        g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
-        g_sector_size = dg.dg_SectorSize;
+        if (sector_size_ok(dg.dg_SectorSize)) {
+            g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
+            g_sector_size = dg.dg_SectorSize;
+        } else {
+            warn_sector_size("TD_GETGEOMETRY", dg.dg_SectorSize);
+        }
     }
 
     printf("Inquiry ");
@@ -1590,7 +1623,9 @@ drive_geometry(void)
         sector_size = *(uint32_t *) &cap10->length;
         FreeMemType(cap10, sizeof (*cap10));
         printf("%5u %12s\n", U32(sector_size), llu_to_str(last_sector + 1));
-        if (g_devsize == 0) {
+        if (!sector_size_ok(sector_size)) {
+            warn_sector_size("READ_CAPACITY_10", sector_size);
+        } else if (g_devsize == 0) {
             g_devsize = (uint64_t) sector_size * (last_sector + 1);
             g_sector_size = sector_size;
         }
@@ -1607,8 +1642,12 @@ drive_geometry(void)
         sector_size = *(uint32_t *) &cap16->length;
         FreeMemType(cap16, sizeof (*cap16));
         printf("%5u %12s\n", U32(sector_size), llu_to_str(last_sector + 1));
-        g_devsize = (uint64_t) sector_size * (last_sector + 1);
-        g_sector_size = sector_size;
+        if (sector_size_ok(sector_size)) {
+            g_devsize = (uint64_t) sector_size * (last_sector + 1);
+            g_sector_size = sector_size;
+        } else {
+            warn_sector_size("READ_CAPACITY_16", sector_size);
+        }
     }
 
     printf("Read-to capacity ");
@@ -1935,7 +1974,7 @@ finish_fail:
         close_device(tio[iter]);
 
     /* dg is only valid if at least one TD_GETGEOMETRY succeeded */
-    if ((dg.dg_SectorSize != 0) && (dg.dg_TotalSectors != 0)) {
+    if (sector_size_ok(dg.dg_SectorSize) && (dg.dg_TotalSectors != 0)) {
         g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
         g_sector_size = dg.dg_SectorSize;
     }
@@ -3214,8 +3253,12 @@ test_cmd_getgeometry(struct IOExtTD *tio)
                U32(dg.dg_TotalSectors), U32(dg.dg_SectorSize), U32(dg.dg_Cylinders),
                U32(dg.dg_Heads), U32(dg.dg_TrackSectors), U32(dg.dg_DeviceType),
                (dg.dg_Flags & DGF_REMOVABLE) ? " Removable" : "");
-        g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
-        g_sector_size = dg.dg_SectorSize;
+        if (sector_size_ok(dg.dg_SectorSize)) {
+            g_devsize = (uint64_t) dg.dg_TotalSectors * dg.dg_SectorSize;
+            g_sector_size = dg.dg_SectorSize;
+        } else {
+            warn_sector_size("TD_GETGEOMETRY", dg.dg_SectorSize);
+        }
     } else {
         print_fail_nl(rc);
     }
@@ -5038,7 +5081,7 @@ test_td_format(struct IOExtTD *tio)
     }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        check_write(tio, buf[0], buf[1], BUFSIZE, BUFSIZE, 0);
+        rc = check_write(tio, buf[0], buf[1], BUFSIZE, BUFSIZE, 0);
     } else {
         print_fail(rc);
     }
@@ -5059,7 +5102,7 @@ test_etd_format(struct IOExtTD *tio)
     if (rc == -1)
         return (0);  // Skipped
     if (rc == 0) {
-        check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0);
+        rc = check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0);
         printf("\n");
     }
     restore_overwritten_data(tio, buf, 0);
@@ -5081,7 +5124,8 @@ test_td_format64(struct IOExtTD *tio)
     }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        if (check_write(tio, buf[0], buf[1], BUFSIZE, BUFSIZE, 0) == 0) {
+        if ((rc = check_write(tio, buf[0], buf[1], BUFSIZE, BUFSIZE,
+                              0)) == 0) {
             if (HIGH_TEST_OK()) {
                 /* Partition is large enough to test 4GB boundary */
                 printf("  4GB:");
@@ -5090,8 +5134,8 @@ test_td_format64(struct IOExtTD *tio)
                                  BUFSIZE, buf[0]) == 0) {
                     rc = DoIO((struct IORequest *) tio);
                     if (rc == 0) {
-                        check_write(tio, buf[0], buf[1], BUFSIZE,
-                                    (1ULL << 32) + BUFSIZE, 0);
+                        rc = check_write(tio, buf[0], buf[1], BUFSIZE,
+                                         (1ULL << 32) + BUFSIZE, 0);
                     } else {
                         print_fail(rc);
                     }
@@ -5125,7 +5169,8 @@ test_nscmd_td_format64(struct IOExtTD *tio)
     }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        if (check_write(tio, buf[0], buf[1], BUFSIZE, BUFSIZE, 1) == 0) {
+        if ((rc = check_write(tio, buf[0], buf[1], BUFSIZE, BUFSIZE,
+                              1)) == 0) {
             if (HIGH_TEST_OK()) {
                 /* Partition is large enough to test 4GB boundary */
                 printf("  4GB:");
@@ -5135,8 +5180,8 @@ test_nscmd_td_format64(struct IOExtTD *tio)
                                  buf[0]) == 0) {
                     rc = DoIO((struct IORequest *) tio);
                     if (rc == 0) {
-                        check_write(tio, buf[0], buf[1], BUFSIZE,
-                                    (1ULL << 32) + BUFSIZE, 1);
+                        rc = check_write(tio, buf[0], buf[1], BUFSIZE,
+                                         (1ULL << 32) + BUFSIZE, 1);
                     } else {
                         print_fail(rc);
                     }
@@ -7316,6 +7361,33 @@ max_cmd_args(uint cmd)
  * length; the remaining CDB bytes start at byte offset 4 (args->arg[1]).
  * The CDB bytes following the opcode must fit in scsi_generic_t.bytes.
  */
+/*
+ * check_args_end() exits with an error if a -c argument list has anything
+ * other than an optional closing parenthesis after the last value parsed,
+ * so that a value such as "512x" is not silently taken as 512.
+ */
+static void
+check_args_end(const char *cmd, const char *rest)
+{
+    if (rest[0] == '\0')
+        return;
+    if ((rest[0] == ')') && (rest[1] == '\0'))
+        return;
+    printf("Invalid argument \"%s\" to %s\n", rest, cmd);
+    exit(RETURN_ERROR);
+}
+
+/*
+ * is_hex_digit() is used instead of isxdigit(), which in clib2 also
+ * accepts some letters past 'f' (such as 'g').
+ */
+static int
+is_hex_digit(char ch)
+{
+    return (((ch >= '0') && (ch <= '9')) || ((ch >= 'a') && (ch <= 'f')) ||
+            ((ch >= 'A') && (ch <= 'F')));
+}
+
 /* hexval() returns the value of a hexadecimal digit character */
 static uint
 hexval(char ch)
@@ -7397,10 +7469,11 @@ get_cmd_scsi_args(args_t *args, const char *arg)
                     field++;
                 if ((field[0] == '0') &&
                     ((field[1] == 'x') || (field[1] == 'X')) &&
-                    isxdigit((unsigned char) field[2]))
+                    is_hex_digit(field[2])) {
                     field += 2;
+                }
                 digits = field;
-                for (dend = digits; isxdigit((unsigned char) *dend); dend++)
+                for (dend = digits; is_hex_digit(*dend); dend++)
                     ;
                 ndigits = dend - digits;
                 nbytes = (ndigits + 1) / 2;
@@ -7425,6 +7498,7 @@ get_cmd_scsi_args(args_t *args, const char *arg)
             }
         }
     }
+    check_args_end("SCSI", arg);
     if (argpos < 4) {
         printf("SCSI command requires len and cmd args\n");
         exit(RETURN_ERROR);
@@ -7466,6 +7540,7 @@ get_cmd(const char *str, args_t *args)
                     }
                     args->arg[args->arg_count++] = val;
                 }
+                check_args_end(str, arg);
                 if ((args->arg_count == 0) ||
                     (args->arg_count > max_cmd_args(pos))) {
                     if (args->arg_count != 0)
@@ -7714,6 +7789,7 @@ main(int argc, char *argv[])
     uint bnum;
     uint loop = 0;
     uint loops = 1;
+    uint first_pass_failed = 0;  // A failure in pass 1 of several
 #define MAX_CMD_MASKS 32
     static uint test_cmd_count = 0;
     struct IOExtTD tio;
@@ -7759,8 +7835,9 @@ main(int argc, char *argv[])
                             exit(RETURN_ERROR);
                         }
                         parse_tsize(argv[arg], (uint *)&user_perf_size, &pos);
-                        if ((user_perf_size == 0) || (user_perf_size & 511)) {
-                            printf("transfer size must be a non-zero "
+                        if ((user_perf_size == 0) || (user_perf_size & 511) ||
+                            (user_perf_size >> 31)) {
+                            printf("transfer size must be a "
                                    "multiple of 512 bytes\n");
                             exit(RETURN_ERROR);
                         }
@@ -7827,8 +7904,9 @@ main(int argc, char *argv[])
                                     exit(RETURN_ERROR);
                                 }
                             }
-                            if ((tsize == 0) || (tsize & 511)) {
-                                printf("transfer size must be a non-zero "
+                            if ((tsize == 0) || (tsize & 511) ||
+                                (tsize >> 31)) {
+                                printf("transfer size must be a "
                                        "multiple of 512 bytes\n");
                                 exit(RETURN_ERROR);
                             }
@@ -8008,6 +8086,10 @@ main(int argc, char *argv[])
         g_envec       = (struct DosEnvec *) BTOC(startup->fssm_Environ);
         if (g_envec != NULL) {
             g_sector_size = g_envec->de_SizeBlock * 4;
+            if (!sector_size_ok(g_sector_size)) {
+                printf("Invalid partition block size %u\n", g_sector_size);
+                exit(RETURN_ERROR);
+            }
             g_devstart = (uint64_t) g_envec->de_LowCyl * g_envec->de_Surfaces *
                          g_envec->de_BlocksPerTrack * g_sector_size;
             g_devend = (uint64_t) (g_envec->de_HighCyl + 1) *
@@ -8054,6 +8136,11 @@ got_unit:
         goto idle_fail;
 
     for (loop = 0; loop < loops; loop++) {
+        /*
+         * With multiple passes, a failure in the first pass does not stop
+         * testing (later passes may still be useful), but it is remembered
+         * so that the result and exit code report it.
+         */
         uint stop_on_error = (loop != 0) || (loops == 1);
         if (loops > 1) {
             printf("Pass %u  ", loop + 1);
@@ -8073,32 +8160,42 @@ got_unit:
                 print_fail_nl(rc);
                 if (stop_on_error)
                     break;
+                first_pass_failed = 1;
             } else {
                 did_open = 1;
             }
         }
-        if (flag_probe && scsi_probe(unit) && stop_on_error)
-            break;
-        if (flag_geometry && drive_geometry() && stop_on_error)
-            break;
+        if (flag_probe && scsi_probe(unit)) {
+            if (stop_on_error)
+                break;
+            first_pass_failed = 1;
+        }
+        if (flag_geometry && drive_geometry()) {
+            if (stop_on_error)
+                break;
+            first_pass_failed = 1;
+        }
         if (flag_integrity &&
             test_integrity(test_mode, flag_integrity, memtype, tsize, talign)) {
             break;
         }
         if (flag_testpackets &&
-            test_packets(flag_destructive, flag_testpackets, 0, NULL) &&
-            stop_on_error) {
-            break;
+            test_packets(flag_destructive, flag_testpackets, 0, NULL)) {
+            if (stop_on_error)
+                break;
+            first_pass_failed = 1;
         }
         if ((test_cmd_count > 0) &&
-            test_packets(0, 0, test_cmd_count, test_cmd_mask) &&
-            stop_on_error) {
-            break;
+            test_packets(0, 0, test_cmd_count, test_cmd_mask)) {
+            if (stop_on_error)
+                break;
+            first_pass_failed = 1;
         }
         if ((flag_benchmark > 1) &&
-            drive_latency(flag_destructive) &&
-            stop_on_error) {
-            break;
+            drive_latency(flag_destructive)) {
+            if (stop_on_error)
+                break;
+            first_pass_failed = 1;
         }
         if (did_open) {
             did_open = 0;
@@ -8123,13 +8220,15 @@ allocmem_fail:
     if (loops > 1) {
         if (loop < loops)
             printf("Stopped at pass %u of %u\n", loop + 1, loops);
+        else if (first_pass_failed)
+            printf("%u passes completed; pass 1 failed\n", loops);
         else
             printf("%u passes completed successfully\n", loops);
     }
 
     idle_task_end();
 
-    if (loop < loops)
+    if ((loop < loops) || first_pass_failed)
         exit(RETURN_ERROR);
 
     exit(RETURN_OK);
