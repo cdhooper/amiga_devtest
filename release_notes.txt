@@ -1,0 +1,79 @@
+Release 2.0
+
+Major changes since 1.9
+
+All changes
+    Increased -c scsi command maximum length from 1024 bytes to 16384 bytes.
+    Added further documentation on the length option to the scsi command.
+    ci: build devtest on pushes and pull requests
+    devtest: fix DOSBase type (pointer to struct DosLibrary)
+    ci: build devtest on pushes and pull requests
+    ci: changes to build LhA package and export archive name from the Makefile
+    Remove "scsi" command from list of tests which are run automatically.
+        It requires arguments which are not specified for the test pass.
+    Fixed write and format tests to respect partition boundaries (-d -d DH1:)
+    Fixed write and write64 to not trim the device offset to 32 bits
+    Fixed -bbd (write benchmark) to respect the partition start (-b -d DH1:)
+    Updated README.md to provide more information on common SCSI commands
+    Fixed bug where -i -d integrity test can restore the wrong data in simple mode.
+    Added check for -d flag to individual destructive commands
+    Fixed crash bug where -c command is specified with too many arguments
+    Fixed drive latency test bug where CreateExtIO failure could cause a crash
+    Fixed mode page parsing to not crash (unaliged) on 68000
+    Fixed -c scsi() to not crash (unaligned) on 68000
+    Added further help to "devtest -c scsi" command
+    Fixed "devtest -m <addr>" bug: fixed address failed to allocate buffers
+    Fixed "devtest -mm <addr>" bug: false failures due to reused buf address
+    Added support for arguments to "devtest -c nsdewrite"
+    Made TD_SEEK reject offset which is beyond 4GB (not supported by trackdisk API)
+    Fixed disk seek-to-capacity for drives of size 8GB or 2TB
+    Fixed multiple issues in butterfly latency test
+        - Avoid cache hits by choosing unique butterfly addresses
+        - Device partition offsets are now respected
+        - Reads past 4 GB switch to the 64-bit commands
+    Fixed open/close latency test. Now does more iterations for better accuracy.
+    Fixed inaccurate latency result display (was off by 10x)
+    Added support for HD_SCSICMD sequential/parallel latency test on large drives
+    Latency benchmark no longer shows latency if there are I/O failures.
+    Improved -i alignment check to require > 0, < 0x10000 and a power of 2.
+    Fixed dev name matching to not require NUL byte after the name.
+    Fixed bug where if user specifies unmounted volume wrong limits will be used.
+    Improved disk device lookup and verification that it's trackdisk-compatible.
+    Fixed TD_ADDCHANGEINT bug where it was possibly freed while the driver owned it.
+    Interrupt structures are no longer allocated on the stack
+    Fixed potential devtest startup hang if another task is already spin-looping.
+    Fixed "devtest -c tur" to not report stale sense data ("Success  Not ready")
+    Fixed Butterfly integrity test on small devices (divide by 0)
+    Fixed Simple integrity test with -dd, wrong "matches originally on disk" report.
+    Fixed SCSI Inquiry in "devtest -t" to pick the correct LUN (was always 0).
+    Fixed "devtest -p" having incorrect sizes for small devices (DF0 was 512 KB)
+    Fixed bug where drive geometry may report wrong results on out-of-memory condition.
+    Fixed bug where "devtest -p" may leave the device still open on out-of-memory condition
+    Fixed write latency test leaking a buffer when device could not be opened
+    Corrected limit of 32 "devtest -c" invocations per program run
+    Made "devtest -B <size" verify size is a multiple of 512.
+    Fixed "devtest -c read" to never read past the end of the partition
+    Fixed bug where the exit code for failed TUR was always 0. Now it is 10.
+    The "devtest -l <loops>" command now refuses negative counts.
+    The "devtest -m [0 to 9 values]" are now refused as addresses.
+    All latency tests now either report failure or latency. Not both.
+    Added real MFM TD_RAWREAD and TD_RAWWRITE tests
+    Fixed devtest -b under-reporting rates >= 100 MB/sec (precision was lost).
+    If the device transfers less than requested, devtest -b will give accurate rate report.
+    devtest -v now responds to ^C during a transfer size step (better for floppy).
+    Added mention in doc of transfer KB units and how the CPU utilization is measured.
+    Now automatically scales back to just 32 KB bandwidth test on a slow device.
+    devtest -b no longer reports a transfer rate when an I/O error occurs.
+    devtest -b now aligns buffers to 16 bytes for up to 5% read improvement
+    Added device write common boundary test for CMD_WRITE and 64-bit alternatives.
+    Fixed "devtest -c scsi" parsing to handle up to 8-byte args.
+    Fixed failure handling bug where data is saved before destructive test.
+    Added more SCSI opcodes to the "destructive" list.
+    Fixed "devtest -g" Read-to-capacity to work when the device size is unknown.
+    Changed -i and -B tests to require they are a multiple of the dev sector size.
+    Corrected formatting for SCSI Mode page 5 display.
+    Format tests now return failure when a write check fails.
+    devtest will now exit with a failure code if the first pass fails.
+    Numeric arguments are now checked for invalid trailing text or negatives
+    Invalid sector sizes from READ_CAPACITY or TD_GETGEOMETRY are now rejected.
+    Fixed bandwidth failure report to show entire 64-bit disk address

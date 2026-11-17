@@ -443,7 +443,8 @@ usage(void)
            "usage: devtest <options> <x.device> <unit>\n"
            "   -b                    benchmark device [-bb show latency, "
                                      "-C no CPU %%]\n"
-           "   -B <tsize>[,<#tio>]   set benchmark arguments, default: 512k,4\n"
+           "   -B <tsize>[,<align>[,<#tio>]]  benchmark arguments, "
+                                     "default: 512k,16,4\n"
            "   -c <cmd>[(arg,...)]   test a specific device driver request\n"
            "   -d                    also do destructive operations (write)\n"
 // Undocumented: -dd skips save/restore of data with -i integrity test
@@ -2727,6 +2728,7 @@ print_perf(uint ttime, uint itime, uint freq, uint64_t bytes, int is_write,
 
 static uint32_t user_perf_size = 0;
 static uint     user_num_tio   = 0;
+static uint32_t user_perf_align = 0;  // 0 = default (BENCH_ALIGN)
 
 /*
  * bandwidth_wait() waits for a benchmark request to complete, and adds the
@@ -3025,6 +3027,22 @@ drive_is_slow(struct IOExtTD *tio, uint8_t *buf)
 
 #define BENCH_ALIGN 16  // Benchmark buffer alignment (cache line)
 
+/*
+ * exact_align() returns an address within [base, base + 2 * align) which
+ * is aligned to align bytes, but not to 2 * align bytes, so that a test
+ * runs at exactly the requested alignment. The allocation at base must be
+ * at least 2 * align bytes larger than the buffer. align is a power of 2.
+ */
+static void *
+exact_align(void *base, uint32_t align)
+{
+    uintptr_t addr = (uintptr_t) base;
+    uintptr_t up   = (addr + 2 * align - 1) & ~(uintptr_t) (2 * align - 1);
+    if (up - align >= addr)
+        return ((void *) (up - align));
+    return ((void *) (up + align));
+}
+
 static int
 drive_benchmark(int do_destructive, uint32_t memtype)
 {
@@ -3099,12 +3117,24 @@ drive_benchmark(int do_destructive, uint32_t memtype)
      * 5.7% faster than with 8-byte aligned buffers. 4 KB alignment read
      * the same as 16 bytes, but 32 KB writes were 4% slower.
      */
-    align = ((memtype > MEMTYPE_MAX) || mem_skip_alloc) ? 0 : BENCH_ALIGN;
+    /* A user-specified alignment is exact (see exact_align()), as with -i */
+    if (user_perf_align != 0)
+        align = user_perf_align * 2;
+    else
+        align = ((memtype > MEMTYPE_MAX) || mem_skip_alloc) ? 0 : BENCH_ALIGN;
 try_again:
     for (i = 0; i < num_tio; i++) {
+        uintptr_t base;
         alloc[i] = (uint8_t *) AllocMemType(perf_buf_size + align, memtype);
-        buf[i] = (uint8_t *) (((uintptr_t) alloc[i] + align) & ~
-                              (uintptr_t) (align ? align - 1 : 0));
+        base = (uintptr_t) alloc[i];
+        if (align == 0) {
+            buf[i] = alloc[i];
+        } else if (user_perf_align != 0) {
+            buf[i] = (uint8_t *) exact_align(alloc[i], user_perf_align);
+        } else {
+            /* Round up to the alignment */
+            buf[i] = (uint8_t *) ((base + align - 1) & ~(uintptr_t) (align - 1));
+        }
         if (alloc[i] == NULL) {
             buf[i] = NULL;
             if (perf_buf_size > 8192) {
@@ -5074,6 +5104,29 @@ test_nscmd_etd_write64(struct IOExtTD *tio)
     return (rc);
 }
 
+/*
+ * format_region() returns the length to use for TD_FORMAT / ETD_FORMAT.
+ * trackdisk.device requires that a format be of whole tracks, starting on
+ * a track boundary. If the device reports a track that fits in a test
+ * buffer, a whole number of tracks is used (the tests format at offset 0
+ * and at offset len, both within the area saved by save_overwritten_data).
+ * Otherwise BUFSIZE is used.
+ */
+static void
+format_region(struct IOExtTD *tio, uint *len)
+{
+    struct DriveGeometry dg;
+    uint tracklen;
+
+    *len = BUFSIZE;
+    if ((do_getgeometry(tio, &dg) == 0) && sector_size_ok(dg.dg_SectorSize) &&
+        (dg.dg_TrackSectors > 0)) {
+        tracklen = dg.dg_TrackSectors * dg.dg_SectorSize;
+        if ((tracklen <= BUFSIZE) && ((BUFSIZE % tracklen) != 0))
+            *len = (BUFSIZE / tracklen) * tracklen;
+    }
+}
+
 static int
 test_td_format(struct IOExtTD *tio)
 {
@@ -5081,15 +5134,18 @@ test_td_format(struct IOExtTD *tio)
     uint8_t **buf = g_tbuf;
 
     /* Format (acts the same same as write) */
+    uint     len;
+
+    format_region(tio, &len);
     memset(buf[0], 0xdb, BUFSIZE);
     print_test_name("TD_FORMAT");
-    if (setup_raw_io(tio, TD_FORMAT, 0, BUFSIZE, BUFSIZE, buf[0])) {
+    if (setup_raw_io(tio, TD_FORMAT, 0, len, len, buf[0])) {
         printf("\n");
         return (0);
     }
     rc = DoIO((struct IORequest *) tio);
     if (rc == 0) {
-        rc = check_write(tio, buf[0], buf[1], BUFSIZE, BUFSIZE, 0);
+        rc = check_write(tio, buf[0], buf[1], len, len, 0);
     } else {
         print_fail(rc);
     }
@@ -5105,12 +5161,15 @@ test_etd_format(struct IOExtTD *tio)
     int rc;
     uint8_t **buf = g_tbuf;
 
+    uint     len;
+
+    format_region(tio, &len);
     memset(buf[0], 0xca, BUFSIZE);
-    rc = test_etd_command(tio, ETD_FORMAT, "ETD_FORMAT", BUFSIZE, buf[0], 0);
+    rc = test_etd_command(tio, ETD_FORMAT, "ETD_FORMAT", len, buf[0], 0);
     if (rc == -1)
         return (0);  // Skipped
     if (rc == 0) {
-        rc = check_write(tio, buf[0], buf[1], BUFSIZE, 0, 0);
+        rc = check_write(tio, buf[0], buf[1], len, 0, 0);
         printf("\n");
     }
     restore_overwritten_data(tio, buf, 0);
@@ -5523,7 +5582,7 @@ mfm_encode_track(uint8_t *raw, const uint8_t *data, uint nsec, uint track)
 }
 
 /*
- * do_rawread() / do_rawwrite() issue TD_RAWREAD / TD_RAWWRITE on a track.
+ * do_rawio() issues TD_RAWREAD / TD_RAWWRITE (or the ETD_ forms) on a track.
  * DoIO() replaces io_Flags with IOF_QUICK, which would discard the sync
  * flags, so BeginIO() is used, which passes io_Flags to the driver.
  */
@@ -5538,6 +5597,7 @@ do_rawio(struct IOExtTD *tio, UWORD cmd, uint track, uint8_t *buf, uint len,
     tio->iotd_Req.io_Data    = buf;
     tio->iotd_Req.io_Flags   = flags;
     tio->iotd_Req.io_Error   = 0xa5;
+    tio->iotd_Count          = g_changenum;  // Used only by ETD_RAW*
     BeginIO((struct IORequest *) tio);
     return (WaitIO((struct IORequest *) tio));
 }
@@ -5547,12 +5607,6 @@ do_rawread(struct IOExtTD *tio, uint track, uint8_t *buf, uint len)
 {
     memset(buf, 0x1e, len);
     return (do_rawio(tio, TD_RAWREAD, track, buf, len, IOTDF_WORDSYNC));
-}
-
-static int
-do_rawwrite(struct IOExtTD *tio, uint track, uint8_t *buf, uint len)
-{
-    return (do_rawio(tio, TD_RAWWRITE, track, buf, len, IOTDF_INDEXSYNC));
 }
 
 /*
@@ -5575,7 +5629,7 @@ rawread_len(uint nsec)
  * checksums), and then compared against the same track read with CMD_READ.
  */
 static int
-test_td_rawread(struct IOExtTD *tio)
+test_rawread(struct IOExtTD *tio, UWORD cmd, const char *cmd_name)
 {
     int      rc;
     uint     nsec = 0;
@@ -5603,8 +5657,15 @@ test_td_rawread(struct IOExtTD *tio)
         return (1);
     }
 
-    print_test_name("TD_RAWREAD");
-    rc = do_rawread(tio, 0, buf, rawlen);  // Track 0 (cylinder 0, head 0)
+    print_test_name(cmd_name);
+    if ((cmd & TDF_EXTCOM) && (get_changenum(tio) != 0)) {
+        printf("Fail - could not acquire change count with TD_CHANGENUM\n");
+        rc = 1;
+        goto rawread_done;
+    }
+    memset(buf, 0x1e, rawlen);
+    /* Track 0 (cylinder 0, head 0) */
+    rc = do_rawio(tio, cmd, 0, buf, rawlen, IOTDF_WORDSYNC);
     if (rc != 0) {
         print_fail_nl(rc);
         goto rawread_done;
@@ -5656,7 +5717,7 @@ test_td_rawread(struct IOExtTD *tio)
     tio->iotd_Req.io_Error   = 0xa5;
     rc = DoIO((struct IORequest *) tio);
     if (rc != 0) {
-        printf("Success  %u sectors decoded; CMD_READ ", nsec);
+        printf("Success  %u sectors; CMD_READ ", nsec);
         print_fail_nl(rc);
         goto rawread_done;
     }
@@ -5670,7 +5731,7 @@ test_td_rawread(struct IOExtTD *tio)
             goto rawread_done;
         }
     }
-    printf("Success  %u sectors decoded, match CMD_READ\n", nsec);
+    printf("Success  %u sectors\n", nsec);
 
 rawread_done:
     if (decoded != NULL)
@@ -5680,6 +5741,18 @@ rawread_done:
     /* TD_RAWREAD and TD_RAWWRITE must be in Chip RAM */
     FreeMem(buf, RAWBUFSIZE);
     return (rc);
+}
+
+static int
+test_td_rawread(struct IOExtTD *tio)
+{
+    return (test_rawread(tio, TD_RAWREAD, "TD_RAWREAD"));
+}
+
+static int
+test_etd_rawread(struct IOExtTD *tio)
+{
+    return (test_rawread(tio, ETD_RAWREAD, "ETD_RAWREAD"));
 }
 
 /*
@@ -5784,7 +5857,7 @@ verify_track(struct IOExtTD *tio, uint track, uint8_t *raw, uint nsec,
 #define RAWWRITE_TRACK 2  // Cylinder 1, head 0: not the boot block
 
 static int
-test_td_rawwrite(struct IOExtTD *tio)
+test_rawwrite(struct IOExtTD *tio, UWORD cmd, const char *cmd_name)
 {
     const uint track = RAWWRITE_TRACK;
     int      rc;
@@ -5800,7 +5873,7 @@ test_td_rawwrite(struct IOExtTD *tio)
     struct DriveGeometry dg;
     const char *step;
 
-    print_test_name("TD_RAWWRITE");
+    print_test_name(cmd_name);
     if ((do_getgeometry(tio, &dg) == 0) && (dg.dg_SectorSize == 512) &&
         (dg.dg_TrackSectors > 0) && (dg.dg_TrackSectors <= 32) &&
         (dg.dg_Cylinders * dg.dg_Heads > track))
@@ -5833,6 +5906,11 @@ test_td_rawwrite(struct IOExtTD *tio)
         goto rawwrite_done;
     }
     g_turn_motor_off = 1;
+    if ((cmd & TDF_EXTCOM) && (get_changenum(tio) != 0)) {
+        printf("Fail - could not acquire change count with TD_CHANGENUM\n");
+        rc = 1;
+        goto rawwrite_done;
+    }
 
     /* 1. Original data must be fully verified before anything is written */
     if (verify_track(tio, track, raw, nsec, NULL, orig, cmpbuf) != 0) {
@@ -5846,7 +5924,7 @@ test_td_rawwrite(struct IOExtTD *tio)
         inv[pos] = (uint8_t) ~orig[pos];
     step = "inverted data";
     len = mfm_encode_track(raw, inv, nsec, track);
-    rc = do_rawwrite(tio, track, raw, len);
+    rc = do_rawio(tio, cmd, track, raw, len, IOTDF_INDEXSYNC);
     if (rc != 0) {
         printf("Fail - write ");
         print_fail(rc);
@@ -5858,7 +5936,7 @@ test_td_rawwrite(struct IOExtTD *tio)
     /* 3. Write the original data back, and verify it */
     step = "original data";
     len = mfm_encode_track(raw, orig, nsec, track);
-    rc = do_rawwrite(tio, track, raw, len);
+    rc = do_rawio(tio, cmd, track, raw, len, IOTDF_INDEXSYNC);
     if (rc != 0) {
         printf("Fail - rewrite ");
         print_fail(rc);
@@ -5867,8 +5945,7 @@ test_td_rawwrite(struct IOExtTD *tio)
     if ((rc = verify_track(tio, track, raw, nsec, orig, got, cmpbuf)) != 0)
         goto rawwrite_restore;
 
-    printf("Success  %u sectors written changed and restored, verified\n",
-           nsec);
+    printf("Success  %u sectors\n", nsec);
     goto rawwrite_done;
 
 rawwrite_restore:
@@ -5888,7 +5965,7 @@ rawwrite_restore:
     } else if (verify_track(tio, track, raw, nsec, orig, got, cmpbuf) != 0) {
         printf("\n");
     } else {
-        printf("Success  original data rewritten\n");
+        printf("Success\n");
     }
     if (rc == 0)
         rc = 1;
@@ -5905,6 +5982,84 @@ rawwrite_done:
     if (raw != NULL)
         FreeMem(raw, RAWBUFSIZE);
     return (rc);
+}
+
+static int
+test_td_rawwrite(struct IOExtTD *tio)
+{
+    return (test_rawwrite(tio, TD_RAWWRITE, "TD_RAWWRITE"));
+}
+
+static int
+test_etd_rawwrite(struct IOExtTD *tio)
+{
+    return (test_rawwrite(tio, ETD_RAWWRITE, "ETD_RAWWRITE"));
+}
+
+/*
+ * test_etd_simple() tests an ETD_ command which transfers no data
+ * (ETD_MOTOR, ETD_UPDATE, ETD_CLEAR). test_etd_command() first checks
+ * that a stale change count is rejected.
+ */
+static int
+test_etd_simple(struct IOExtTD *tio, UWORD cmd, const char *cmd_name,
+                uint len)
+{
+    int rc = test_etd_command(tio, cmd, cmd_name, len, NULL, 0);
+    if (rc == 0)
+        printf("Success\n");
+    return ((rc == -1) ? 0 : rc);
+}
+
+static int
+test_etd_motor(struct IOExtTD *tio)
+{
+    int rc = test_etd_simple(tio, ETD_MOTOR, "ETD_MOTOR ON", 1);
+    g_turn_motor_off = 1;
+    return (rc);
+}
+
+static int
+test_etd_update(struct IOExtTD *tio)
+{
+    return (test_etd_simple(tio, ETD_UPDATE, "ETD_UPDATE", 0));
+}
+
+static int
+test_etd_clear(struct IOExtTD *tio)
+{
+    return (test_etd_simple(tio, ETD_CLEAR, "ETD_CLEAR", 0));
+}
+
+static int
+test_simple_cmd(struct IOExtTD *tio, UWORD cmd, const char *cmd_name)
+{
+    int rc;
+
+    tio->iotd_Req.io_Command = cmd;
+    tio->iotd_Req.io_Actual  = 0;
+    tio->iotd_Req.io_Offset  = 0;
+    tio->iotd_Req.io_Length  = 0;
+    tio->iotd_Req.io_Data    = NULL;
+    tio->iotd_Req.io_Flags   = 0;
+    tio->iotd_Req.io_Error   = 0xa5;
+    print_test_name(cmd_name);
+    rc = DoIO((struct IORequest *) tio);
+    print_fail_nl(rc);
+
+    return (rc);
+}
+
+static int
+test_cmd_reset(struct IOExtTD *tio)
+{
+    return (test_simple_cmd(tio, CMD_RESET, "CMD_RESET"));
+}
+
+static int
+test_cmd_flush(struct IOExtTD *tio)
+{
+    return (test_simple_cmd(tio, CMD_FLUSH, "CMD_FLUSH"));
 }
 
 static int
@@ -6075,6 +6230,11 @@ test_cmd_scsi(struct IOExtTD *tio)
 #define TEST_CMD_UPDATE         UBIT(40)
 #define TEST_CMD_CLEAR          UBIT(41)
 #define TEST_CMD_SCSI           UBIT(42)
+#define TEST_ETD_MOTOR          UBIT(43)
+#define TEST_ETD_UPDATE         UBIT(44)
+#define TEST_ETD_CLEAR          UBIT(45)
+#define TEST_CMD_RESET          UBIT(46)
+#define TEST_CMD_FLUSH          UBIT(47)
 
 static const test_cmds_t test_cmds[] = {
     { "CHANGEINT",   2, TEST_ADDREMCHANGEINT, NULL,
@@ -6101,13 +6261,10 @@ static const test_cmds_t test_cmds[] = {
                         "TD_RAWREAD read raw track from (floppy) device" },
     { "RAWWRITE",    1, TEST_TD_RAWWRITE, NULL,
                         "TD_RAWWRITE write raw track 2 (floppy) and restore" },
-#if 0
-    /* These are not implemented yet */
     { "ERAWREAD",    0, TEST_ETD_RAWREAD, NULL,
                         "ETD_RAWREAD read raw track from (floppy) device" },
-    { "ERAWWRITE",   0, TEST_ETD_RAWWRITE, NULL,
-                        "ETD_RAWWRITE write raw track to (floppy) device" },
-#endif
+    { "ERAWWRITE",   1, TEST_ETD_RAWWRITE, NULL,
+                        "ETD_RAWWRITE write raw track 2 (floppy) and restore" },
     { "READ",        0, TEST_CMD_READ, "size,offset",
                         "CMD_READ Read from device" },
     { "EREAD",       0, TEST_ETD_READ, "size,offset",
@@ -6152,10 +6309,20 @@ static const test_cmds_t test_cmds[] = {
                         "CMD_UPDATE flushes the floppy track buffer" },
     { "CLEAR",       1, TEST_CMD_CLEAR, NULL,
                         "CMD_CLEAR discards the floppy track buffer" },
+    { "EUPDATE",     0, TEST_ETD_UPDATE, NULL,
+                        "ETD_UPDATE extended CMD_UPDATE" },
+    { "ECLEAR",      1, TEST_ETD_CLEAR, NULL,
+                        "ETD_CLEAR extended CMD_CLEAR" },
+    { "RESET",       2, TEST_CMD_RESET, NULL,
+                        "CMD_RESET reset the device unit" },
+    { "FLUSH",       2, TEST_CMD_FLUSH, NULL,
+                        "CMD_FLUSH abort all queued requests" },
     { "MOTOROFF",    2, TEST_TD_MOTOR_OFF, NULL,
                         "TD_MOTOR OFF stop motor (spin down)" },
     { "MOTORON",     2, TEST_TD_MOTOR_ON, NULL,
                         "TD_MOTOR ON start motor (spin up)" },
+    { "EMOTORON",    2, TEST_ETD_MOTOR, NULL,
+                        "ETD_MOTOR ON extended start motor" },
     { "SCSI",        2, TEST_CMD_SCSI, "rlen,cb0,cb1,cb2...",
                         "HD_SCSICMD (SCSI direct)" },
     { "START",       2, TEST_CMD_START, NULL,
@@ -6172,12 +6339,6 @@ static int
 test_packets_ll(uint64_t test_mask, struct IOExtTD *tio)
 {
     int rc = 0;
-    /*
-     * To do:
-     * TD_MOTOR
-     * TD_RAWREAD
-     * TD_RAWWRITE
-     */
 
     if ((test_mask & TEST_CMD_GETGEOMETRY) && test_cmd_getgeometry(tio))
         rc++;
@@ -6192,17 +6353,32 @@ test_packets_ll(uint64_t test_mask, struct IOExtTD *tio)
     if ((test_mask & TEST_TD_GETNUMTRACKS) && test_td_getnumtracks(tio))
         rc++;
     if ((test_mask & TEST_TD_RAWREAD) && test_td_rawread(tio)) {
-        test_mask &= ~TEST_TD_RAWWRITE;
+        test_mask &= ~(TEST_TD_RAWWRITE | TEST_ETD_RAWREAD |
+                       TEST_ETD_RAWWRITE);
+        rc++;
+    }
+    if ((test_mask & TEST_ETD_RAWREAD) && test_etd_rawread(tio)) {
+        test_mask &= ~TEST_ETD_RAWWRITE;
         rc++;
     }
     if ((test_mask & TEST_CMD_UPDATE) && test_cmd_update(tio))
         rc++;
     if ((test_mask & TEST_CMD_CLEAR) && test_cmd_clear(tio))
         rc++;
+    if ((test_mask & TEST_ETD_UPDATE) && test_etd_update(tio))
+        rc++;
+    if ((test_mask & TEST_ETD_CLEAR) && test_etd_clear(tio))
+        rc++;
+    if ((test_mask & TEST_CMD_FLUSH) && test_cmd_flush(tio))
+        rc++;
+    if ((test_mask & TEST_CMD_RESET) && test_cmd_reset(tio))
+        rc++;
     if ((test_mask & TEST_CMD_SCSI) && test_cmd_scsi(tio))
         rc++;
 
     if ((test_mask & TEST_TD_RAWWRITE) && test_td_rawwrite(tio))
+        rc++;
+    if ((test_mask & TEST_ETD_RAWWRITE) && test_etd_rawwrite(tio))
         rc++;
     if ((test_mask & TEST_HD_SCSICMD_INQ) && test_hd_scsicmd_inquiry(tio))
         rc++;
@@ -6337,6 +6513,8 @@ test_packets_ll(uint64_t test_mask, struct IOExtTD *tio)
     }
     if ((test_mask & TEST_TD_MOTOR_ON) && test_td_motor_on(tio))
         rc++;
+    if ((test_mask & TEST_ETD_MOTOR) && test_etd_motor(tio))
+        rc++;
 
     /* Motor off should be the last test, as a courtesy to floppy drives */
     if ((test_mask & TEST_TD_MOTOR_OFF) && test_td_motor_off(tio))
@@ -6406,12 +6584,13 @@ test_packets(int do_destructive, int test_level,
                            TEST_TD_FORMAT | TEST_ETD_FORMAT |
                            TEST_TD_FORMAT64 |
                            TEST_NSCMD_TD_FORMAT64 | TEST_NSCMD_ETD_FORMAT64 |
-                           TEST_TD_RAWWRITE |
+                           TEST_TD_RAWWRITE | TEST_ETD_RAWWRITE |
                            TEST_CMD_CLEAR);
         }
 
         /* Command line only */
-        test_mask &= ~TEST_CMD_SCSI;
+        test_mask &= ~(TEST_CMD_SCSI | TEST_CMD_RESET | TEST_CMD_FLUSH |
+                       TEST_ETD_UPDATE | TEST_ETD_CLEAR);
 
         rc = test_packets_ll(test_mask, tio);
     } else {
@@ -7198,7 +7377,6 @@ test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
 
     if (g_ibuf[0] == NULL) {
         for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++) {
-            uint32_t base;
             uint     cur;
             /*
              * g_ibuf is the collection of buffers for integrity testing.
@@ -7216,32 +7394,15 @@ test_integrity(uint mode, uint pattern, uint32_t memtype, uint bufsize,
              */
             if (((bnum == 4) || (bnum == 5)) && (flag_destructive > 1))
                 continue;
-            g_ibuf[bnum] = AllocMemType(bufsize + align, memtype);
+            g_ibuf[bnum] = AllocMemType(bufsize + align * 2, memtype);
             if (g_ibuf[bnum] == NULL) {
-                report_allocmem_fail(bufsize + align, memtype);
+                report_allocmem_fail(bufsize + align * 2, memtype);
                 rc = ENOMEM;
                 goto integrity_fail;
             }
 
-            /*
-             * Create specific alignment
-             * If the address is aligned at a lower order of alignment,
-             * then need to increase the alignment by rounding up.
-             *    Example: address = 0x0004  desired_alignment = 8
-             *             address = 0x0008
-             * If the address is already aligned at a higher order than
-             * the requested alignment, need to reduce the alignment.
-             *    Example: address = 0x0004  desired_alignment = 1
-             *             address = 0x0005
-             */
-            base = (uintptr_t) g_ibuf[bnum];
-            if (base & (align - 1)) {
-                /* Lower order of alignment; round up */
-                g_align[bnum] = (void *) ((base + align - 1) & ~(align - 1));
-            } else {
-                /* Higher order of alignment; force alignment */
-                g_align[bnum] = (void *) (base + align);
-            }
+            /* Aligned at exactly align bytes (not a higher order) */
+            g_align[bnum] = exact_align(g_ibuf[bnum], align);
             if (g_verbose > 1)
                 printf("Align %p\n", g_align[bnum]);
 
@@ -7839,7 +8000,9 @@ main(int argc, char *argv[])
                         if (++arg >= argc) {
                             printf("-%s requires an argument\n", ptr);
                             printf("    Transfer size: 512 1M 64k etc\n"
-                                   "    concurrent requests: ,1 ,2 ,3 etc\n");
+                                   "    optional alignment: ,1 ,2 ,4 etc\n"
+                                   "    optional concurrent requests: ,1 ,2 ,3 "
+                                   "etc (after alignment)\n");
                             exit(RETURN_ERROR);
                         }
                         parse_tsize(argv[arg], (uint *)&user_perf_size, &pos);
@@ -7851,12 +8014,26 @@ main(int argc, char *argv[])
                         }
                         if (argv[arg][pos] == ',') {
                             char *str = argv[arg] + pos + 1;
-                            if ((sscanf(str, "%i%n", (int *) &user_num_tio,
-                                        &pos) != 1) || (pos == 0) ||
-                                (user_num_tio < 1) ||
-                                (user_num_tio > MAX_NUM_TIO)) {
-                                printf("Invalid TIO count %s\n", str);
+                            int  apos = 0;
+                            if ((sscanf(str, "%i%n", (int *) &user_perf_align,
+                                        &apos) != 1) || (apos == 0) ||
+                                (user_perf_align == 0) ||
+                                (user_perf_align > 0x10000) ||
+                                (user_perf_align & (user_perf_align - 1))) {
+                                printf("Invalid alignment %s; must be a "
+                                       "power of 2 from 1 to 65536\n", str);
                                 exit(RETURN_ERROR);
+                            }
+                            str += apos;
+                            if (*str == ',') {
+                                str++;
+                                if ((sscanf(str, "%i%n", (int *) &user_num_tio,
+                                            &pos) != 1) || (pos == 0) ||
+                                    (user_num_tio < 1) ||
+                                    (user_num_tio > MAX_NUM_TIO)) {
+                                    printf("Invalid TIO count %s\n", str);
+                                    exit(RETURN_ERROR);
+                                }
                             }
                         }
                         break;
@@ -8223,7 +8400,7 @@ allocmem_fail:
 
     for (bnum = 0; bnum < ARRAY_SIZE(g_ibuf); bnum++)
         if (g_ibuf[bnum] != NULL)
-            FreeMemType(g_ibuf[bnum], tsize + talign);
+            FreeMemType(g_ibuf[bnum], tsize + talign * 2);
 
     if (loops > 1) {
         if (loop < loops)
