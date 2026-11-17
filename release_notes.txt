@@ -1,6 +1,19 @@
 Release 2.0
 
 Major changes since 1.9
+    Improved support for drives > 4 GB across multiple tests.
+    Improved accuracy of latency and bandwidth benchmarks.
+    Improved program exit code to always return non-zero on failure.
+    Improved devtest -b rate measurement for unusually slow and fast drives.
+    Added devtest -B options to set the alignment and number of concurrent I/Os.
+    Fixed devtest -i -d bug where test can restore wrong data (simple mode).
+    Fixed devtest -i test with -dd, wrong "matches originally on disk" report.
+    Fixed devtest -g seek-to-capacity for drives of size 8GB or 2TB
+    Fixed handling of various out-of-memory conditions.
+    Fixed multiple tests to respect partition boundaries (DH0: for example).
+    Fixed TD_ADDCHANGEINT early memory free bug.
+    Added real MFM (floppy) TD_RAWREAD and TD_RAWWRITE tests
+    Added multiple common boundary (wrap-around) tests for CMD_WRITE
 
 All changes
     Increased -c scsi command maximum length from 1024 bytes to 16384 bytes.
@@ -70,10 +83,14 @@ All changes
     Fixed failure handling bug where data is saved before destructive test.
     Added more SCSI opcodes to the "destructive" list.
     Fixed "devtest -g" Read-to-capacity to work when the device size is unknown.
-    Changed -i and -B tests to require they are a multiple of the dev sector size.
+    Changed -i and -B tests to require a multiple of the dev sector size.
     Corrected formatting for SCSI Mode page 5 display.
     Format tests now return failure when a write check fails.
     devtest will now exit with a failure code if the first pass fails.
     Numeric arguments are now checked for invalid trailing text or negatives
     Invalid sector sizes from READ_CAPACITY or TD_GETGEOMETRY are now rejected.
     Fixed bandwidth failure report to show entire 64-bit disk address
+    Added optional alignment to devtest -B <size>[,align[,threads]
+    Added ERAWREAD, ERAWWRITE, EUPDATE, ECLEAR, RESET, FLUSH, EMOTORON commands
+    Added "devtest -tt" tests for TD_ERAWREAD and TD_ERAWWRITE
+    Fixed bug in TD_FORMAT and ETD_FORMAT. Now works on DD, but not HD floppies.

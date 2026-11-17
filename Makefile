@@ -2,7 +2,7 @@
 # Makefile to build devtest for AmigaOS/68k using Bebbo's GCC cross-compiler.
 #
 
-VER     ?= 1.9b+
+VER     ?= 2.0+
 
 PROG    := devtest
 OBJDIR  := objs
