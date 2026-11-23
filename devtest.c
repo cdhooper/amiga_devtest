@@ -1702,24 +1702,24 @@ drive_geometry(void)
                         goto show_default;
                     printf("Mode Page 0x%02x", page);
                     printf("%8u %30u\n",
-                           _2btol(&pages[pos + 12]),   // Sector size
-                           _2btol(&pages[pos + 10]));  // Sectors / track
+                           (uint) _2btol(&pages[pos + 12]),   // Sector size
+                           (uint) _2btol(&pages[pos + 10]));  // Sectors / track
                     break;
                 case 0x04: // Rigid Geometry
                     if (!PAGE_HAS_BYTES(2, 4))
                         goto show_default;
                     printf("Mode Page 0x%02x", page);
                     printf("%28u %4u\n",
-                           _3btol(&pages[pos + 2]),    // Cylinders
-                           pages[pos + 5]);            // Heads
+                           (uint) _3btol(&pages[pos + 2]),    // Cylinders
+                           (uint) pages[pos + 5]);            // Heads
                     break;
                 case 0x05: // Flexible Geometry
                     if (!PAGE_HAS_BYTES(4, 6))
                         goto show_default;
                     printf("Mode Page 0x%02x", page);
                     printf("%8u %19u %4u %5u\n",
-                           _2btol(&pages[pos + 6]),    // Sector size
-                           _2btol(&pages[pos + 8]),    // Cylinders
+                           (uint) _2btol(&pages[pos + 6]),    // Sector size
+                           (uint) _2btol(&pages[pos + 8]),    // Cylinders
                            pages[pos + 4],             // Heads
                            pages[pos + 5]);            // Sectors / track
                     break;
@@ -1728,7 +1728,7 @@ drive_geometry(void)
                         goto show_default;
                     printf("Mode Page 0x%02x", page);
                     printf("%8u %12s\n",
-                           _2btol(&pages[pos + 3]),    // Sector size
+                           (uint) _2btol(&pages[pos + 3]),    // Sector size
                            llu_to_str(_5btol(&pages[pos + 5])));
                     break;
                 /* The below pages are commonly seen, but not interesting */
@@ -7648,7 +7648,7 @@ get_cmd_scsi_args(args_t *args, const char *arg)
                 nbytes = (ndigits + 1) / 2;
                 if (argpos + nbytes > SCSI_ARG_MAX_POS) {
                     printf("SCSI command is too long (max %u bytes)\n",
-                           SCSI_ARG_MAX_POS - 3);
+                           (uint) (SCSI_ARG_MAX_POS - 3));
                     exit(RETURN_ERROR);
                 }
                 for (cur = 0; cur < nbytes; cur++) {
